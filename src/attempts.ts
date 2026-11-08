@@ -22,6 +22,7 @@ export class WorkspaceAcquisitionError extends Error {
 /** Trusted dispatch entry point. A replay does not need to read a policy that may since have changed. */
 export async function reserveWithTrustedChecks(db: Database, input: Omit<ReservationInput, 'checks'>,
   repository: Pick<GitRepository, 'readCheckPolicy'>): Promise<Reservation> {
+  input = structuredClone(input);
   if (db.requests().some(request => request.requestKey === input.requestKey)) {
     return db.reserveAttempt({ ...input, checks: {} as ReservationInput['checks'] });
   }

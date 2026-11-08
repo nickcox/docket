@@ -36,6 +36,44 @@ test('R15: trusted reservation freezes target checks and provenance; replay does
   assert.equal(replay.attempt.id, reserved.attempt.id); assert.equal(replay.replayed, true);
 });
 
+test('R15: configuration changes during policy resolution refuse before claiming a check slot', async t => {
+  for (const field of ['revision', 'digest'] as const) {
+    const f = await checkFixture(t), a = await f.attempt('task'), fake = fakeServices();
+    const configured = f.db.events().find(event => event.kind === 'context.configured')!;
+    fake.services.repository.readCheckPolicy = async () => {
+      await f.db.appendEvents([{ sourceKey: `context.configured:changed-${field}`, kind: 'context.configured',
+        payloadVersion: 1, correlationId: 'configuration-change', actor: person, occurredAt: new Date().toISOString(),
+        payload: { ...configured.payload, [field]: field === 'revision' ? 2 : 'new-policy-configuration' } }]);
+      return parseCheckPolicy(start, policyContent, contextChecks);
+    };
+    await assert.rejects(runCandidateChecks(f.db, a.id, person, fake.services), /Configuration changed/);
+    assert.deepEqual(fake.calls, []);
+    assert.equal(f.db.requests().filter(request => request.operation === 'checks.run').length, 0);
+    assert.equal(f.db.claims().filter(claim => claim.role === 'check_executor').length, 0);
+  }
+});
+
+test('R15/R16: profile identity and ignored paths are detached before asynchronous policy reads', async t => {
+  const f = await checkFixture(t), a = await f.attempt('task'), fake = fakeServices();
+  fake.services.profile = structuredClone(profile);
+  fake.services.repository.readCheckPolicy = async () => {
+    fake.services.profile.tools.node = 'changed';
+    fake.services.profile.ignoredGeneratedPaths!.push('undeclared');
+    return parseCheckPolicy(start, policyContent, contextChecks);
+  };
+  const observedPaths: string[][] = [];
+  const inspect = fake.services.repository.inspectWorkspace;
+  fake.services.repository.inspectWorkspace = async (workspace, forChecks, ignored) => {
+    observedPaths.push([...ignored!]);
+    return inspect(workspace, forChecks, ignored);
+  };
+  const result = await runCandidateChecks(f.db, a.id, person, fake.services);
+  assert.equal(result.state, 'succeeded');
+  assert.deepEqual(result.input.profile, profile);
+  assert.ok(observedPaths.length > 0);
+  assert.ok(observedPaths.every(paths => JSON.stringify(paths) === JSON.stringify(profile.ignoredGeneratedPaths)));
+});
+
 test('R16: missing terminal or validated result evidence refuses without starting commands', async t => {
   for (const stage of ['prepared', 'validated'] as const) {
     const f = await checkFixture(t), a = await f.attempt('task', ['Criterion'], undefined, head, start, policyContent, stage);

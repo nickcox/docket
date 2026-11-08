@@ -23,6 +23,8 @@ test('R16/A35: real commands have no stdin, shell or DOCKET variables and diagno
   assert.ok(result.stderr.length <= 8192); assert.equal(result.truncated, true);
   const literal = await run({ name: 'literal', command: [process.execPath, '-e', 'console.log(process.argv[1])', '$(touch SHOULD_NOT_EXIST)'], timeoutMs: 2000 }, root);
   assert.equal(literal.stdout.trim(), '$(touch SHOULD_NOT_EXIST)');
+  const clipped = await run(check("console.log('x'.repeat(9000))"), root);
+  assert.equal(clipped.stdout.length, 8192); assert.equal(clipped.truncated, true);
 });
 
 test('R16/A35: timeout and spawn failure never pass; a signal-killed command remains uncertain', async t => {
@@ -60,6 +62,10 @@ test('R15: Git reads exact target content without checkout; worker changes canno
   await writeFile(join(root, '.docket/checks.json'), '{bad'); await git('commit', '-am', 'Bad policy');
   await assert.rejects(repo.readCheckPolicy('refs/heads/worker', contextChecks), /JSON/);
   await assert.rejects(repo.readCheckPolicy('refs/heads/missing', contextChecks), /target/);
+  await git('rm', '.docket/checks.json');
+  await git('update-index', '--add', '--cacheinfo', '120000', await git('hash-object', '-w', 'file'), '.docket/checks.json');
+  await git('commit', '-m', 'Policy is a symbolic link');
+  await assert.rejects(repo.readCheckPolicy('refs/heads/worker', contextChecks), /regular file/);
 });
 
 test('R16/A35: candidate checks with real Git fail tracked/untracked mutations and hidden index entries, allowing ignored generated files', async t => {

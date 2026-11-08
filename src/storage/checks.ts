@@ -12,6 +12,8 @@ export interface CheckRunInput {
   profile: ExecutionProfile;
   caller: TaskActor;
   requestKey?: string;
+  expectedConfigRevision?: number;
+  expectedConfigDigest?: string;
 }
 export interface CheckAdmission {
   request: StoredRequest;

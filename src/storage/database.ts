@@ -1139,14 +1139,16 @@ export class Database {
 
   /** Current person-controlled context additions; repository requirements are resolved by the adapter. */
   checkConfiguration(): { targetBranch: string; checks: ContextChecks; revision: number; digest: string } {
-    return this.snapshot(() => {
-      const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
-      if (!row) throw new StorageError('conflict', 'Missing check configuration');
-      const payload = this.decodeEvent(row).payload, resolved = object(payload.resolved);
-      const finalisation = object(resolved.finalisation), checks = object(resolved.checks) as ContextChecks;
-      text(finalisation.targetBranch);
-      return { targetBranch: finalisation.targetBranch, checks, revision: Number(payload.revision), digest: String(payload.digest) };
-    });
+    return this.snapshot(() => this.checkConfigurationInTransaction());
+  }
+
+  private checkConfigurationInTransaction(): { targetBranch: string; checks: ContextChecks; revision: number; digest: string } {
+    const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+    if (!row) throw new StorageError('conflict', 'Missing check configuration');
+    const payload = this.decodeEvent(row).payload, resolved = object(payload.resolved);
+    const finalisation = object(resolved.finalisation), checks = object(resolved.checks) as ContextChecks;
+    text(finalisation.targetBranch);
+    return { targetBranch: finalisation.targetBranch, checks, revision: Number(payload.revision), digest: String(payload.digest) };
   }
 
   /** Admission and slot ownership commit together. A lost executor never frees its slot by age. */
@@ -1168,6 +1170,11 @@ export class Database {
         operation: 'checks.run', caller: value.caller, input: logical, fingerprint: json(logical) };
       let request = this.duplicateRequest(command, 'command');
       if (request && request.state !== 'pending') return { request, execute: false, executor: null };
+      const config = this.checkConfigurationInTransaction();
+      if ((value.expectedConfigRevision !== undefined && value.expectedConfigRevision !== config.revision)
+        || (value.expectedConfigDigest !== undefined && value.expectedConfigDigest !== config.digest)) {
+        throw new StorageError('conflict', 'Configuration changed while resolving check policy');
+      }
       if (!request) {
         const id = randomUUID();
         this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, attempt_id, created_at)
@@ -1223,7 +1230,7 @@ export class Database {
 
   async finishChecks(requestId: string, executor: ClaimIdentity, result: CheckRunResult): Promise<StoredRequest> {
     claimIdentity(executor);
-    const value = object(result) as CheckRunResult;
+    const value = JSON.parse(json(object(result))) as CheckRunResult;
     if (!['passed', 'failed', 'uncertain'].includes(value.status)) throw new TypeError('Invalid check outcome');
     return this.write(() => {
       const request = this.decodeRequest(this.requestRow(requestId)), claim = this.activeClaim(executor);

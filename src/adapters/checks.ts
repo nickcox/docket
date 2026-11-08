@@ -21,6 +21,7 @@ export function redactDiagnostics(text: string, secrets: readonly string[] = [])
 /** The environment is supplied by the trusted execution profile, never inherited implicitly. */
 export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: readonly string[] = []): CheckRunner {
   const env = Object.fromEntries(Object.entries(environment).filter(([name]) => !name.toUpperCase().startsWith('DOCKET_')));
+  const redactions = [...secrets];
   return (check, workspace) => new Promise(resolve => {
     let stdout = '', stderr = '', stdoutTruncated = false, stderrTruncated = false, timedOut = false, spawnFailed = false;
     const child = spawn(check.command[0]!, check.command.slice(1), { cwd: workspace, env, shell: false,
@@ -43,12 +44,13 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
     });
     child.once('close', (code, signal) => {
       clearTimeout(timer); clearTimeout(drain);
+      // Suppress an overflowing stream rather than retaining a credential cut at the buffer boundary.
+      const out = stdoutTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stdout, redactions);
+      const err = stderrTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stderr, redactions);
       resolve({ status: spawnFailed ? 'not_run' : timedOut ? 'failed' : signal || pipesOpen ? 'uncertain' : code === 0 ? 'passed' : 'failed',
         exitCode: spawnFailed ? null : code, timedOut,
-        // Suppress an overflowing stream rather than retaining a credential cut at the buffer boundary.
-        stdout: stdoutTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stdout, secrets).slice(0, 8192),
-        stderr: stderrTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stderr, secrets).slice(0, 8192),
-        truncated: stdoutTruncated || stderrTruncated,
+        stdout: out.slice(0, 8192), stderr: err.slice(0, 8192),
+        truncated: stdoutTruncated || stderrTruncated || out.length > 8192 || err.length > 8192,
         ...(spawnFailed ? { reason: 'Command could not be started' } : {}) });
     });
   });

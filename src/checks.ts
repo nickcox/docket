@@ -18,29 +18,33 @@ export interface CheckServices {
 /** No filesystem or process work is performed while SQLite holds its write lock. */
 export async function runCandidateChecks(db: Database, attemptId: string, caller: TaskActor, services: CheckServices,
   requestKey?: string): Promise<StoredRequest> {
+  caller = structuredClone(caller);
+  const { repository, run } = services;
+  const profile = structuredClone(services.profile);
   const attempt = db.attempt(attemptId);
   if (!attempt.candidate || !attempt.allocation) throw new StorageError('conflict', 'Checks require a recorded candidate and allocation');
   const commit = String(attempt.candidate.commit), workspace = attempt.allocation.path;
   const config = db.checkConfiguration();
   const target = config.targetBranch.startsWith('refs/') ? config.targetBranch : `refs/heads/${config.targetBranch}`;
-  const current = await services.repository.readCheckPolicy(target, config.checks);
-  if (services.profile.id !== current.executionProfile) throw new StorageError('conflict', 'Check execution profile does not match policy');
+  const current = await repository.readCheckPolicy(target, config.checks);
+  if (profile.id !== current.executionProfile) throw new StorageError('conflict', 'Check execution profile does not match policy');
   const checks = mandatoryChecks(attempt.specification.checks as TrustedChecks, current);
-  const admission = await db.beginChecks({ attemptId, commit, checks, profile: services.profile, caller,
+  const admission = await db.beginChecks({ attemptId, commit, checks, profile, caller,
+    expectedConfigRevision: config.revision, expectedConfigDigest: config.digest,
     ...(requestKey === undefined ? {} : { requestKey }) });
   if (!admission.execute) return admission.request;
   const commands: JsonObject[] = [];
   let status: 'passed' | 'failed' | 'uncertain' = 'passed';
   const clean = async (): Promise<boolean> => {
-    const state = await services.repository.inspectWorkspace(workspace, true, services.profile.ignoredGeneratedPaths ?? []);
+    const state = await repository.inspectWorkspace(workspace, true, profile.ignoredGeneratedPaths ?? []);
     return state.status === 'confirmed' && state.value.head === commit && state.value.clean;
   };
   try {
-    const repository = await services.repository.identity(), allocated = await services.repository.identity(workspace);
+    const identity = await repository.identity(), allocated = await repository.identity(workspace);
     const recordedPath = (attempt.specification.repository as JsonObject).path;
-    const recorded = typeof recordedPath === 'string' ? await services.repository.identity(recordedPath) : repository;
-    if (repository.status !== 'confirmed' || allocated.status !== 'confirmed' || recorded.status !== 'confirmed'
-      || repository.value !== allocated.value || repository.value !== recorded.value || !await clean()) {
+    const recorded = typeof recordedPath === 'string' ? await repository.identity(recordedPath) : identity;
+    if (identity.status !== 'confirmed' || allocated.status !== 'confirmed' || recorded.status !== 'confirmed'
+      || identity.value !== allocated.value || identity.value !== recorded.value || !await clean()) {
       status = 'failed';
       commands.push({ status: 'not_run', reason: 'Workspace is not clean at the candidate in the expected repository' });
     } else {
@@ -54,7 +58,7 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
             status = 'failed'; commands.push({ kind, name: check.name, status: 'not_run', reason: 'Workspace changed before command' });
             continue;
           }
-          const result = await services.run(check, workspace);
+          const result = await run(check, workspace);
           const unchanged = await clean();
           const commandStatus = result.status === 'uncertain' ? 'uncertain'
             : !unchanged || result.timedOut || (result.status === 'passed' && result.exitCode !== 0) ? 'failed' : result.status;
