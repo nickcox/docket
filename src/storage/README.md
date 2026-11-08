@@ -15,9 +15,22 @@ Read-only opens do not create directories, database files or probe files. They d
 
 ## Transactions and evidence
 
-`appendEvents` is the initial narrow write operation. It inserts a batch atomically, generates event IDs, preserves recording order and compares duplicate source keys by logical JSON content. Conflicting duplicates or relational constraints refuse the whole batch. There is no event update/delete/replace method and no public raw SQL or transaction callback API. Domain-specific payload validation, authority and state transitions belong in typed operations as they are added; generic event storage does not grant authority or validate all future event families.
+`appendEvents` is the narrow insert-only evidence operation. It inserts a batch atomically, generates event IDs, preserves recording order and compares duplicate source keys by logical JSON content. Conflicting duplicates or relational constraints refuse the whole batch. There is no event update/delete/replace method and no public raw SQL or transaction callback API. Domain-specific payload validation, authority and state transitions belong in typed operations as they are added; generic event storage does not grant authority or validate all future event families.
 
 Transaction callbacks are internal and synchronous. They may only perform database work: never await filesystem operations, processes or providers while holding a lock. Busy admission retries yield to the event loop, with a finite deadline (default 5 seconds, configurable up to 60 seconds). SQLite's own busy timeout is zero. Callback failures roll back, including a defensive refusal of Promise/thenable returns. Open retries also use fresh connections for transient Windows `SQLITE_IOERR_TRUNCATE` failures after an unclean exit.
+
+## Tasks
+
+Task types are in `tasks.ts`; `Database` owns all task SQL. These in-process methods do not add CLI commands. The host supplies a person actor (`{ kind: 'person', id }`), separately from task input. This is attribution, not a replacement for future host permission checks.
+
+- `addTask(input, actor)` accepts a title and optional ID, instructions, ordered text criteria, kind, profile, objective ID and blocker IDs. Defaults are queued, unheld, code, empty instructions/criteria, no profile/objective, definition revision 1 and decision revision 0. Generated IDs use a readable title slug, then `-2`, `-3`, etc. Explicit collisions refuse; identities have no deletion/reuse method. New tasks go after the current last position.
+- `updateTaskDefinition(id, patch, actor)` accepts only definition fields. One effective edit increments the definition revision once, even when several fields change. Criteria order matters. Equal values and empty patches do nothing.
+- `addBlocker` and `removeBlocker` take task ID, blocker ID and actor. Both IDs must exist; self/cyclic additions refuse. Duplicate additions and absent-edge removals do nothing. Dependencies affect readiness, not revisions or dependant states.
+- `reorderTasks(ids, actor)` takes a complete permutation. Positions remain positive and unique, including during the transaction; unchanged order does nothing.
+- `holdTask(id, reason, actor)`, `releaseTask`, `markTaskDone` and `reopenTask` increment the decision revision only when their decision changes current fields. A hold reason is one nonblank line of at most 200 characters. State decisions preserve holds; hold/release preserve state. Done is a recorded person judgement, not accepted output. These methods never set in_flight; that belongs to the future start operation.
+- `task(id)`, `tasks()` and `readyTasks()` return detached snapshots, with blocker IDs in ID order and tasks in position order. Ready means queued, unheld and all blockers done. Unknown task IDs refuse rather than yielding an empty task.
+
+Every effective operation writes one `action.recorded` event in the same `BEGIN IMMEDIATE` transaction as its rows. Definition and decision updates match the revision read under that lock and require one affected row. No-op operations emit no event. All caller-owned inputs are detached before waiting for the write lock. Definitions, graph checks and end-position/ID allocation are decided under the lock. The operation tests inject failure both before and after event insertion for each task write method, then inspect through a fresh connection to prove all-or-none persistence.
 
 ## Durability and qualification
 
