@@ -17,10 +17,10 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   caller: TaskActor, requestKey: string, runtime: Runtime, progress: (message: string) => void) {
   const previous = db.requests().find(r => r.requestKey === requestKey);
   // A replay never starts another owner or resumes an interrupted remote call.
-  if (previous && !args.dryRun) {
+  if (previous) {
     const replay = await db.reserveAttempt({ requestKey, caller, ...(args.taskId === null ? {} : { taskId: args.taskId }),
       ...(args.profile === null ? {} : { profile: args.profile }), startingCommit: '', checks: {} as ReservationInput['checks'],
-      delivery: {} as ReservationInput['delivery'] });
+      delivery: {} as ReservationInput['delivery'] }, args.dryRun);
     return { attempt: replay.attempt, replayed: true, steps: [] };
   }
   const config = db.checkConfiguration();
@@ -56,13 +56,24 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     schemaFamily: applicationId, schemaVersion, configRevision: config.revision, heartbeatAt: new Date().toISOString() }], caller);
   const executor = { claimId: claim!.id, generation };
   let reference: WorkerReference | undefined;
-  let terminal = false, sequence = 0;
+  let terminal = false, sequence = 0, stopRequested = false;
+  const interrupt = () => { stopRequested = true; };
+  process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
   const refresh = async () => {
     const now = new Date().toISOString();
     await db.refreshClaim(executor, now, caller);
-    if (reference) {
-      const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);
-      if (owner) await db.heartbeatWorkerOwner(id, owner.id, host);
+    const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);
+    if (owner) await db.heartbeatWorkerOwner(id, owner.id, host);
+  };
+  const withHeartbeat = async <T>(pending: Promise<T>): Promise<T> => {
+    while (true) {
+      const timer = new AbortController();
+      try {
+        const result = await Promise.race([pending.then(value => ({ kind: 'result' as const, value })),
+          delay(5000, undefined, { signal: timer.signal }).then(() => ({ kind: 'pulse' as const }))]);
+        if (result.kind === 'result') return result.value;
+        await refresh();
+      } finally { timer.abort(); }
     }
   };
   const fence = async () => {
@@ -82,8 +93,8 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, caller);
     try {
       const spec = reservation.attempt.specification;
-      const allocation = known(await runtime.workspace.acquire({ databaseId: String(spec.databaseId), attemptId: id,
-        holder: canonicalJson((spec.workspace as JsonObject).holder), branch: String(spec.outputRef).replace(/^refs\/heads\//u, ''), startingCommit: starting.commit }));
+      const allocation = known(await withHeartbeat(runtime.workspace.acquire({ databaseId: String(spec.databaseId), attemptId: id,
+        holder: canonicalJson((spec.workspace as JsonObject).holder), branch: String(spec.outputRef).replace(/^refs\/heads\//u, ''), startingCommit: starting.commit })));
       const stored: Allocation = { leaseId: allocation.leaseId, holder: (spec.workspace as JsonObject).holder as JsonObject,
         path: allocation.path, pool: runtime.workspace.options.poolRoot, repository: spec.repository as JsonObject,
         outputRef: String(spec.outputRef), startingCommit: allocation.startingCommit };
@@ -95,14 +106,18 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     await refresh();
     progress('attempt.start'); await db.startAttempt(id, caller);
     progress('worker.prepare');
-    const prepared = await prepareWorker(db, id, host, runtime.launcher);
-    if (prepared.state !== 'succeeded') throw new CommandFailure('effect_uncertain', { attemptId: id });
+    const prepared = await withHeartbeat(prepareWorker(db, id, host, runtime.launcher));
+    if (prepared.state !== 'succeeded') {
+      reference = prepared.result?.referenceHints as WorkerReference | undefined;
+      throw new CommandFailure('effect_uncertain', { attemptId: id });
+    }
     reference = prepared.result!.reference as WorkerReference;
     progress('worker.bind');
     await refresh();
     progress('worker.permit'); await db.decideWorkerLaunch(id, prepared.claimId!, 'permit', host);
+    if (stopRequested) throw new CommandFailure('policy_refused', { attemptId: id });
     progress('worker.activate');
-    const activation = await activateWorker(db, id, reference, host, runtime.launcher);
+    const activation = await withHeartbeat(activateWorker(db, id, reference, host, runtime.launcher));
     if (activation?.state !== 'succeeded') throw new CommandFailure('effect_uncertain', { attemptId: id });
     progress('worker.wait');
     const deadline = Date.now() + Number(profile.runMs);
@@ -111,7 +126,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       const observation = await runtime.launcher.inspect(reference);
       if (observation.status !== 'known') throw new CommandFailure('owner_unknown', { attemptId: id });
       if (observation.terminal) { terminal = true; break; }
-      if (observation.turn === 'ended' || Date.now() >= deadline) break;
+      if (observation.turn === 'ended' || Date.now() >= deadline || stopRequested) break;
       if (Date.now() - refreshed >= 5000) { await refresh(); refreshed = Date.now(); }
       await delay(50);
     }
@@ -124,13 +139,37 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
       payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
     progress('attempt.complete');
-    await db.completeWorker(id, host, runtime.repository);
-    if (db.attempt(id).candidate) { progress('checks.run'); await runCandidateChecks(db, id, caller, runtime.completion); }
+    await withHeartbeat(db.completeWorker(id, host, runtime.repository));
+    if (db.attempt(id).candidate) {
+      progress('checks.run');
+      let checks = await withHeartbeat(runCandidateChecks(db, id, caller, runtime.completion));
+      while (checks.state === 'pending') {
+        if (stopRequested) throw new CommandFailure('policy_refused', { attemptId: id, checksRequestId: checks.id });
+        await delay(250); await refresh();
+        checks = await withHeartbeat(runCandidateChecks(db, id, caller, runtime.completion));
+      }
+      if (checks.state === 'uncertain' || checks.state === 'claimed') throw new CommandFailure('effect_uncertain', { attemptId: id, checksRequestId: checks.id });
+    }
     return { attempt: db.attempt(id), steps };
   } finally {
-    // Do not leave a direct child behind when this foreground command fails.
+    process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
+    // A failed preparation can still own a non-acting child. Stop it using its
+    // exact returned hints, but preserve the uncertain preparation for inspection.
+    const preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
+    reference ??= preparation?.result?.referenceHints as WorkerReference | undefined;
     if (reference && !terminal) {
-      await runtime.launcher.fence(reference, `emergency-stop:${id}`);
+      const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);
+      if (owner) {
+        const identity = { claimId: owner.id, generation };
+        const stop = await db.recordEffect({ requestKey: `emergency-stop:${id}`, operation: 'worker.emergency-stop', caller,
+          input: { reference }, fingerprint: canonicalJson(reference), parentId: reservation.requestId, executor: identity,
+          attemptId: id, target: { kind: 'worker', reference } });
+        if (stop.state === 'pending') {
+          await db.claimEffect(stop.id, identity);
+          const result = await runtime.launcher.fence(reference, stop.id);
+          await db.recordEffectOutcome(stop.id, identity, result.status === 'confirmed' ? 'succeeded' : 'uncertain', JSON.parse(JSON.stringify(result)));
+        }
+      }
     }
     await db.releaseClaim(executor, { stopped: true, attemptId: id }, caller);
     if (terminal) {

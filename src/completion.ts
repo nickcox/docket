@@ -27,7 +27,7 @@ export interface CompletionServices extends CheckServices {
   readPolicy?: typeof readFinalisationPolicy;
 }
 const refuse = (message: string): never => { throw new StorageError('conflict', message); };
-class OwnerReadError extends Error {}
+export class OwnerReadError extends Error {}
 function known<T>(result: Result<T>): T {
   if (result.status === 'uncertain') throw new OwnerReadError(result.reason);
   if (result.status !== 'confirmed') refuse(result.reason);
@@ -75,15 +75,23 @@ async function planAcceptance(db: Database, input: AcceptInput, services: Comple
   return { kind: config.policy.kind as FinalisationPlan['kind'], target, expected, policyDigest: policy.digest };
 }
 
-export async function selectCandidate(db: Database, input: { attemptId: string; commit: string; caller: AcceptInput['caller'] }, services: CompletionServices) {
+export async function inspectCandidateSelection(db: Database, input: { attemptId: string; commit: string; caller: AcceptInput['caller'] }, services: CompletionServices) {
   input = structuredClone(input);
   taskActor(input.caller);
   const attempt = db.attempt(input.attemptId), ref = String(attempt.specification.outputRef);
+  if (attempt.executionOpen || !attempt.outcome || (attempt.specification.delivery as JsonObject).kind !== 'code'
+    || input.commit === attempt.specification.startingCommit || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) refuse('Candidate requires a terminal, settled code attempt and must move beyond the start');
+  if (db.events().some(e => e.attemptId === attempt.id && e.kind === 'candidate.accepted')) refuse('An accepted candidate cannot be replaced');
   const state = known(await services.repository.inspectRef(ref));
   if (state.state !== 'present' || state.commit !== input.commit) refuse('Selected branch is not at the exact candidate');
   await retainedOutput(db, input.attemptId, services);
   known(await services.repository.verifyRetention({ references: [{ ref, commit: input.commit }], artefacts: [],
     recyclableRoots: db.workerResultBinding(input.attemptId).recyclableRoots }));
+  return ref;
+}
+
+export async function selectCandidate(db: Database, input: { attemptId: string; commit: string; caller: AcceptInput['caller'] }, services: CompletionServices) {
+  const ref = await inspectCandidateSelection(db, input, services);
   return db.selectRetainedCandidate(input.attemptId, input.commit, ref, input.caller);
 }
 
@@ -120,12 +128,13 @@ async function effect(db: Database, authorisation: StoredEvent, operation: 'inte
   return request;
 }
 
-export async function planCandidateAcceptance(db: Database, input: AcceptInput, services: CompletionServices) {
+export async function planCandidateAcceptance(db: Database, input: AcceptInput, services: CompletionServices, selecting = false) {
   taskActor(input.caller);
   const attempt = db.attempt(input.attemptId);
-  exactCandidate(db, input);
+  if (selecting) await inspectCandidateSelection(db, input, services);
+  else exactCandidate(db, input);
   if (attempt.executionOpen || !attempt.outcome || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) refuse('Acceptance requires a stopped terminal worker and recorded outcome');
-  const accepted = db.acceptance(attempt.id, input.candidateId);
+  const accepted = selecting ? null : db.acceptance(attempt.id, input.candidateId);
   const finished = accepted && db.events().some(e => e.sourceKey === `acceptance.finished:${accepted.id}`);
   if (finished) return { steps: [] };
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
@@ -134,7 +143,7 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
   const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['claimed', 'uncertain'].includes(r.state));
   // Interrupted integration is reconciled by the executor, not reissued by a plan.
   if (unresolved && !unresolved.operation.startsWith('completion.')) refuse('Attempt has an unresolved effect');
-  const steps = [];
+  const steps = selecting ? [step('candidate.select', attempt.id, ['terminal', 'exact_retained_commit'])] : [];
   if (!accepted) {
     if (input.overrideReason === undefined) {
       const config = db.checkConfiguration();
@@ -220,8 +229,14 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
   if (attempt.leaseState === 'returned') return { steps: [] };
   if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
   const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
-  if (unresolved) refuse('Attempt has an unresolved effect');
-  if (attempt.outcome) await retainedOutput(db, attempt.id, services);
+  const authorisation = db.events().find(e => e.sourceKey === `return.authorised:${attempt.id}`);
+  const previous = db.requests().find(r => r.requestKey === `return:${attempt.id}`);
+  if (unresolved && unresolved.id !== previous?.id) refuse('Attempt has an unresolved effect');
+  if (previous && ['claimed', 'uncertain', 'succeeded'].includes(previous.state)) {
+    if (known(await services.workspace.inspect(allocation)).state !== 'absent') refuse('Interrupted effect remains unresolved; it will not be repeated');
+    return { steps: [step('return.reconcile', allocation.leaseId, ['owner_confirms_return'])] };
+  }
+  if (attempt.outcome && !authorisation?.payload.abandonedWithoutOutcome) await retainedOutput(db, attempt.id, services);
   if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
   if (!known(await services.repository.inspectWorkspace(allocation.path)).clean) refuse('Workspace has uncommitted or untracked work');
   return { steps: [step(input.discard ? 'attempt.discard' : 'attempt.return', allocation.leaseId, ['terminal', 'no_processes', 'matching_allocation', 'clean_workspace'])] };
@@ -230,6 +245,7 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
 export async function returnAttempt(db: Database, input: ReturnInput, services: CompletionServices) {
   input = structuredClone(input);
   taskActor(input.caller);
+  if (input.discard && db.attempt(input.attemptId).outcome === null) await planAttemptReturn(db, input, services);
   const command = await db.recordCommand({ requestKey: input.requestKey, operation: input.discard ? 'attempt.discard' : 'attempt.return',
     caller: input.caller, fingerprint: canonicalJson(input), input: JSON.parse(JSON.stringify(input)) as JsonObject });
   const authorisation = await db.authoriseReturn(input, command.id);

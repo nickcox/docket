@@ -1,6 +1,6 @@
 import { userInfo } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { canonicalJson } from './configuration.ts';
+import { canonicalJson, ConfigurationError } from './configuration.ts';
 import { initialiseContext, openContext } from './context.ts';
 import type { ContextOptions, ContextSelector } from './context.ts';
 import type { OperationDefinition } from './catalog.ts';
@@ -11,7 +11,7 @@ import type { CommandInput } from './storage/requests.ts';
 import { createRuntime } from './runtime.ts';
 import type { Runtime } from './runtime.ts';
 import { dispatch } from './dispatch.ts';
-import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn } from './completion.ts';
+import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, OwnerReadError } from './completion.ts';
 import { CommandFailure } from './response.ts';
 import { known } from './operation-utils.ts';
 import { step } from './plans.ts';
@@ -42,9 +42,12 @@ function attemptView(db: Database, id: string) {
     effects: db.requests().filter(r => r.attemptId === id && r.category === 'effect') };
 }
 function mapStorage(error: unknown, db: Database, requestKey: string): never {
-  if (!(error instanceof StorageError)) throw error;
   const request = db.requests().find(r => r.requestKey === requestKey);
   const data = request ? { requestId: requestKey, attemptId: request.attemptId } : {};
+  if (error instanceof ConfigurationError) throw error;
+  if (error instanceof CommandFailure) throw new CommandFailure(error.code, { ...data, ...error.data });
+  if (error instanceof OwnerReadError) throw new CommandFailure('owner_unknown', data);
+  if (!(error instanceof StorageError)) throw new CommandFailure('internal_failure', data);
   const blockers = db.admissionBlockers();
   const message = error.message;
   if (error.code === 'request_input_mismatch') throw new CommandFailure('request_input_mismatch', data);
@@ -80,13 +83,21 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'status.show': {
         const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!));
         const tasks = db.tasks().map(t => taskView(db, t)).filter(t => !args.attentionOnly || t.holdReason !== null || t.ready);
+        const attentionAttempts = attempts.filter(a => !args.attentionOnly || a.executionOpen || a.leaseState !== 'returned');
+        const claims = db.claims().filter(c => !c.releasedAt), effects = db.requests().filter(r => r.category === 'effect' && ['claimed', 'uncertain'].includes(r.state));
+        const entries = [...tasks.map(value => ({ key: `task:${value.id}`, kind: 'task', value })),
+          ...attentionAttempts.map(value => ({ key: `attempt:${value.id}`, kind: 'attempt', value })),
+          ...claims.map(value => ({ key: `claim:${value.id}`, kind: 'claim', value })),
+          ...effects.map(value => ({ key: `effect:${value.id}`, kind: 'effect', value }))];
+        const page = paginate(entries, args.page as Page, entry => entry.key);
+        const section = (kind: string) => page.items.filter(entry => entry.kind === kind).map(entry => entry.value);
         return { contextId: context.configuration.resolved.contextId, databaseId: context.databaseId,
           configurationRevision: context.configuration.revision, migrationState: 'current',
           capacity: { used: attempts.filter(a => a.executionOpen).length, limit: (context.configuration.resolved.limits as JsonObject).maxAttempts },
-          tasks: paginate(tasks, args.page as Page, t => t.id),
-          attempts: paginate(attempts.filter(a => !args.attentionOnly || a.executionOpen || a.leaseState !== 'returned'), args.page as Page, a => a.id),
-          claims: db.claims().filter(c => !c.releasedAt), effects: db.requests().filter(r => r.category === 'effect' && ['claimed', 'uncertain'].includes(r.state)),
-          blockers: db.admissionBlockers(), objectives: [], openPersonQuestions: [] };
+          tasks: { items: section('task'), next: page.next, total: tasks.length },
+          attempts: { items: section('attempt'), next: page.next, total: attentionAttempts.length },
+          claims: section('claim'), effects: section('effect'), page: { next: page.next, total: page.total },
+          blockers: db.admissionBlockers().slice(0, (args.page as Page).limit), objectives: [], openPersonQuestions: [] };
       }
       case 'task.show': return { task: taskView(db, db.task(id)) };
       case 'task.list': return paginate(db.tasks().map(t => taskView(db, t)).filter(t => (args.state === null || t.state === args.state) && (!args.readyOnly || t.ready)), args.page as Page, t => t.id);
@@ -104,16 +115,18 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'attempt.dispatch': return await dispatch(db, args as unknown as Parameters<typeof dispatch>[1], caller, requestKey, await services(), progress);
       case 'attempt.accept': {
         const runtime = await services(), attemptId = String(args.attemptId);
-        let attempt = db.attempt(attemptId);
-        if (args.candidateCommit !== null && attempt.candidate?.commit !== args.candidateCommit) {
-          if (args.dryRun) throw new CommandFailure('candidate_moved', { attemptId });
-          attempt = await selectCandidate(db, { attemptId, commit: String(args.candidateCommit), caller }, runtime.completion);
-        }
-        if (!attempt.candidate) throw new CommandFailure('candidate_missing', { attemptId });
-        const accept = { requestKey, attemptId, candidateId: String(attempt.candidate.id), commit: String(attempt.candidate.commit), caller,
+        const attempt = db.attempt(attemptId);
+        const selecting = args.candidateCommit !== null && attempt.candidate?.commit !== args.candidateCommit;
+        if (!attempt.candidate && !selecting) throw new CommandFailure('candidate_missing', { attemptId });
+        const accept = { requestKey, attemptId, candidateId: selecting ? 'planned-selection' : String(attempt.candidate!.id),
+          commit: selecting ? String(args.candidateCommit) : String(attempt.candidate!.commit), caller,
           ...(args.overrideReason === null ? {} : { overrideReason: String(args.overrideReason) }) };
-        const plan = await planCandidateAcceptance(db, accept, runtime.completion);
+        const plan = await planCandidateAcceptance(db, accept, runtime.completion, selecting);
         if (args.dryRun) return plan;
+        if (selecting) {
+          const selected = await selectCandidate(db, { attemptId, commit: accept.commit, caller }, runtime.completion);
+          accept.candidateId = String(selected.candidate!.id);
+        }
         for (const entry of plan.steps) progress(entry.operation);
         return { attempt: await acceptCandidate(db, accept, runtime.completion), ...plan };
       }
@@ -132,6 +145,13 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'claim.resolve': {
         if (!args.confirmStopped) throw new CommandFailure('process_confirmation_required');
         const claim = db.claim(String(args.claimId));
+        if (claim.role === 'worker_owner' && claim.attemptId) {
+          const reference = db.requests().find(r => r.attemptId === claim.attemptId && r.operation === 'worker.prepare')?.result?.reference;
+          if (reference) {
+            const observation = await (await services()).launcher.inspect(reference as import('./storage/launch.ts').WorkerReference);
+            if (observation.status === 'known' && !observation.terminal) throw new CommandFailure('owner_unresolved', { claimId: claim.id });
+          }
+        }
         const plan = { steps: claim.releasedAt ? [] : [step('claim.resolve', claim.id, ['person', 'stopped_owner', 'scoped_evidence'])], scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef } };
         if (args.dryRun) return plan;
         return { claim: await db.resolveClaimByPerson(claim.id, String(args.evidence), caller, command), ...plan };
@@ -155,7 +175,13 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           if (inspected.state === 'absent') ownerHappened = true;
           if (inspected.state === 'mismatch') throw new CommandFailure('owner_unresolved');
         } else if (request.target?.kind === 'workspace') {
-          known(await runtime.workspace.list());
+          const leases = known(await runtime.workspace.list());
+          const holder = (request.input.workspace as JsonObject | undefined)?.holder;
+          if (holder && leases.some(lease => lease.holder === canonicalJson(holder))) ownerHappened = true;
+        } else if (request.target?.kind === 'worker') {
+          const reference = db.requests().find(r => r.attemptId === request.attemptId && r.operation === 'worker.prepare')?.result?.reference ?? request.target.reference;
+          const observation = await runtime.launcher.inspect(reference as import('./storage/launch.ts').WorkerReference);
+          if (observation.status === 'known' && !observation.terminal) throw new CommandFailure('owner_unresolved', { effectId: request.id });
         }
         if (ownerHappened !== null && ownerHappened !== (args.outcome === 'happened')) throw new CommandFailure('owner_unresolved');
         if (request.category !== 'effect' || !['claimed', 'uncertain'].includes(request.state)) {

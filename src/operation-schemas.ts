@@ -14,10 +14,29 @@ const definition = (review: boolean) => object({ title: string, instructions: { 
   kind: { enum: review ? ['code', 'report', 'review'] : ['code', 'report'] }, profile: nullable(string) });
 const attempt = { attemptId: uuid };
 const planAttempt = { ...attempt, dryRun: bool };
+const view = { type: 'object' };
+const steps = { type: 'array', items: object({ operation: string, target: string, requires: { type: 'array', items: string }, conditional: bool }) };
+const paginated = (items: JsonSchema) => object({ items: { type: 'array', items }, next: nullable(string), total: { type: 'integer', minimum: 0 } });
+function outputSchema(name: string): JsonSchema {
+  if (name === 'task.list') return paginated(view);
+  if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
+  if (name.startsWith('task.')) return object({ task: view });
+  if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision'],
+    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'effects'].map(key => [key, {}])), additionalProperties: false };
+  if (name === 'status.show') return object({ contextId: string, databaseId: string, configurationRevision: { type: 'integer' }, migrationState: string,
+    capacity: view, tasks: paginated(view), attempts: paginated(view), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
+    blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
+  const variants: JsonSchema[] = [object({ steps })];
+  if (name === 'attempt.dispatch') variants.push(object({ taskId: id, steps }), object({ attempt: view, steps }), object({ attempt: view, replayed: bool, steps }));
+  else if (name.startsWith('attempt.')) variants.push(object({ attempt: view, steps }));
+  else if (name === 'claim.resolve') variants.push(object({ steps, scope: view }), object({ claim: view, steps, scope: view }));
+  else if (name === 'effect.resolve') variants.push(object({ steps, target: nullable(view) }), object({ effect: view, steps, target: nullable(view) }));
+  return { type: 'object', anyOf: variants };
+}
 function operation(name: string, description: string, properties: Record<string, JsonSchema>, mutates = true,
   roles: readonly Role[] = ['person', 'supervisor']): OperationDefinition {
   return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: [], mutates,
-    plans: Object.hasOwn(properties, 'dryRun'), outputSchema: { type: 'object', description: `The ${name} result and current progress.` },
+    plans: Object.hasOwn(properties, 'dryRun'), outputSchema: outputSchema(name),
     tool: { name: `dk_${name.replaceAll('.', '_')}`, description } };
 }
 export const coreOperations: OperationDefinition[] = [
@@ -57,10 +76,10 @@ export function validateSchema(schema: JsonSchema, value: unknown, path = '$'): 
   }
   if (schema.type === 'object') {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return path;
-    const record = value as Record<string, unknown>, properties = schema.properties as Record<string, JsonSchema>;
-    for (const key of schema.required as string[]) if (!Object.hasOwn(record, key)) return `${path}.${key}`;
+    const record = value as Record<string, unknown>, properties = (schema.properties ?? {}) as Record<string, JsonSchema>;
+    for (const key of (schema.required ?? []) as string[]) if (!Object.hasOwn(record, key)) return `${path}.${key}`;
     for (const key of Object.keys(record)) {
-      if (!Object.hasOwn(properties, key)) return `${path}.${key}`;
+      if (!Object.hasOwn(properties, key)) { if (schema.additionalProperties === false) return `${path}.${key}`; else continue; }
       const invalid = validateSchema(properties[key]!, record[key], `${path}.${key}`); if (invalid) return invalid;
     }
   }

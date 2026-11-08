@@ -51,6 +51,10 @@ function receive(line: string) {
     active = true;
     emit({ type: 'agent_start' });
     if (mode !== 'lost-ack') respond({ disposition: 'started' });
+    if (mode === 'invalid-result') {
+      const protocol = JSON.parse(request.message.split('\n\n')[2]);
+      writeFileSync(protocol.resultPath, 'invalid JSON');
+    }
     if (mode === 'result' || mode === 'code-result') {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       let commit = 'b'.repeat(40);

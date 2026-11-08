@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { writeFile, unlink } from 'node:fs/promises';
-import { acceptCandidate, returnAttempt, selectCandidate } from '../../src/completion.ts';
+import { acceptCandidate, returnAttempt, selectCandidate, planCandidateAcceptance, planAttemptReturn } from '../../src/completion.ts';
 import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
@@ -59,7 +59,7 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
   const accept = { requestKey: 'accept', attemptId: a.id, candidateId: String(candidate.id), commit: head, caller: person };
   const returns = { requestKey: 'return', attemptId: a.id, caller: person, noProcesses: { leaseId: a.allocation.leaseId } };
   return { ...f, a, services, refs, calls, accept, returns,
-    dirty: () => { clean = false; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
+    dirty: () => { clean = false; }, cleanWorkspace: () => { clean = true; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
     loseRetention: () => { retained = false; } };
 }
 
@@ -76,6 +76,11 @@ test('R11: person discards terminal missing/invalid results without retention an
       discard: { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Result unavailable' } };
     await assert.rejects(returnAttempt(f.db, input, f.services), /terminal/);
     await f.db.recordWorkerObservation(a.observation('terminal', 2), host);
+    f.dirty();
+    await assert.rejects(returnAttempt(f.db, input, f.services), /uncommitted/);
+    assert.equal(f.db.attempt(a.id).outcome, null, 'dirty discard cannot settle the outcome');
+    assert.equal(f.db.attempt(a.id).leaseState, 'held');
+    f.cleanWorkspace();
     f.services.repository.verifyRetention = async () => { throw new Error('Must not require retained output'); };
     await returnAttempt(f.db, input, f.services);
     await returnAttempt(f.db, input, f.services);
@@ -85,6 +90,21 @@ test('R11: person discards terminal missing/invalid results without retention an
     assert.equal(f.db.task(a.binding.identity.taskId as string).holdReason, 'discarded');
     assert.equal(f.db.events().filter(e => e.sourceKey === `attempt.discard_failed:${a.id}`).length, 1);
   }
+});
+
+test('R30: acceptance plans missing checks and conditional acceptance without writes; execution runs those checks', async t => {
+  const f = await fixture(t, true);
+  const events = f.db.events(), requests = f.db.requests(), claims = f.db.claims();
+  const plan = await planCandidateAcceptance(f.db, f.accept, f.services);
+  assert.deepEqual(plan.steps.map(s => s.operation), ['checks.run', 'candidate.accept', 'repository.integrate', 'task.complete']);
+  assert.equal(plan.steps[1]!.conditional, true);
+  assert.deepEqual(f.db.events(), events); assert.deepEqual(f.db.requests(), requests); assert.deepEqual(f.db.claims(), claims);
+  assert.deepEqual(f.calls, []);
+  await acceptCandidate(f.db, f.accept, f.services);
+  assert.deepEqual(f.calls, ['fast', 'full', 'integrate']);
+  assert.deepEqual((await planCandidateAcceptance(f.db, f.accept, f.services)).steps, []);
+  const returnPlan = await planAttemptReturn(f.db, f.returns, f.services);
+  assert.deepEqual(returnPlan.steps.map(s => s.target), [f.a.allocation.leaseId]);
 });
 
 test('R10: acceptance runs fast/full checks once, records the exact candidate and keeps manual output and lease', async t => {
@@ -422,6 +442,11 @@ test('R10/R11/R25: task completion and returned state roll back with failed expl
 test('R11: explicit retained branch selection creates a fresh exact candidate and requires fresh checks', async t => {
   const f = await fixture(t), commit = 'c'.repeat(40);
   f.refs.set(f.a.binding.outputRef, commit);
+  f.services.repository.inspectWorkspace = async () => confirmed({ branch: f.a.binding.outputRef, head: commit, clean: true, uncommitted: [], untracked: [] });
+  const beforeSelection = f.db.attempt(f.a.id);
+  const plan = await planCandidateAcceptance(f.db, { ...f.accept, candidateId: 'planned-selection', commit }, f.services, true);
+  assert.equal(plan.steps[0]!.operation, 'candidate.select');
+  assert.deepEqual(f.db.attempt(f.a.id), beforeSelection);
   await selectCandidate(f.db, { attemptId: f.a.id, commit, caller: person }, f.services);
   const selected = f.db.attempt(f.a.id).candidate!;
   assert.notEqual(selected.id, f.accept.candidateId);

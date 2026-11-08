@@ -6,10 +6,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { configuration } from '../fixtures/configuration.ts';
-import { Database } from '../../src/storage/database.ts';
+import { Database, applicationId } from '../../src/storage/database.ts';
+import { userInfo } from 'node:os';
 const entry = fileURLToPath(new URL('../../bin/docket.ts', import.meta.url));
 const peer = fileURLToPath(new URL('../fixtures/pi-peer.ts', import.meta.url));
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, mode = 'code-result') {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-operations-')));
   t.after(() => rm(home, { recursive: true, force: true }));
   const repo = join(home, 'repository'); await mkdir(repo);
@@ -30,7 +31,7 @@ async function fixture(t: test.TestContext) {
   const invoke = (operation: string, args: object, key?: string) => {
     const result = spawnSync(process.execPath, [entry, ...operation.split('.'), '--config', file, '--stdin', '--json', ...(key ? ['--request-id', key] : [])], {
       encoding: 'utf8', input: JSON.stringify(args), timeout: 20000,
-      env: { ...process.env, HOME: home, USERPROFILE: home, PEER_MODE: 'code-result', PEER_RECORD: join(home, 'peer.jsonl') },
+      env: { ...process.env, HOME: home, USERPROFILE: home, PEER_MODE: mode, PEER_RECORD: join(home, 'peer.jsonl') },
     });
     assert.ifError(result.error); assert.equal(result.signal, null);
     assert.equal(result.stdout.split('\n').length, 2, result.stdout);
@@ -73,6 +74,64 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(f.invoke('task.show', { taskId: 'feature' }).data.task.state, 'done');
   const records = (await readFile(join(f.home, 'peer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.equal(records.filter(r => r.type === 'prompt').length, 1);
+});
+
+test('R11: CLI discards terminal missing/invalid output, refuses dirty work and frees capacity after the exact lease returns', async t => {
+  for (const mode of ['missing-result', 'invalid-result']) {
+    const f = await fixture(t, mode);
+    f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+    const failed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+    assert.equal(failed.envelope.code, 'result_invalid');
+    const attemptId = failed.data.attemptId;
+    assert.ok(attemptId);
+    const before = f.invoke('attempt.show', { attemptId }).data;
+    assert.equal(before.outcome, null); assert.equal(before.executionOpen, true);
+    const discard = { attemptId, confirmDiscard: true, noProcesses: true, reason: 'Result is unusable', dryRun: false };
+    const dirty = join(before.allocation.path, 'untracked');
+    await writeFile(dirty, 'Keep this work');
+    assert.equal(f.invoke('attempt.discard', discard).envelope.code, 'workspace_dirty');
+    assert.equal(f.invoke('attempt.show', { attemptId }).data.outcome, null);
+    await rm(dirty);
+    const returned = f.invoke('attempt.discard', discard, 'discard');
+    assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
+    assert.equal(returned.data.attempt.outcome, 'failed');
+    assert.equal(returned.data.attempt.executionOpen, false);
+    assert.equal(returned.data.attempt.leaseState, 'returned');
+    assert.equal(f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data.capacity.used, 0);
+  }
+});
+
+test('A16/A49/R30: stale claim and uncertain effect block dispatch until scoped person resolutions; plans do not write', async t => {
+  const f = await fixture(t);
+  f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+  const options = { readOnly: false, location: { retainedRoot: f.config.stateDirectory, recyclableRoots: [f.config.workspace.poolRoot] } };
+  const db = await Database.open(f.config.databasePath, options);
+  const person = { kind: 'person' as const, id: String(userInfo().uid) };
+  const [claim] = await db.registerClaims([{ resourceKey: 'owner', role: 'maintenance', generation: 'test-generation', ownerRef: person,
+    schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
+  const command = await db.recordCommand({ requestKey: 'original', operation: 'original', caller: person, fingerprint: 'original', input: {} });
+  const executor = { claimId: claim!.id, generation: claim!.generation };
+  const effect = await db.recordEffect({ requestKey: 'uncertain', operation: 'worker.test', caller: person, fingerprint: 'effect', input: {},
+    parentId: command.id, executor, target: { kind: 'worker', reference: { launcher: 'pi', ownerId: 'lost-owner' } } });
+  await db.claimEffect(effect.id, executor);
+  await db.recordEffectOutcome(effect.id, executor, 'uncertain', { reason: 'Lost response' });
+  await db.refreshClaim(executor, new Date(Date.now() - 60000).toISOString(), person);
+  db.close();
+  const dispatch = () => f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: true });
+  assert.equal(dispatch().status, 1);
+  const resolve = { claimId: claim!.id, evidence: 'Inspected the exact owner and stopped its processes', confirmStopped: true, dryRun: true };
+  assert.equal(f.invoke('claim.resolve', { ...resolve, confirmStopped: false }).envelope.code, 'process_confirmation_required');
+  const bytes = await readFile(f.config.databasePath);
+  assert.equal(f.invoke('claim.resolve', resolve).status, 0);
+  assert.deepEqual(await readFile(f.config.databasePath), bytes);
+  assert.equal(dispatch().status, 1, 'age and a plan are not proof');
+  assert.equal(f.invoke('claim.resolve', { ...resolve, dryRun: false }, 'resolve-claim').status, 0);
+  assert.equal(dispatch().status, 1, 'the uncertain effect still blocks');
+  const effectArgs = { effectId: effect.id, outcome: 'not_happened', evidence: 'Exact owner inspected; no activation was sent', confirmStopped: true, dryRun: false };
+  assert.equal(f.invoke('effect.resolve', { ...effectArgs, evidence: ' ' }).status, 2);
+  assert.equal(f.invoke('effect.resolve', effectArgs, 'resolve-effect').status, 0);
+  assert.equal(f.invoke('effect.resolve', effectArgs, 'resolve-effect').status, 0, 'resolution is replayable');
+  assert.equal(dispatch().status, 0);
 });
 
 test('R28/R27: strict task inputs, mutations, revisions, replay and paginated reads share one envelope', async t => {

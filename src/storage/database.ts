@@ -468,6 +468,7 @@ export class Database {
         this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, state, result, created_at)
           VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', 'succeeded', ?, ?)`)
           .run(id, command.requestKey, command.operation, json(command.caller), command.fingerprint, json(command.input), json({ value }), new Date().toISOString());
+        this.storageEvent('request.succeeded', command.caller, { operation: command.operation }, id);
       }
       return value;
     });
@@ -506,7 +507,9 @@ export class Database {
     return this.writeTask(command, () => {
       const before = this.decodeTask(this.taskRow(id));
       if (expectedRevision !== undefined && before.definitionRevision !== expectedRevision) throw new StorageError('conflict', 'Task revision changed');
-      if (before.kind === 'review' && (value.kind !== undefined || value.criteria !== undefined || value.instructions !== undefined)) throw new StorageError('conflict', 'Linked review definition cannot change');
+      if ((before.kind !== 'review' && value.kind === 'review') || (before.kind === 'review'
+        && ((value.kind !== undefined && value.kind !== before.kind) || (value.criteria !== undefined && json(value.criteria) !== json(before.criteria))
+          || (value.instructions !== undefined && value.instructions !== before.instructions)))) throw new StorageError('conflict', 'Linked review definition cannot change');
       const after = { ...before, ...value };
       if (json(before) === json(after)) return before;
       this.changed(this.db.prepare(`UPDATE tasks SET title = ?, instructions = ?, criteria = ?, kind = ?,
