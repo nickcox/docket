@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { canonicalPath, ConfigurationError, inside, parseConfiguration, strictJson } from './configuration.ts';
 import type { ResolvedConfiguration } from './configuration.ts';
 import { Database, StorageError } from './storage/database.ts';
@@ -67,6 +69,29 @@ export async function resolveContext(selector: ContextSelector, options: Context
   return { ...configuration, file };
 }
 
+/** Keep this file in place: SQLite locks its inode and releases it on process exit. */
+async function lockRegistry(path: string): Promise<DatabaseSync> {
+  await canonicalPath(path, '$registry.lock');
+  const file = await open(path, 'a', 0o600);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$registry.lock', 'Expected a regular file without hard links');
+  } finally { await file.close(); }
+  const lock = new DatabaseSync(path, { timeout: 0 });
+  try {
+    const deadline = performance.now() + 5000;
+    for (;;) {
+      try { lock.exec('BEGIN IMMEDIATE'); return lock; }
+      catch (error) {
+        if (!(error instanceof Error) || !('errcode' in error) || ![5, 6].includes(Number(error.errcode) & 0xff)) throw error;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw new ContextError('storage_busy', 'Context registry remained locked after 5000ms; retry the initialisation');
+        await sleep(Math.min(20, remaining));
+      }
+    }
+  } catch (error) { lock.close(); throw error; }
+}
+
 /** The registry lock serialises initialisers across names, including path collision checks. */
 export async function initialiseContext(selector: ContextSelector, options: ContextOptions & { caller: TaskActor }): Promise<Record<string, unknown>> {
   const configuration = await resolveContext(selector, options);
@@ -74,17 +99,9 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
   const path = registryPath(options);
   await canonicalPath(dirname(path), '$registry');
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const lockPath = `${path}.lock`;
-  let lock;
-  try { lock = await open(lockPath, 'wx', 0o600); }
-  catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'EEXIST') throw new ContextError('storage_busy', 'Context registry is locked; inspect its owner before retrying');
-    throw error;
-  }
+  const lock = await lockRegistry(`${path}.lock.sqlite`);
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
-    await lock.writeFile(`${JSON.stringify({ pid: process.pid, contextId: config.contextId, configurationFile: file })}\n`);
-    await lock.sync();
     const entries = await registry(path);
     if (Object.hasOwn(entries, config.contextId)) throw new ContextError('context_registered', 'Context name is already registered');
     for (const existingFile of Object.values(entries)) {
@@ -137,7 +154,7 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
     try {
       try { await unlink(temporary); } catch (error) { if (!missing(error)) throw error; }
     } finally {
-      try { await lock.close(); } finally { await unlink(lockPath); }
+      lock.close();
     }
   }
 }

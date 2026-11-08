@@ -104,7 +104,7 @@ test('A01/R39: a nonempty database refuses without touching its bytes, registry 
   assert.deepEqual(await readFile(f.config.databasePath), bytes);
   assert.equal(await readFile(f.registry, 'utf8'), '{}\n');
   await assert.rejects(lstat(f.config.workspace.poolRoot), { code: 'ENOENT' });
-  assert.deepEqual(await readdir(join(f.home, '.config', 'docket')), ['contexts.json']);
+  assert.deepEqual(await readdir(join(f.home, '.config', 'docket')), ['contexts.json', 'contexts.json.lock.sqlite']);
 });
 
 test('A01/R39: a zero-length file is initialised, but an existing context database under a new name is never adopted', async t => {
@@ -211,13 +211,13 @@ test('R01/R39: an edited registered configuration cannot hide storage collisions
   await assert.rejects(lstat(other.stateDirectory), { code: 'ENOENT' });
 });
 
-test('R39: a held registry lock refuses without changing it or creating context state', async t => {
+test('R39: a legacy lock file does not block initialisation', async t => {
   const f = await fixture(t);
   await mkdir(join(f.home, '.config', 'docket'), { recursive: true });
   const lock = await open(`${f.registry}.lock`, 'wx');
   await lock.close();
-  await assert.rejects(initialiseContext({ config: f.file }, f.options), contextError('storage_busy'));
-  await assert.rejects(lstat(f.config.stateDirectory), { code: 'ENOENT' });
+  await initialiseContext({ config: f.file }, f.options);
+  assert.deepEqual(JSON.parse(await readFile(f.registry, 'utf8')), { example: f.file });
   assert.ok((await lstat(`${f.registry}.lock`)).isFile());
 });
 
