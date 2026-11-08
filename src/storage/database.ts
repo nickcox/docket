@@ -11,6 +11,9 @@ import type { WorkerReference, InitialPromptAdmission, LaunchDecision, WorkerHos
 import { readWorkerResult, workerObservation } from './results.ts';
 import type { ResultBinding, ValidatedResult, WorkerObservation } from './results.ts';
 import type { GitRepository } from '../adapters/repository.ts';
+import { checkEvidenceKey } from '../check-policy.ts';
+import type { CheckAdmission, CheckRunInput, CheckRunResult } from './checks.ts';
+import type { ContextChecks } from '../check-policy.ts';
 import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState } from './tasks.ts';
 
 import { claimIdentity, claimInput, heartbeatStatus, text, timestamp } from './claims.ts';
@@ -1131,6 +1134,110 @@ export class Database {
       }
       this.launchEvent(attemptId, taskId, actor, 'attempt.completed', { outcome, candidate, resultDigest: result.digest });
       return this.decodeAttempt(this.attemptRow(attemptId));
+    });
+  }
+
+  /** Current person-controlled context additions; repository requirements are resolved by the adapter. */
+  checkConfiguration(): { targetBranch: string; checks: ContextChecks; revision: number; digest: string } {
+    return this.snapshot(() => {
+      const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+      if (!row) throw new StorageError('conflict', 'Missing check configuration');
+      const payload = this.decodeEvent(row).payload, resolved = object(payload.resolved);
+      const finalisation = object(resolved.finalisation), checks = object(resolved.checks) as ContextChecks;
+      text(finalisation.targetBranch);
+      return { targetBranch: finalisation.targetBranch, checks, revision: Number(payload.revision), digest: String(payload.digest) };
+    });
+  }
+
+  /** Admission and slot ownership commit together. A lost executor never frees its slot by age. */
+  async beginChecks(input: CheckRunInput): Promise<CheckAdmission> {
+    taskActor(input.caller); text(input.attemptId);
+    const value = JSON.parse(json(input)) as CheckRunInput;
+    return this.write(() => {
+      const attempt = this.attemptRow(value.attemptId), spec = object(JSON.parse(String(attempt.specification)));
+      const result = this.validatedResultInTransaction(value.attemptId);
+      const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
+        AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(value.attemptId);
+      const candidate = attempt.candidate === null ? null : object(JSON.parse(String(attempt.candidate)));
+      if (!terminal || !result || candidate?.commit !== value.commit || attempt.allocation === null) {
+        throw new StorageError('conflict', 'Checks require a terminal worker, validated result and recorded candidate');
+      }
+      const key = checkEvidenceKey(object(spec.repository), value.commit, spec.criteria as string[], value.checks, value.profile);
+      const logical = { attemptId: value.attemptId, commit: value.commit, evidenceKey: key };
+      const command: CommandInput = { requestKey: value.requestKey ?? `checks:auto:${value.attemptId}:${key}`,
+        operation: 'checks.run', caller: value.caller, input: logical, fingerprint: json(logical) };
+      let request = this.duplicateRequest(command, 'command');
+      if (request && request.state !== 'pending') return { request, execute: false, executor: null };
+      if (!request) {
+        const id = randomUUID();
+        this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, attempt_id, created_at)
+          VALUES (?, ?, 'command', 'checks.run', ?, ?, ?, '{}', ?, ?)`).run(id, command.requestKey, json(command.caller),
+            command.fingerprint, json({ ...logical, checks: value.checks, profile: value.profile }), value.attemptId, new Date().toISOString());
+        request = this.decodeRequest(this.requestRow(id));
+      }
+      const previous = this.db.prepare(`SELECT * FROM requests WHERE operation = 'checks.run' AND id <> ?
+        AND json_extract(input, '$.evidenceKey') = ? AND state IN ('succeeded', 'rejected') ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(request.id, key);
+      if (previous && (previous.state === 'succeeded' || value.requestKey === undefined)) {
+        const reused = this.decodeRequest(previous);
+        this.db.prepare('UPDATE requests SET state = ?, result = ?, revision = revision + 1 WHERE id = ?')
+          .run(reused.state, json(reused.result), request.id);
+        this.storageEvent('checks.reused', value.caller, { evidenceKey: key, sourceRequestId: reused.id, attemptId: value.attemptId }, request.id);
+        this.applyCheckOutcome(value.attemptId, reused.result as CheckRunResult);
+        return { request: this.decodeRequest(this.requestRow(request.id)), execute: false, executor: null };
+      }
+      // A run of this identity already in flight must not be duplicated, even with a new request.
+      const inFlight = this.db.prepare(`SELECT 1 FROM requests WHERE operation = 'checks.run' AND id <> ?
+        AND json_extract(input, '$.evidenceKey') = ? AND state IN ('claimed', 'uncertain')`).get(request.id, key);
+      const configured = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get()!;
+      const resolved = object(this.decodeEvent(configured).payload.resolved), limits = object(resolved.limits);
+      const maximum = Number(limits.maxConcurrentFullChecks ?? 1);
+      if (!Number.isSafeInteger(maximum) || maximum < 1) throw new TypeError('Invalid full-check capacity');
+      const active = Number(this.db.prepare("SELECT count(*) AS n FROM claims WHERE role = 'check_executor' AND released_at IS NULL").get()!.n);
+      if (inFlight || active >= maximum) {
+        this.db.prepare("UPDATE attempts SET phase = 'awaiting_checks', revision = revision + 1 WHERE id = ?").run(value.attemptId);
+        this.storageEvent('checks.waiting', value.caller, { attemptId: value.attemptId, evidenceKey: key }, request.id);
+        return { request, execute: false, executor: null };
+      }
+      const generation = randomUUID();
+      const [claim] = this.registerClaimsInTransaction([{ resourceKey: `checks:${request.id}`, role: 'check_executor',
+        attemptId: value.attemptId, generation, ownerRef: object(value.caller), schemaFamily: applicationId,
+        schemaVersion, configRevision: this.configRevision(), heartbeatAt: new Date().toISOString() }], value.caller);
+      this.db.prepare("UPDATE requests SET state = 'claimed', claim_id = ?, claimed_at = ?, revision = revision + 1 WHERE id = ?")
+        .run(claim!.id, new Date().toISOString(), request.id);
+      this.db.prepare("UPDATE attempts SET phase = 'awaiting_checks', revision = revision + 1 WHERE id = ?").run(value.attemptId);
+      this.storageEvent('checks.started', value.caller, { attemptId: value.attemptId, evidenceKey: key }, request.id);
+      return { request: this.decodeRequest(this.requestRow(request.id)), execute: true, executor: { claimId: claim!.id, generation } };
+    });
+  }
+
+  private applyCheckOutcome(attemptId: string, result: CheckRunResult): void {
+    const attempt = this.attemptRow(attemptId), task = this.taskRow(String(attempt.task_id));
+    this.db.prepare('UPDATE attempts SET phase = ?, revision = revision + 1 WHERE id = ?')
+      .run(result.status === 'uncertain' ? 'needs_resolution' : 'settled', attemptId);
+    if (task.decision_revision === attempt.started_decision_revision) {
+      this.db.prepare('UPDATE tasks SET hold_reason = ? WHERE id = ? AND decision_revision = ?')
+        .run(result.status === 'passed' ? 'awaiting_acceptance' : result.status === 'failed' ? 'checks_failed' : 'checks_uncertain',
+          String(attempt.task_id), Number(task.decision_revision));
+    }
+  }
+
+  async finishChecks(requestId: string, executor: ClaimIdentity, result: CheckRunResult): Promise<StoredRequest> {
+    claimIdentity(executor);
+    const value = object(result) as CheckRunResult;
+    if (!['passed', 'failed', 'uncertain'].includes(value.status)) throw new TypeError('Invalid check outcome');
+    return this.write(() => {
+      const request = this.decodeRequest(this.requestRow(requestId)), claim = this.activeClaim(executor);
+      if (request.operation !== 'checks.run' || request.state !== 'claimed' || request.claimId !== claim.id
+        || request.input.evidenceKey !== value.evidenceKey) throw new StorageError('conflict', 'Check executor or evidence mismatch');
+      const state = value.status === 'passed' ? 'succeeded' : value.status === 'failed' ? 'rejected' : 'uncertain';
+      this.db.prepare('UPDATE requests SET state = ?, result = ?, revision = revision + 1 WHERE id = ?').run(state, json(value), requestId);
+      if (value.status !== 'uncertain') {
+        this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
+          .run(new Date().toISOString(), json({ requestId, status: value.status }), claim.id);
+      }
+      this.applyCheckOutcome(request.attemptId!, value);
+      this.storageEvent('checks.finished', request.caller, { attemptId: request.attemptId!, ...value }, requestId);
+      return this.decodeRequest(this.requestRow(requestId));
     });
   }
 

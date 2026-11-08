@@ -2,6 +2,7 @@ import type { JsonObject } from './storage/database.ts';
 import { Database } from './storage/database.ts';
 import type { ClaimIdentity } from './storage/claims.ts';
 import type { Allocation, Reservation, ReservationInput } from './storage/reservations.ts';
+import type { GitRepository } from './adapters/repository.ts';
 
 /** The workspace adapter must check all owner evidence before returning a confirmed allocation. */
 export interface WorkspaceProvider {
@@ -16,6 +17,18 @@ export class WorkspaceAcquisitionError extends Error {
     this.name = 'WorkspaceAcquisitionError';
     this.evidence = evidence;
   }
+}
+
+/** Trusted dispatch entry point. A replay does not need to read a policy that may since have changed. */
+export async function reserveWithTrustedChecks(db: Database, input: Omit<ReservationInput, 'checks'>,
+  repository: Pick<GitRepository, 'readCheckPolicy'>): Promise<Reservation> {
+  if (db.requests().some(request => request.requestKey === input.requestKey)) {
+    return db.reserveAttempt({ ...input, checks: {} as ReservationInput['checks'] });
+  }
+  const config = db.checkConfiguration();
+  const target = config.targetBranch.startsWith('refs/') ? config.targetBranch : `refs/heads/${config.targetBranch}`;
+  const checks = await repository.readCheckPolicy(target, config.checks);
+  return db.reserveAttempt({ ...input, checks, expectedConfigRevision: config.revision, expectedConfigDigest: config.digest });
 }
 
 /** No provider or filesystem work occurs under a SQLite transaction. Replays only inspect progress. */

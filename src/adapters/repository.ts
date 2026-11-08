@@ -4,6 +4,8 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative } from "node:path";
 import { commandRunner, confirmed, gitEnvironment, isCommit, isRef, rejected, uncertain } from "./command.ts";
 import type { Command, Result, Runner } from "./command.ts";
+import { parseCheckPolicy } from '../check-policy.ts';
+import type { CheckPolicy, ContextChecks } from '../check-policy.ts';
 
 export type RefState = { state: "absent" } | { state: "present"; commit: string };
 export type WorkspaceState = { branch: string | null; head: string; clean: boolean; uncommitted: string[]; untracked: string[] };
@@ -49,6 +51,19 @@ export class GitRepository {
     const commit = read.stdout.trim();
     if (!read.complete || read.code !== 0 || !isCommit(commit)) return uncertain("Ref commit could not be read", read);
     return confirmed({ state: "present", commit });
+  }
+  /** Read a fixed tree from the trusted target, never from the worker's worktree. */
+  async readCheckPolicy(target: string, context: ContextChecks): Promise<CheckPolicy> {
+    const ref = await this.inspectRef(target);
+    if (ref.status !== 'confirmed' || ref.value.state !== 'present') throw new Error('Trusted check target cannot be read');
+    const sourceCommit = ref.value.commit;
+    const entry = await this.command(['ls-tree', '-z', sourceCommit, '--', '.docket/checks.json']);
+    if (!entry.complete || entry.code !== 0) throw new Error('Trusted check policy cannot be read');
+    if (entry.stdout === '') return parseCheckPolicy(sourceCommit, null, context);
+    if (!/^100644 blob [a-f0-9]+\t\.docket\/checks\.json\0$/.test(entry.stdout)) throw new Error('Check policy must be a regular file');
+    const content = await this.command(['show', `${sourceCommit}:.docket/checks.json`]);
+    if (!content.complete || content.code !== 0) throw new Error('Trusted check policy cannot be read');
+    return parseCheckPolicy(sourceCommit, content.stdout, context);
   }
   async inspectWorkspace(path: string): Promise<Result<WorkspaceState>> {
     const head = await this.command(["rev-parse", "--verify", "HEAD^{commit}"], path);

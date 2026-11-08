@@ -7,14 +7,25 @@ import type { StoredRequest } from './storage/requests.ts';
 import type { WorkerObservation } from './storage/results.ts';
 import type { Attempt } from './storage/reservations.ts';
 import type { GitRepository } from './adapters/repository.ts';
+import { runCandidateChecks } from './checks.ts';
+import type { CheckServices } from './checks.ts';
+import type { TaskActor } from './storage/tasks.ts';
 
 /** Observations are retained before result processing, so a refusal cannot lose a terminal fact. */
 export async function observeWorker(db: Database, observation: WorkerObservation, host: WorkerHost,
-  repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>): Promise<Attempt> {
+  repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>,
+  checks?: { caller: TaskActor; services: CheckServices }): Promise<Attempt> {
   await db.recordWorkerObservation(observation, host);
   if (observation.kind === 'result_available') await db.validateWorkerResult(observation.attemptId, host, repository);
   // Turn-end and idle are not completion evidence. They may reconcile facts already recorded.
-  if (db.validatedWorkerResult(observation.attemptId)) return db.completeWorker(observation.attemptId, host, repository);
+  if (db.validatedWorkerResult(observation.attemptId)) {
+    const attempt = await db.completeWorker(observation.attemptId, host, repository);
+    if (attempt.candidate && checks) {
+      await runCandidateChecks(db, attempt.id, checks.caller, checks.services);
+      return db.attempt(attempt.id);
+    }
+    return attempt;
+  }
   return db.attempt(observation.attemptId);
 }
 

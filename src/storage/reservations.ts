@@ -2,6 +2,7 @@ import { isAbsolute, resolve } from 'node:path';
 import type { JsonObject } from './database.ts';
 import type { Task, TaskActor } from './tasks.ts';
 import { fields, positive, text } from './claims.ts';
+import { definitions } from '../check-policy.ts';
 
 export interface CheckDefinition extends JsonObject {
   name: string;
@@ -96,17 +97,11 @@ export function reservationInput(value: ReservationInput): void {
 /** Only invoked for a new key: replay must not revalidate resolved repository evidence. */
 export function reservationEvidence(value: ReservationInput): void {
   commit(value.startingCommit);
-  fields(value.checks, ['sourceCommit', 'digest', 'fast', 'full']);
+  fields(value.checks, ['sourceCommit', 'digest', 'fast', 'full', 'present', 'sourceDigest', 'executionProfile']);
   commit(value.checks.sourceCommit); text(value.checks.digest);
   const names = new Set<string>();
   for (const set of [value.checks.fast, value.checks.full]) {
-    if (!Array.isArray(set)) throw new TypeError('Expected check set');
-    for (const check of set) {
-      fields(check, ['name', 'command', 'timeoutMs', 'goalMs']);
-      text(check.name); positive(check.timeoutMs);
-      if (check.goalMs !== undefined) positive(check.goalMs);
-      if (!Array.isArray(check.command) || check.command.length === 0) throw new TypeError('Expected check command');
-      check.command.forEach(text);
+    for (const check of definitions(set)) {
       if (names.has(check.name)) throw new TypeError('Duplicate check name');
       names.add(check.name);
     }
