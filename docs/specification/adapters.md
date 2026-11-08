@@ -30,6 +30,8 @@ Every binding carries attempt/database identity, profile digest, allocation, int
 
 Adapter effects return confirmed(value), rejected(reason,evidence), or uncertain(reason,referenceHints). Inspect returns absent only after complete successful lookup. No adapter hides SDK retries that might activate/send twice. Unsupported operations refuse before effect. Preparation/activation/terminal semantics are each tested for every launcher.
 
+A worker's environment contains only `PATH`, `HOME`, `TMPDIR` and `LANG`; the proxy variables `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and `NODE_USE_ENV_PROXY` when the host sets them; the credentials its profile references; and any further variable names that its execution profile lists in person-controlled host configuration. No `DOCKET_` variable is passed to a worker. The rest of the environment of the process that starts the worker is not inherited.
+
 ## Workspaces and repository
 
 **R32.** Workspace operations are acquire, inspect/list, recyclableRoots and return. Every allocation has leaseId, task holder, path, pool/repository identity, branch and starting commit. Return requires exact matching identity and an authorised core return request. A path alone cannot identify a lease. Missing listed leases in a different pool are unknown.
