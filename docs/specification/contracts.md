@@ -71,8 +71,10 @@ Core data views:
 | task | id, title, instructions, criteria, kind, profile, objectiveId, state, holdReason, position, definitionRevision, decisionRevision, blockedBy, ready |
 | attempt | full identity, phase/executionOpen, launchState, immutable specification/allocation/workerRef, candidate, terminal evidence, outcome, taskTransitionApplied, acceptance/integration/lease facts and revision |
 | request | ID/key/operation/state, selected attempt, linked effects with outcomes, bounded diagnostics and next action |
-| status | context identity/config revision, migration state, capacity, tasks/attempts needing action, objectives, open person questions, claims/effects with unknowns, and counts/pagination |
+| status | context identity/config revision, migration state, capacity, compact tasks/attempts, objectives, open person questions, claims/effects with unknowns, and counts/pagination |
 | evidence | candidate identity, required check-set identity and each result, exact review/verdict, scoped acceptance and blockers |
+
+Status task records contain id, title, state, ready, holdReason and blockedBy. Status attempt records contain id, taskId, number, phase, outcome, leaseState, candidateCommit and checksState. They do not contain task instructions or the immutable attempt specification; `attempt.show` supplies full attempt detail. Both compact records also contain reason and nextAction, nullable when no action is needed. With `attentionOnly: true`, only items needing a person or supervisor are listed, each with a reason and next action. Claims, effects and blockers retain their existing fields, with attention explanations added in that mode.
 
 ## Operation and tool catalogue
 

@@ -76,6 +76,25 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   const attempt = dispatched.data.attempt;
   assert.equal(attempt.outcome, 'completed'); assert.equal(attempt.executionOpen, false);
   assert.equal(f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch').data.attempt.id, attempt.id);
+  const detail = f.invoke('attempt.show', { attemptId: attempt.id }).data;
+  assert.equal(detail.specification.task.instructions, definition.instructions, 'R27: attempt.show retains full instructions');
+  for (const attentionOnly of [false, true]) {
+    const status = f.invoke('status.show', { attentionOnly, page: { after: null, limit: 100 } }).data;
+    assert.equal(JSON.stringify(status).includes(definition.instructions), false, 'R27: status excludes task instructions');
+    assert.equal(JSON.stringify(status).includes('specification'), false);
+    assert.equal(status.attempts.items[0].candidateCommit, attempt.candidate.commit);
+    assert.equal(status.attempts.items[0].checksState, 'passed');
+    assert.match(status.attempts.items[0].reason, /awaiting acceptance/u);
+    assert.equal(status.attempts.items[0].nextAction.operation, 'attempt.accept');
+    for (const item of [...status.tasks.items, ...status.attempts.items]) {
+      assert.ok(item.reason); assert.ok(item.nextAction.description);
+    }
+    const schema = findOperation('status.show')!.outputSchema;
+    const extra = structuredClone(status); extra.attempts.items[0].specification = {};
+    assert.notEqual(validateSchema(schema, extra), null, 'A52: catalogue refuses full attempt detail in status');
+    const missing = structuredClone(status); delete missing.tasks.items[0].ready;
+    assert.notEqual(validateSchema(schema, missing), null, 'A52: catalogue requires compact task fields');
+  }
   const acceptArgs = { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: true };
   const bytes = await snapshot(f.home);
   const acceptancePlan = f.invoke('attempt.accept', acceptArgs);
@@ -85,12 +104,33 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
   assert.deepEqual(accepted.data.steps, acceptancePlan.data.steps);
   assert.equal(f.git('rev-parse', 'main'), attempt.candidate.commit);
+  const held = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.attempts.items[0];
+  assert.equal(held.reason, 'Lease is held.', 'R27: accepted output still requires lease attention');
+  assert.equal(held.nextAction.operation, 'attempt.show');
   const returned = f.invoke('attempt.return', { attemptId: attempt.id, noProcesses: true, dryRun: false }, 'return');
   assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
   assert.equal(returned.data.attempt.leaseState, 'returned');
   assert.equal(f.invoke('task.show', { taskId: 'feature' }).data.task.state, 'done');
   const records = (await readFile(join(f.home, 'peer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.equal(records.filter(r => r.type === 'prompt').length, 1);
+});
+
+test('R27/A52: failed checks appear in compact attention status with a reason and next action', async t => {
+  const f = await fixture(t);
+  await mkdir(join(f.repo, '.docket'));
+  await writeFile(join(f.repo, '.docket', 'checks.json'), JSON.stringify({ version: 1, fast: [],
+    full: [{ name: 'fails', command: [process.execPath, '-e', 'process.exit(1)'], timeoutMs: 5000 }] }));
+  f.git('add', '.'); f.git('commit', '-qm', 'Add failing check');
+  f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+  f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+  const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  assert.equal(status.status, 0, JSON.stringify(status.envelope));
+  const attempt = status.data.attempts.items[0];
+  assert.equal(attempt.checksState, 'failed');
+  assert.equal(attempt.reason, 'Candidate checks failed.');
+  assert.equal(attempt.nextAction.operation, 'attempt.show');
+  assert.equal(status.data.tasks.items[0].holdReason, 'checks_failed');
+  assert.equal(JSON.stringify(status.data).includes(definition.instructions), false);
 });
 
 test('R11: CLI discards terminal missing/invalid output, refuses dirty work and frees capacity after the exact lease returns', async t => {
@@ -134,6 +174,17 @@ test('A16/A49/R30: stale claim and uncertain effect block dispatch until scoped 
   await db.recordEffectOutcome(effect.id, executor, 'uncertain', { reason: 'Lost response' });
   await db.refreshClaim(executor, new Date(Date.now() - 60000).toISOString(), person);
   db.close();
+  const attention = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data;
+  assert.equal(attention.claims.length, 1);
+  assert.match(attention.claims[0].reason, /stale/u);
+  assert.equal(attention.claims[0].nextAction.operation, 'claim.resolve');
+  assert.equal(attention.effects.length, 1);
+  assert.match(attention.effects[0].reason, /uncertain/u);
+  assert.equal(attention.effects[0].nextAction.operation, 'request.show');
+  for (const item of [...attention.tasks.items, ...attention.claims, ...attention.effects, ...attention.blockers]) {
+    assert.ok(item.reason, 'R27: every attention item explains why');
+    assert.ok(item.nextAction.description, 'R27: every attention item has a next action');
+  }
   const dispatch = () => f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: true });
   assert.equal(dispatch().status, 1);
   const resolve = { claimId: claim!.id, evidence: 'Inspected the exact owner and stopped its processes', confirmStopped: true, dryRun: true };

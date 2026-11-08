@@ -17,6 +17,12 @@ const planAttempt = { ...attempt, dryRun: bool };
 const view = { type: 'object' };
 const steps = { type: 'array', items: object({ operation: string, target: string, requires: { type: 'array', items: string }, conditional: bool }) };
 const paginated = (items: JsonSchema) => object({ items: { type: 'array', items }, next: nullable(string), total: { type: 'integer', minimum: 0 } });
+const attention = { reason: nullable(string), nextAction: nullable(object({ operation: string, args: view, description: string })) };
+const statusTask = object({ id, title: string, state: { enum: ['queued', 'in_flight', 'done'] }, ready: bool,
+  holdReason: nullable(string), blockedBy: { type: 'array', items: id }, ...attention });
+const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', minimum: 1 }, phase: string,
+  outcome: nullable({ enum: ['completed', 'held', 'failed'] }), leaseState: string,
+  candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), checksState: string, ...attention });
 function outputSchema(name: string): JsonSchema {
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
@@ -24,7 +30,7 @@ function outputSchema(name: string): JsonSchema {
   if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision'],
     properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'effects'].map(key => [key, {}])), additionalProperties: false };
   if (name === 'status.show') return object({ contextId: string, databaseId: string, configurationRevision: { type: 'integer' }, migrationState: string,
-    capacity: view, tasks: paginated(view), attempts: paginated(view), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
+    capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
     blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
   const variants: JsonSchema[] = [object({ steps })];
   if (name === 'attempt.dispatch') variants.push(object({ taskId: id, steps }), object({ attempt: view, steps }), object({ attempt: view, replayed: bool, steps }));

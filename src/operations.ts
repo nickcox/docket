@@ -82,9 +82,40 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
     switch (operation.name) {
       case 'status.show': {
         const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!));
-        const tasks = db.tasks().map(t => taskView(db, t)).filter(t => !args.attentionOnly || t.holdReason !== null || t.ready);
-        const attentionAttempts = attempts.filter(a => !args.attentionOnly || a.executionOpen || a.leaseState !== 'returned');
-        const claims = db.claims().filter(c => !c.releasedAt), effects = db.requests().filter(r => r.category === 'effect' && ['claimed', 'uncertain'].includes(r.state));
+        const action = (operation: string, args: Record<string, unknown>, description: string) => ({ operation, args, description });
+        const tasks = db.tasks().map(t => {
+          const ready = db.readyTasks().some(task => task.id === t.id);
+          return { id: t.id, title: t.title, state: t.state, ready, holdReason: t.holdReason, blockedBy: t.blockerIds,
+            reason: t.holdReason ?? (ready ? 'Task is ready to dispatch.' : null),
+            nextAction: t.holdReason !== null ? action('task.show', { taskId: t.id }, 'Inspect the task hold before deciding how to proceed.')
+              : ready ? action('attempt.dispatch', { taskId: t.id, profile: null, dryRun: true }, 'Plan dispatch of the ready task.') : null };
+        }).filter(t => !args.attentionOnly || t.reason !== null);
+        const requests = db.requests();
+        const attentionAttempts = attempts.map(a => {
+          const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
+          const checksState = String(checks?.result?.status ?? checks?.state ?? 'missing');
+          const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
+          const reason = ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
+            : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
+            : a.leaseState === 'held' ? 'Lease is held.'
+            : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null;
+          const nextAction = reason === null ? null
+            : checksState === 'failed' || checksState === 'uncertain' ? action('attempt.show', { attemptId: a.id }, 'Inspect check evidence before retrying or resolving uncertainty.')
+            : a.candidate && !accepted ? action('attempt.accept', { attemptId: a.id, candidateCommit: a.candidate.commit, overrideReason: null, dryRun: true }, 'Inspect the acceptance plan for this candidate.')
+            : action('attempt.show', { attemptId: a.id }, 'Inspect the attempt and lease before continuing or returning it.');
+          return { id: a.id, taskId: a.taskId, number: a.number, phase: a.phase, outcome: a.outcome,
+            leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, checksState, reason, nextAction };
+        }).filter(a => !args.attentionOnly || a.reason !== null);
+        const blockers = db.admissionBlockers();
+        const claims = db.claims().filter(c => !c.releasedAt).map(c => {
+          if (!args.attentionOnly) return c;
+          const blocker = blockers.find(b => b.kind === 'claim' && b.claimId === c.id);
+          return blocker ? { ...c, reason: `Claim heartbeat is ${blocker.reason}; ownership is unresolved.`,
+            nextAction: action('claim.resolve', { claimId: c.id, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.') } : null;
+        }).filter(c => c !== null);
+        const effects = requests.filter(r => r.category === 'effect' && ['claimed', 'uncertain'].includes(r.state)).map(r => !args.attentionOnly ? r : {
+          ...r, reason: `Effect is ${r.state}; its external outcome needs reconciliation.`,
+          nextAction: action('request.show', { requestId: r.requestKey }, 'Inspect the effect and its owner before resolving its outcome.') });
         const entries = [...tasks.map(value => ({ key: `task:${value.id}`, kind: 'task', value })),
           ...attentionAttempts.map(value => ({ key: `attempt:${value.id}`, kind: 'attempt', value })),
           ...claims.map(value => ({ key: `claim:${value.id}`, kind: 'claim', value })),
@@ -97,7 +128,11 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           tasks: { items: section('task'), next: page.next, total: tasks.length },
           attempts: { items: section('attempt'), next: page.next, total: attentionAttempts.length },
           claims: section('claim'), effects: section('effect'), page: { next: page.next, total: page.total },
-          blockers: db.admissionBlockers().slice(0, (args.page as Page).limit), objectives: [], openPersonQuestions: [] };
+          blockers: blockers.slice(0, (args.page as Page).limit).map(b => !args.attentionOnly ? b : { ...b,
+            nextAction: b.kind === 'claim'
+              ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
+              : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
+          objectives: [], openPersonQuestions: [] };
       }
       case 'task.show': return { task: taskView(db, db.task(id)) };
       case 'task.list': return paginate(db.tasks().map(t => taskView(db, t)).filter(t => (args.state === null || t.state === args.state) && (!args.readyOnly || t.ready)), args.page as Page, t => t.id);
