@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { reserveAndAllocate, WorkspaceAcquisitionError } from '../../src/attempts.ts';
@@ -45,7 +45,8 @@ async function add(db: Database, id: string, profile?: string) {
 }
 function allocation(request: { input: JsonObject }): Allocation {
   const workspace = request.input.workspace as JsonObject;
-  return { leaseId: 'lease', holder: workspace.holder as JsonObject, path: workspace.path as string, pool: workspace.pool as string,
+  return { leaseId: 'lease', holder: workspace.holder as JsonObject,
+    path: join(workspace.pool as string, '.treehouse', 'example', '7', 'example'), pool: workspace.pool as string,
     repository: request.input.repository as JsonObject, outputRef: request.input.outputRef as string, startingCommit: request.input.startingCommit as string };
 }
 function snapshot(db: Database, path: string) {
@@ -76,6 +77,8 @@ test('R04/R05: reserve a numbered immutable specification with resolved profile,
   assert.equal(spec.targetBranch, 'main');
   const databaseId = db.events()[0]!.payload.databaseId;
   assert.equal(spec.outputRef, `refs/heads/docket/${databaseId}/${attempt.id}`);
+  assert.deepEqual(spec.workspace, { holder: { databaseId, contextId: 'reservations', taskId: task.id, attemptId: attempt.id },
+    pool: join(root, 'pool') });
   assert.deepEqual(spec.delivery, { ...input().delivery, baseRef: 'main', startingCommit: hash, outputBranch: spec.outputRef });
   assert.equal(db.task('one').state, 'queued');
   assert.equal(db.requests()[0]!.attemptId, attempt.id);
@@ -212,17 +215,20 @@ test('R08/R09: a fresh executor permits other reservations, stale/released claim
   });
 });
 
-test('A10/R05: confirmed allocation and effect are recorded once, identical repeats return it and differences refuse', async t => {
+test('A10/R05: provider-chosen path is recorded once, identical allocations return it and differences refuse', async t => {
   const { db, executor, path } = await fixture(t);
   await add(db, 'one');
   const reserved = await db.reserveAttempt(input());
   const { effect, claimed } = await db.beginWorkspaceAcquisition(reserved.attempt.id, reserved.requestId, executor, actor);
   assert.equal(claimed, true);
+  assert.equal(Object.hasOwn(effect.input.workspace as JsonObject, 'path'), false);
   const value = allocation(effect);
   assert.deepEqual(await db.recordAllocation(reserved.attempt.id, effect.id, executor, value), value);
+  assert.deepEqual(db.attempt(reserved.attempt.id).allocation, value);
   const before = snapshot(db, path);
   assert.deepEqual(await db.recordAllocation(reserved.attempt.id, effect.id, executor, value), value);
   await assert.rejects(db.recordAllocation(reserved.attempt.id, effect.id, executor, { ...value, leaseId: 'another' }), conflict);
+  await assert.rejects(db.recordAllocation(reserved.attempt.id, effect.id, executor, { ...value, path: join(value.pool, 'other') }), conflict);
   assert.deepEqual(snapshot(db, path), before);
   assert.equal(db.attempt(reserved.attempt.id).phase, 'allocated');
   assert.equal(db.request(effect.id).state, 'succeeded');
@@ -244,6 +250,35 @@ test('A11/R05: wrong provider holder, path, pool, repository, ref or commit neve
     assert.equal(replay.attempt.leaseState, 'unknown');
     assert.equal(calls, 1);
     assert.equal(db.requests().find(request => request.category === 'effect')!.state, 'uncertain');
+  });
+});
+
+test('A11/R05: provider paths must be absolute, normalised and strictly inside the recorded pool', async t => {
+  const paths = {
+    outside: (pool: string) => join(pool, '..', 'outside'),
+    'sibling with pool prefix': (pool: string) => `${pool}-other${sep}workspace`,
+    'equal to pool': (pool: string) => pool,
+    'parent component': (pool: string) => `${pool}${sep}child${sep}..${sep}workspace`,
+    relative: () => 'relative/workspace',
+    'dot component': (pool: string) => `${pool}${sep}.${sep}workspace`,
+    'trailing separator': (pool: string) => `${pool}${sep}workspace${sep}`,
+  };
+  for (const [name, providerPath] of Object.entries(paths)) await t.test(name, async t => {
+    const { db, executor } = await fixture(t);
+    await add(db, 'one');
+    let calls = 0;
+    const provider = { acquire: async (request: { input: JsonObject }) => {
+      calls++;
+      const value = allocation(request);
+      return { ...value, path: providerPath(value.pool) };
+    } };
+    await assert.rejects(reserveAndAllocate(db, input(), executor, provider), error => conflict(error) || error instanceof TypeError);
+    const replay = await reserveAndAllocate(db, input(), executor, provider);
+    assert.equal(replay.attempt.allocation, null);
+    assert.equal(replay.attempt.phase, 'needs_resolution');
+    assert.equal(replay.attempt.leaseState, 'unknown');
+    assert.equal(db.requests().find(request => request.category === 'effect')!.state, 'uncertain');
+    assert.equal(calls, 1);
   });
 });
 

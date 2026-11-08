@@ -645,7 +645,7 @@ export class Database {
           definitionRevision: task.definitionRevision, decisionRevision: task.decisionRevision, criteria: task.criteria,
           objectiveId: null, delivery: object({ ...value.delivery, baseRef: config.baseBranch, startingCommit: value.startingCommit, outputBranch: outputRef }),
           baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit: value.startingCommit,
-          repository, workspace: { holder, path: join(config.poolRoot, String(identity.databaseId), id), pool: config.poolRoot },
+          repository, workspace: { holder, pool: config.poolRoot },
           profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
           finalisation: config.finalisation, checks: value.checks,
           configuration: { revision: config.revision, digest: config.digest, sourceEventId: configEvent.id } };
@@ -711,7 +711,8 @@ export class Database {
       this.effectExecutor(effect, expected);
       if (effect.state !== 'claimed' || attempt.phase !== 'reserved' || attempt.lease_state !== 'none') throw new StorageError('conflict', 'Acquisition is not awaiting confirmation');
       const spec = object(JSON.parse(String(attempt.specification))), workspace = object(spec.workspace);
-      if (json(value.holder) !== json(workspace.holder) || value.path !== workspace.path || value.pool !== workspace.pool ||
+      if (json(value.holder) !== json(workspace.holder) || value.pool !== workspace.pool ||
+        value.path === value.pool || !inside(value.path, value.pool) ||
         json(value.repository) !== json(spec.repository) || value.outputRef !== spec.outputRef || value.startingCommit !== spec.startingCommit) throw new StorageError('conflict', 'Allocation does not match specification');
       this.changed(this.db.prepare(`UPDATE attempts SET allocation = ?, lease_id = ?, lease_state = 'held', phase = 'allocated', revision = revision + 1
         WHERE id = ? AND allocation IS NULL AND phase = 'reserved' AND revision = ?`).run(json(value), value.leaseId, attemptId, Number(attempt.revision)));
