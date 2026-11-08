@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative } from "node:path";
-import { commandRunner, confirmed, isCommit, isRef, rejected, uncertain } from "./command.ts";
+import { commandRunner, confirmed, gitEnvironment, isCommit, isRef, rejected, uncertain } from "./command.ts";
 import type { Command, Result, Runner } from "./command.ts";
 
 export type RefState = { state: "absent" } | { state: "present"; commit: string };
@@ -23,9 +23,11 @@ export const inside = (root: string, path: string): boolean => {
 export class GitRepository {
   readonly options: RepositoryOptions;
   readonly run: Runner;
+  readonly environment: NodeJS.ProcessEnv;
   constructor(options: RepositoryOptions) {
     this.options = options;
-    this.run = options.run ?? commandRunner({ ...(options.environment ? { environment: options.environment } : {}), ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) });
+    this.environment = gitEnvironment(options.environment);
+    this.run = options.run ?? commandRunner({ environment: this.environment, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) });
   }
   command(args: string[], cwd = this.options.repository, input?: string): Promise<Command> {
     return this.run(this.options.git ?? "git", args, cwd, input);
@@ -91,10 +93,9 @@ export class GitRepository {
     return this.changeRef(ref, expected, commit);
   }
   async conditionalDeleteRef(ref: string, expected: string): Promise<Result<{ ref: string; commit: null }>> {
-    const result = await this.changeRef(ref, expected, null);
-    return result.status === "confirmed" ? confirmed({ ref, commit: null }) : result;
+    return this.changeRef(ref, expected, null);
   }
-  private async changeRef(ref: string, expected: string | null, commit: string | null): Promise<Result<{ ref: string; commit: string }>> {
+  private async changeRef<C extends string | null>(ref: string, expected: string | null, commit: C): Promise<Result<{ ref: string; commit: C }>> {
     if (!isRef(ref) || (expected !== null && !isCommit(expected)) || (commit !== null && !isCommit(commit))) return rejected("Invalid ref or commit");
     const checked = await this.checkouts(ref);
     if (checked.status !== "confirmed") return checked;
@@ -106,7 +107,7 @@ export class GitRepository {
     const changed = await this.command(args);
     if (!changed.complete) return uncertain("Ref mutation outcome is unknown", changed);
     if (changed.code !== 0) return rejected("Conditional ref mutation refused", changed);
-    return confirmed({ ref, commit: commit! });
+    return confirmed({ ref, commit });
   }
   async conditionalFastForward(ref: string, expected: string, commit: string): Promise<Result<{ ref: string; commit: string }>> {
     if (!isRef(ref) || !isCommit(expected) || !isCommit(commit)) return rejected("Invalid ref or commit");
@@ -126,18 +127,21 @@ export class GitRepository {
   /** Hold Git's expected-old-value ref lock while updating the index/worktree, then commit the ref.
    * A lost response or a partial worktree update is uncertain, never retried or rolled back blindly. */
   private async fastForwardWorktree(ref: string, expected: string, commit: string, workspace: string): Promise<Result<{ ref: string; commit: string }>> {
-    const child = spawn(this.options.git ?? "git", ["update-ref", "--stdin"], { cwd: this.options.repository, env: this.options.environment ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(this.options.git ?? "git", ["update-ref", "--stdin"], { cwd: this.options.repository, env: this.environment, stdio: ["pipe", "pipe", "pipe"] });
     let stderr = "", touched = false, spawnError: unknown;
     child.stderr.on("data", chunk => { stderr = (stderr + String(chunk)).slice(-8192); });
     child.on("error", error => { spawnError = error; });
     child.stdin.on("error", () => {});
     const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
-    const timer = setTimeout(() => child.kill("SIGKILL"), this.options.timeoutMs ?? 60_000);
+    let timer: NodeJS.Timeout | undefined;
     const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
     const step = async (input: string, response: string) => {
-      child.stdin.write(input);
-      const line = await lines.next();
-      if (line.done || line.value !== response) throw new Error(stderr || String(spawnError ?? "Ref transaction interrupted"));
+      timer = setTimeout(() => child.kill("SIGKILL"), this.options.timeoutMs ?? 60_000);
+      try {
+        child.stdin.write(input);
+        const line = await lines.next();
+        if (line.done || line.value !== response) throw new Error(stderr || String(spawnError ?? "Ref transaction interrupted"));
+      } finally { clearTimeout(timer); }
     };
     try {
       await step("start\n", "start: ok");
@@ -174,10 +178,15 @@ export class GitRepository {
       if (!contains.value) return rejected("Exact commit is not retained by ref", reference);
     }
     if (request.workspace !== undefined) {
+      const repository = await this.identity();
+      const workspace = await this.identity(request.workspace);
+      if (repository.status !== "confirmed") return repository;
+      if (workspace.status !== "confirmed") return workspace;
+      if (repository.value !== workspace.value) return rejected("Retention workspace belongs to a different repository");
       const state = await this.inspectWorkspace(request.workspace);
       if (state.status !== "confirmed") return state;
       if (!state.value.clean) return rejected("Workspace has unretained changes", state.value);
-      const orphaned = await this.command(["rev-list", "HEAD", "--not", "--branches", "--tags"], request.workspace);
+      const orphaned = await this.command(["rev-list", "HEAD", "--not", "--branches", "--tags", ...request.references.map(reference => reference.ref)], request.workspace);
       if (!orphaned.complete || orphaned.code !== 0) return uncertain("Workspace reachability could not be read", orphaned);
       if (orphaned.stdout !== "") return rejected("Workspace has unretained commits", orphaned.stdout);
     }
@@ -201,7 +210,11 @@ export class GitRepository {
     const state = await this.inspectWorkspace(workspace);
     if (state.status !== "confirmed") return state;
     if (!state.value.clean || state.value.head !== original) return rejected("Rebase workspace moved or is dirty", state.value);
-    const result = await this.command(["-c", "rebase.updateRefs=false", "-c", "rebase.autoStash=false", "-c", "rerere.enabled=false", "rebase", "--no-verify", "--no-fork-point", "--onto", onto, upstream, original], workspace);
+    const detached = await this.command(["switch", "--detach", "--quiet", original], workspace);
+    if (!detached.complete || detached.code !== 0) return uncertain("Rebase detachment could not be confirmed", detached);
+    const prepared = await this.inspectWorkspace(workspace);
+    if (prepared.status !== "confirmed" || prepared.value.branch !== null || prepared.value.head !== original || !prepared.value.clean) return uncertain("Rebase workspace is not clean and detached at the original commit", prepared);
+    const result = await this.command(["-c", "rebase.updateRefs=false", "-c", "rebase.autoStash=false", "-c", "rerere.enabled=false", "rebase", "--no-verify", "--no-fork-point", "--onto", onto, upstream], workspace);
     if (!result.complete || result.code !== 0) return uncertain("Detached rebase stopped; inspect workspace", result);
     const after = await this.inspectWorkspace(workspace);
     if (after.status !== "confirmed" || after.value.branch !== null || !after.value.clean) return uncertain("Detached rebase could not be verified", after);

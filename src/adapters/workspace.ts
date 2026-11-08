@@ -38,7 +38,7 @@ export class TreehouseWorkspace {
   constructor(options: WorkspaceOptions) {
     if (!isAbsolute(options.poolRoot) || !isAbsolute(options.receiptsDirectory)) throw new Error("Pool and receipt paths must be absolute");
     this.options = options;
-    this.run = options.run ?? commandRunner();
+    this.run = options.run ?? commandRunner({ environment: options.repository.environment });
   }
   private command(args: string[]): Promise<Command> {
     return this.run(this.options.treehouse ?? "treehouse", ["--root", this.options.poolRoot, ...args], this.options.repository.options.repository);
@@ -139,8 +139,10 @@ export class TreehouseWorkspace {
     catch (error) { return uncertain("Workspace storage could not be prepared", String(error)); }
     const identity = await this.identity();
     if (identity.status !== "confirmed") return identity;
-    const receipts = await realpath(this.options.receiptsDirectory);
-    if (inside(identity.value.root, receipts)) return rejected("Acquisition receipts must be outside recyclable roots");
+    try {
+      const receipts = await realpath(this.options.receiptsDirectory);
+      if (inside(identity.value.root, receipts)) return rejected("Acquisition receipts must be outside recyclable roots");
+    } catch (error) { return uncertain("Acquisition receipt storage could not be resolved", String(error)); }
     const base = startingBranch(request.databaseId, request.attemptId);
     const ref = `refs/heads/${base}`;
     // Create-only: an interrupted earlier preparation requires reconciliation, not another get.
@@ -181,6 +183,9 @@ export class TreehouseWorkspace {
     // Recheck required deliverables immediately before Treehouse's conditional return.
     const retained = await this.options.repository.verifyRetention({ ...request.retention, workspace: expected.path, recyclableRoots: [...request.retention.recyclableRoots, ...roots.value] });
     if (retained.status !== "confirmed") return retained;
+    const beforeReturn = await this.inspect(expected);
+    if (beforeReturn.status !== "confirmed") return beforeReturn;
+    if (beforeReturn.value.state !== "matching") return rejected("Allocation changed during retention verification", beforeReturn.value);
     const returned = await this.command(["return", "--if-lease-holder", expected.holder, "--if-lease-id", expected.leaseId, expected.path]);
     const identity = await this.identity();
     const rows = await this.rows();

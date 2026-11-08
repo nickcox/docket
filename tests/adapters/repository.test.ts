@@ -119,6 +119,70 @@ test("R32 fast-forward of an un-checked-out ref uses CAS and rejects non-fast-fo
   assert.equal(await f.git("rev-parse", "main"), f.base);
 });
 
+test("R32 conditional move/delete and unchecked fast-forward detect a ref moved between read and effect", async t => {
+  const f = await fixture(t);
+  for (const operation of ["move", "delete", "fast-forward"] as const) {
+    await f.git("update-ref", "refs/heads/race", f.base);
+    let raced = false;
+    const run: Runner = async (exe, args, cwd, input) => {
+      const read = await f.run(exe, args, cwd, input);
+      if (!raced && args[0] === "symbolic-ref") {
+        raced = true;
+        await f.git("update-ref", "refs/heads/race", f.head, f.base);
+      }
+      return read;
+    };
+    const repo = new GitRepository({ repository: f.path, run });
+    const result = operation === "move" ? await repo.conditionalMoveRef("refs/heads/race", f.base, f.head)
+      : operation === "delete" ? await repo.conditionalDeleteRef("refs/heads/race", f.base)
+      : await repo.conditionalFastForward("refs/heads/race", f.base, f.head);
+    assert.equal(result.status, "rejected");
+    assert.equal(await f.git("rev-parse", "refs/heads/race"), f.head);
+  }
+});
+
+test("R32 linked target worktrees stay consistent and the expected ref is locked during their update", async t => {
+  const f = await fixture(t);
+  const linked = join(f.root, "linked target");
+  await f.git("worktree", "add", "-qb", "target", linked, f.base);
+  let lockObserved = false;
+  const run: Runner = async (exe, args, cwd, input) => {
+    if (args[0] === "read-tree") {
+      const raced = await f.run("git", ["update-ref", "refs/heads/target", f.head, f.base], f.path);
+      assert.notEqual(raced.code, 0);
+      assert.match(raced.stderr, /lock/);
+      lockObserved = true;
+    }
+    return f.run(exe, args, cwd, input);
+  };
+  value(await new GitRepository({ repository: f.path, run }).conditionalFastForward("refs/heads/target", f.base, f.head));
+  assert.equal(lockObserved, true);
+  assert.equal(await readFile(join(linked, "file"), "utf8"), "output\n");
+  assert.equal(value(await f.repo.inspectWorkspace(linked)).clean, true);
+  assert.equal(await readFile(join(f.path, "file"), "utf8"), "base\n");
+});
+
+test("R31/R32 an interrupted worktree update is uncertain and never retried", async t => {
+  const f = await fixture(t);
+  let effects = 0;
+  const run: Runner = async (exe, args, cwd, input) => {
+    if (args[0] === "read-tree") { effects++; return { complete: false, code: null, stdout: "", stderr: "lost response" }; }
+    return f.run(exe, args, cwd, input);
+  };
+  assert.equal((await new GitRepository({ repository: f.path, run }).conditionalFastForward("refs/heads/main", f.base, f.head)).status, "uncertain");
+  assert.equal(effects, 1);
+  assert.equal(await f.git("rev-parse", "main"), f.base);
+});
+
+test("R32 malformed worktree inventory never permits ref-only integration", async t => {
+  const f = await fixture(t);
+  for (const stdout of ["", "worktree /somewhere\0HEAD nope\0", "garbage\0\0"]) {
+    const run: Runner = async (exe, args, cwd, input) => args[0] === "worktree" ? { complete: true, code: 0, stdout, stderr: "" } : f.run(exe, args, cwd, input);
+    assert.equal((await new GitRepository({ repository: f.path, run }).conditionalFastForward("refs/heads/main", f.base, f.head)).status, "uncertain");
+  }
+  assert.equal(await f.git("rev-parse", "main"), f.base);
+});
+
 test("R32 retention requires exact reachability, clean workspace and regular artefacts outside recyclable roots", async t => {
   const f = await fixture(t);
   const pool = join(f.root, "pool"); await mkdir(pool);

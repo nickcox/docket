@@ -15,7 +15,7 @@ export type Runner = (executable: string, args: string[], cwd: string, input?: s
 export function commandRunner(options: { timeoutMs?: number; maxBuffer?: number; environment?: NodeJS.ProcessEnv } = {}): Runner {
   return (executable, args, cwd, input) => new Promise(resolve => {
     const child = execFile(executable, args, {
-      cwd, env: options.environment ?? process.env, timeout: options.timeoutMs ?? 60_000,
+      cwd, env: options.environment ?? process.env, timeout: options.timeoutMs ?? 60_000, killSignal: "SIGKILL",
       maxBuffer: options.maxBuffer ?? 4 * 1024 * 1024, encoding: "utf8",
     }, (error, stdout, stderr) => {
       const code = error === null ? 0 : typeof error.code === "number" ? error.code : null;
@@ -23,6 +23,11 @@ export function commandRunner(options: { timeoutMs?: number; maxBuffer?: number;
     });
     child.stdin?.end(input);
   });
+}
+
+/** Do not let inherited Git overrides redirect an adapter away from its explicit repository/worktree. */
+export function gitEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...Object.fromEntries(Object.entries(environment).filter(([key]) => !key.startsWith("GIT_"))), GIT_TERMINAL_PROMPT: "0" };
 }
 
 export const isCommit = (value: string): boolean => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
