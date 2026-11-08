@@ -42,7 +42,7 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
     child.once('close', (code, signal) => {
       clearTimeout(timer); clearTimeout(drain);
       resolve({ status: spawnFailed ? 'not_run' : timedOut ? 'failed' : signal || pipesOpen ? 'uncertain' : code === 0 ? 'passed' : 'failed',
-        exitCode: code, timedOut, stdout: redactDiagnostics(stdout, secrets).slice(0, 8192),
+        exitCode: spawnFailed ? null : code, timedOut, stdout: redactDiagnostics(stdout, secrets).slice(0, 8192),
         stderr: redactDiagnostics(stderr, secrets).slice(0, 8192), truncated });
     });
   });
