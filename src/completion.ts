@@ -26,7 +26,9 @@ export interface CompletionServices extends CheckServices {
   readPolicy?: typeof readFinalisationPolicy;
 }
 const refuse = (message: string): never => { throw new StorageError('conflict', message); };
+class OwnerReadError extends Error {}
 function known<T>(result: Result<T>): T {
+  if (result.status === 'uncertain') throw new OwnerReadError(result.reason);
   if (result.status !== 'confirmed') refuse(result.reason);
   return (result as { status: 'confirmed'; value: T }).value;
 }
@@ -37,6 +39,11 @@ function exactCandidate(db: Database, input: AcceptInput): JsonObject {
 }
 async function retainedOutput(db: Database, attemptId: string, services: CompletionServices): Promise<RetentionRequest> {
   const attempt = db.attempt(attemptId), binding = db.workerResultBinding(attemptId);
+  const repository = known(await services.repository.identity());
+  const recordedPath = (attempt.specification.repository as JsonObject).path;
+  if (typeof recordedPath === 'string' && known(await services.repository.identity(recordedPath)) !== repository) refuse('Recorded repository identity differs');
+  if (attempt.allocation && attempt.leaseState !== 'returned'
+    && known(await services.repository.identity(attempt.allocation.path)) !== repository) refuse('Allocation belongs to a different repository');
   const recorded = db.validatedWorkerResult(attemptId);
   if (!recorded) refuse('Validated retained output is required');
   const current = await readWorkerResult(binding);
@@ -48,6 +55,8 @@ async function retainedOutput(db: Database, attemptId: string, services: Complet
   }
   const retention: RetentionRequest = { references,
     artefacts: [binding.resultPath, ...current.artefacts.map(item => join(dirname(binding.resultPath), String(item.relativePath)))],
+    artefactDigests: [{ path: binding.resultPath, digest: current.digest }, ...current.artefacts.map(item => ({
+      path: join(dirname(binding.resultPath), String(item.relativePath)), digest: String(item.digest) }))],
     recyclableRoots: binding.recyclableRoots };
   known(await services.repository.verifyRetention(retention));
   return retention;
@@ -67,6 +76,7 @@ async function planAcceptance(db: Database, input: AcceptInput, services: Comple
 
 export async function selectCandidate(db: Database, input: { attemptId: string; commit: string; caller: AcceptInput['caller'] }, services: CompletionServices) {
   input = structuredClone(input);
+  taskActor(input.caller);
   const attempt = db.attempt(input.attemptId), ref = String(attempt.specification.outputRef);
   const state = known(await services.repository.inspectRef(ref));
   if (state.state !== 'present' || state.commit !== input.commit) refuse('Selected branch is not at the exact candidate');
@@ -90,13 +100,17 @@ async function effect(db: Database, authorisation: StoredEvent, operation: 'inte
   if (request.state !== 'pending') refuse('Completion effect was refused; a new decision is required');
   try { await preflight(); }
   catch (error) {
+    if (error instanceof OwnerReadError) throw error;
     await db.closePendingEffect(request.id, 'rejected', { reason: String(error), called: false }, request.caller);
     throw error;
   }
   await db.refreshClaim(admission.executor, new Date().toISOString(), request.caller);
   request = await db.claimEffect(request.id, admission.executor);
   let result: Result<unknown>;
-  try { result = await call(); }
+  try {
+    db.checkCompletionEffect(request.id, admission.executor);
+    result = await call();
+  }
   catch { result = uncertain('Completion owner call was interrupted'); }
   request = await db.recordEffectOutcome(request.id, admission.executor,
     result.status === 'confirmed' ? 'succeeded' : result.status === 'rejected' ? 'rejected' : 'uncertain',
@@ -107,6 +121,7 @@ async function effect(db: Database, authorisation: StoredEvent, operation: 'inte
 
 export async function acceptCandidate(db: Database, input: AcceptInput, services: CompletionServices) {
   input = structuredClone(input);
+  services = { ...services, profile: structuredClone(services.profile) };
   taskActor(input.caller);
   exactCandidate(db, input);
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
@@ -138,17 +153,16 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
       return target.state === 'present' && known(await services.repository.compare(input.commit, target.commit))
         ? { target: plan.target, commit: input.commit, observedTarget: target.commit } : null;
     };
+    let alreadyContains = false;
     await effect(db, accepted, 'integrate', { ...plan, commit: input.commit }, proof, async () => {
-      const target = known(await services.repository.inspectRef(plan.target));
-      if (target.state !== 'present') return rejected('Target is absent');
-      if (target.commit !== plan.expected) return rejected('Target moved after planning');
-      if (known(await services.repository.compare(input.commit, target.commit))) return { status: 'confirmed', value: { alreadyContains: true, target: plan.target, commit: input.commit } };
+      if (alreadyContains) return { status: 'confirmed', value: { alreadyContains: true, target: plan.target, commit: input.commit } };
       return services.repository.conditionalFastForward(plan.target, plan.expected, input.commit);
     }, async () => {
       await retainedOutput(db, input.attemptId, services);
       const current = await planAcceptance(db, input, services);
       if (current.target !== plan.target || current.kind !== plan.kind || current.policyDigest !== plan.policyDigest) refuse('Finalisation policy changed after acceptance');
       if (current.expected !== plan.expected) refuse('Target moved after planning');
+      alreadyContains = known(await services.repository.compare(input.commit, plan.expected));
     });
   }
   return db.finishAcceptance(accepted);

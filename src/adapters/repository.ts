@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from 'node:crypto';
 import { createInterface } from "node:readline";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, matchesGlob, relative } from "node:path";
@@ -13,6 +14,7 @@ export type RepositoryOptions = { repository: string; git?: string; run?: Runner
 export type RetentionRequest = {
   references: { ref: string; commit: string }[];
   artefacts: string[];
+  artefactDigests?: { path: string; digest: string }[];
   recyclableRoots: string[];
   workspace?: string;
 };
@@ -232,8 +234,18 @@ export class GitRepository {
         if (roots.some(root => inside(root, resolved))) return rejected("Artefact is in a recyclable root", artefact);
         if (!(await lstat(artefact)).isFile()) return rejected("Artefact must be a retained regular file", artefact);
         const file = await open(artefact, "r");
-        try { if (!(await file.stat()).isFile()) return rejected("Artefact is not a regular file", artefact); await file.read(Buffer.alloc(1), 0, 1, 0); }
-        finally { await file.close(); }
+        try {
+          const before = await file.stat();
+          if (!before.isFile()) return rejected("Artefact is not a regular file", artefact);
+          const expected = request.artefactDigests?.find(item => item.path === artefact);
+          if (expected) {
+            const hash = createHash('sha256');
+            for await (const chunk of file.createReadStream({ autoClose: false })) hash.update(chunk);
+            const after = await file.stat(), current = await lstat(artefact);
+            if (hash.digest('hex') !== expected.digest || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+              || before.ctimeMs !== after.ctimeMs || current.ino !== before.ino || current.dev !== before.dev) return rejected('Retained artefact changed', artefact);
+          } else await file.read(Buffer.alloc(1), 0, 1, 0);
+        } finally { await file.close(); }
       }
     } catch (error) { return uncertain("Retained artefact or recyclable root could not be read", String(error)); }
     return confirmed({ retained: true });

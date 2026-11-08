@@ -85,6 +85,14 @@ export class TreehouseWorkspace {
       return confirmed(leases);
     } catch (error) { return uncertain("Malformed Treehouse listing", { read, error: String(error) }); }
   }
+  /** Immutable acquisition identity, not evidence that the lease is still live. */
+  async recordedAllocation(leaseId: string): Promise<Result<Allocation>> {
+    try {
+      const saved: unknown = JSON.parse(await readFile(this.receipt(leaseId), 'utf8'));
+      if (!allocation(saved) || saved.leaseId !== leaseId) return uncertain('Malformed acquisition receipt');
+      return confirmed(saved);
+    } catch (error) { return uncertain('Acquisition receipt cannot be read', String(error)); }
+  }
   async list(): Promise<Result<Allocation[]>> {
     const identity = await this.identity();
     if (identity.status !== "confirmed") return identity;

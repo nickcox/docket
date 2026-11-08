@@ -26,6 +26,22 @@ Return accepts an explicit authorised core request and the core-selected retenti
 
 Rebase passes exact commit IDs, disables automatic stash/ref updates and runs detached. Conflicts leave the workspace for inspection without moving the accepted/source branches. It does not automatically abort or resolve them.
 
+## Acceptance and finalisation
+
+`acceptCandidate` in `src/completion.ts` uses the repository and check adapters, records exact-candidate acceptance, and separately confirms integration and task completion. `returnAttempt` requires a trusted person caller and `noProcesses: { leaseId }`. Its optional `discard: { leaseId, confirmed: true, reason }` requires a nonblank reason. Neither operation infers process termination from a successful check. Replaying an interrupted operation inspects its durable steps; a claimed or uncertain effect is never called again. Exact target reachability or an absent lease in the recorded pool can confirm a lost response. Otherwise the uncertainty remains for explicit resolution.
+
+`completionWorkspace(treehouse)` bridges the stored holder/repository/pool-root fields to the adapter's immutable acquisition receipt. Acquisition must encode the structured holder as canonical JSON. The bridge reads the receipt with `recordedAllocation`, then inspects the full original pool identity; an origin change cannot masquerade as an absent lease. The receipt alone never proves return.
+
+Repository restrictions are read from `.docket/finalisation.json` in the trusted target commit. Operator restrictions are read from the configured `globalFile`, or `~/.config/docket/finalisation.json` when it is null. An absent conventional operator file or absent repository file adds no restrictions; an explicit missing operator file, unreadable file, malformed JSON or linked repository policy refuses. The fixed schema is:
+
+```json
+{ "version": 1, "forbid": ["local-merge"], "protectedTargets": ["main"] }
+```
+
+Both arrays are required. `forbid` entries name `local-merge` or an exact target; `protectedTargets` entries name exact branches, either short or full refs. Unknown fields, including executable policy fields, refuse. Recorded and current context restrictions, operator files and the trusted repository restrictions add up. Protection and policy are re-read before integration, and a changed target refuses the planned fast-forward. Manual acceptance keeps the output ref without claiming integration.
+
+Return rechecks retained result/artefact digests as well as Git reachability. Cleanup has its own conditional-delete effect after confirmed return, and only integrated or explicitly discarded output is eligible. Moved refs are preserved. Cleanup failure or uncertainty stays visible in its request without reversing the return.
+
 ## Standalone Pi
 
 `PiLauncher` implements R31/R35 over the Pi RPC JSONL protocol. Construct it in the trusted, long-lived worker owner, with an absolute retained state directory outside the lease and person-controlled execution profiles. Each profile names an absolute executable, an optional credential environment variable and an explicit list of additional environment variable names. For a CLI or synthetic peer it can name an absolute Node entrypoint. For shared Pi agent files it instead names an absolute installed Pi SDK module (`sdkModule`), with Node as the executable. Unknown options and `DOCKET_` names refuse. The adapter snapshots this configuration and the host environment at construction.

@@ -102,6 +102,16 @@ The operation reads the current trusted policy and requires the union of recorde
 
 `observeWorker` accepts optional trusted check services and caller attribution. With them, completion of a code candidate invokes this same check path. Without them, it records completion only; a host must call `runCandidateChecks` before acceptance. These are internal APIs, not new CLI commands or supervisor permission grants.
 
+## Acceptance, return and discard
+
+`../completion.ts` exposes person-only `selectCandidate`, `acceptCandidate` and `returnAttempt` application operations. These are internal APIs, not additional CLI commands. Acceptance names both the candidate ID and exact commit. A selected retained output commit gets a fresh candidate ID; an accepted candidate cannot be replaced. Acceptance revalidates retained output, uses matching mandatory fast/full checks, re-resolves current check requirements, and records the candidate, evidence request, finalisation plan and current person-decision revision together. A nonblank person override reason is retained against that candidate and can bypass missing/failed checks, but not terminal state, identity, retention or unresolved effects.
+
+Integration is a separate repository effect before task completion. Manual acceptance records a deliverable only. Local integration uses the planned target's exact old commit, or records that it already contains the candidate. A newer person decision prevents a pending integration and is never overwritten by task completion. Replays inspect recorded acceptance, effect and completion events rather than repeating a completed step.
+
+Return requires the exact lease's person no-processes confirmation, terminal/stopped execution, a matching allocation/pool, a recorded outcome, retained result/artefacts and no unresolved effect. Discard additionally requires an explicit confirmation and nonblank reason, holds unfinished work, and preserves done decisions. Authorisation, conditional lease return, confirmed returned state and optional ref cleanup are separate steps. Manual-unintegrated output remains retained. Cleanup failures cannot reverse return.
+
+Completion effects have their own maintenance claims and immutable typed targets. Definite success/refusal releases the claim atomically with its result. A claimed or uncertain effect is never called again: owner reads can settle exact target reachability, an absent lease in its original pool, or an absent output ref. Otherwise explicit resolution is required. A read failure before claiming an effect can be retried without another external call. No SQLite write lock is held during owner reads, checks or workspace/repository effects.
+
 ## Durability and qualification
 
 Every connection requests foreign keys, synchronous FULL, fullfsync and checkpoint_fullfsync. Writable connections establish WAL; read-only ones require it. `settings()` exposes requested SQLite settings, not a proof of hardware durability. SQLite's full-fsync options have additional effect on macOS where supported; other OS/filesystem combinations can provide only their ordinary sync guarantees. Network filesystems are unsupported. Devices, virtualised storage and filesystems can still fail to honour sync requests. No stronger power-loss guarantee is claimed.

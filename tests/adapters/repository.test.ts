@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, realpath, rm, writeFile, symlink, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import { test } from "node:test";
 import { commandRunner } from "../../src/adapters/command.ts";
 import type { Result, Runner } from "../../src/adapters/command.ts";
 import { GitRepository } from "../../src/adapters/repository.ts";
+import { readFinalisationPolicy } from '../../src/adapters/finalisation.ts';
 
 function value<T>(result: Result<T>): T {
   assert.equal(result.status, "confirmed", JSON.stringify(result));
@@ -59,6 +61,43 @@ test("R32/R08 ref reads distinguish absence from failed, corrupt and truncated r
   assert.equal((await f.repo.inspectRef("refs/heads/broken")).status, "uncertain");
   const run: Runner = async () => ({ code: 0, complete: false, stdout: f.base, stderr: "" });
   assert.equal((await new GitRepository({ repository: f.path, run }).inspectRef("refs/heads/main")).status, "uncertain");
+});
+
+test('R10/R32: finalisation restrictions add up from the trusted tree, operator and context, never the worker', async t => {
+  const f = await fixture(t), globalFile = join(f.root, 'operator.json');
+  await writeFile(globalFile, JSON.stringify({ version: 1, forbid: [], protectedTargets: [] }));
+  await mkdir(join(f.path, '.docket'));
+  await writeFile(join(f.path, '.docket/finalisation.json'), JSON.stringify({ version: 1, forbid: [], protectedTargets: ['main'] }));
+  await f.git('add', '.'); await f.git('commit', '-qm', 'protect main');
+  const trusted = await f.git('rev-parse', 'HEAD');
+  const context = { kind: 'local-merge', targetBranch: 'main', globalFile, forbid: [] };
+  const protectedPolicy = value(await readFinalisationPolicy(f.repo, trusted, 'refs/heads/main', context, context));
+  assert.equal(protectedPolicy.protected, true);
+  await writeFile(join(f.path, '.docket/finalisation.json'), JSON.stringify({ version: 1, forbid: [], protectedTargets: [] }));
+  assert.equal(value(await readFinalisationPolicy(f.repo, trusted, 'refs/heads/main', context, context)).protected, true);
+  await writeFile(globalFile, JSON.stringify({ version: 1, forbid: ['local-merge'], protectedTargets: [] }));
+  const global = value(await readFinalisationPolicy(f.repo, trusted, 'refs/heads/main', context, context));
+  assert.equal(global.forbidden, true); assert.notEqual(global.digest, protectedPolicy.digest);
+  await writeFile(globalFile, JSON.stringify({ version: 1, forbid: [], protectedTargets: [] }));
+  assert.equal(value(await readFinalisationPolicy(f.repo, trusted, 'refs/heads/main', { ...context, forbid: ['local-merge'] }, context)).forbidden, true);
+  assert.equal(value(await readFinalisationPolicy(f.repo, trusted, 'refs/heads/main', context, { ...context, forbid: ['main'] })).forbidden, true);
+});
+
+test('R10/R32: unreadable, executable, linked and malformed finalisation policy refuses integration', async t => {
+  const f = await fixture(t), globalFile = join(f.root, 'operator.json');
+  const context = { kind: 'local-merge', targetBranch: 'main', globalFile, forbid: [] };
+  assert.equal((await readFinalisationPolicy(f.repo, f.base, 'refs/heads/main', context, context)).status, 'uncertain');
+  for (const content of ['{', '{"version":1,"forbid":[],"protectedTargets":[],"script":"run"}', '{"version":1,"forbid":[],"forbid":["main"],"protectedTargets":[]}']) {
+    await writeFile(globalFile, content);
+    assert.equal((await readFinalisationPolicy(f.repo, f.base, 'refs/heads/main', context, context)).status, 'uncertain');
+  }
+  await rm(globalFile); await symlink(join(f.path, 'file'), globalFile);
+  assert.equal((await readFinalisationPolicy(f.repo, f.base, 'refs/heads/main', context, context)).status, 'uncertain');
+  await rm(globalFile); await writeFile(globalFile, JSON.stringify({ version: 1, forbid: [], protectedTargets: [] }));
+  await mkdir(join(f.path, '.docket'));
+  await symlink('../file', join(f.path, '.docket/finalisation.json'));
+  await f.git('add', '.'); await f.git('commit', '-qm', 'linked policy');
+  assert.equal((await readFinalisationPolicy(f.repo, await f.git('rev-parse', 'HEAD'), 'refs/heads/main', context, context)).status, 'uncertain');
 });
 
 test("R32 workspace inspection separates tracked and untracked changes; changed paths include unusual names", async t => {
@@ -208,6 +247,12 @@ test("R32 retention requires exact reachability, clean workspace and regular art
   const f = await fixture(t);
   const pool = join(f.root, "pool"); await mkdir(pool);
   const report = join(f.root, "report.json"); await writeFile(report, "{}");
+  const digestRequest = { references: [], artefacts: [report], recyclableRoots: [pool],
+    artefactDigests: [{ path: report, digest: createHash('sha256').update('{}').digest('hex') }] };
+  assert.equal((await f.repo.verifyRetention(digestRequest)).status, 'confirmed');
+  await writeFile(report, '{"changed":true}');
+  assert.equal((await f.repo.verifyRetention(digestRequest)).status, 'rejected');
+  await writeFile(report, '{}');
   const request = { references: [{ ref: "refs/heads/output", commit: f.head }], artefacts: [report], recyclableRoots: [pool], workspace: f.path };
   value(await f.repo.verifyRetention(request));
   assert.equal((await f.repo.verifyRetention({ ...request, references: [{ ref: "refs/heads/main", commit: f.head }] })).status, "rejected");

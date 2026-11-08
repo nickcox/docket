@@ -1288,7 +1288,7 @@ export class Database {
     taskActor(caller); text(commit); text(outputRef);
     return this.write(() => {
       const attempt = this.completionGuard(attemptId), spec = object(JSON.parse(String(attempt.specification)));
-      if (outputRef !== spec.outputRef || commit === spec.startingCommit || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new StorageError('conflict', 'Candidate must name the retained output and move beyond the start');
+      if (object(spec.delivery).kind !== 'code' || outputRef !== spec.outputRef || commit === spec.startingCommit || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new StorageError('conflict', 'Candidate must name the retained output and move beyond the start');
       if (this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'candidate.accepted'").get(attemptId)) throw new StorageError('conflict', 'An accepted candidate cannot be replaced');
       const previous = attempt.candidate === null ? null : object(JSON.parse(String(attempt.candidate)));
       if (previous?.commit === commit && previous.outputRef === outputRef) return this.decodeAttempt(attempt);
@@ -1327,6 +1327,10 @@ export class Database {
       const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
       if (previous) return this.decodeEvent(previous);
       const current = this.checkConfigurationInTransaction();
+      const configured = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get()!;
+      const finalisation = object(object(this.decodeEvent(configured).payload.resolved).finalisation);
+      const target = String(finalisation.targetBranch).startsWith('refs/') ? String(finalisation.targetBranch) : `refs/heads/${String(finalisation.targetBranch)}`;
+      if (policy.kind !== finalisation.kind || policy.target !== target) throw new StorageError('conflict', 'Finalisation plan differs from configuration');
       if (current.revision !== config.revision || current.digest !== config.digest) throw new StorageError('conflict', 'Configuration changed before acceptance');
       const check = checks === null ? null : this.decodeRequest(this.requestRow(checks.id));
       if (!value.overrideReason && (!check || check.operation !== 'checks.run' || check.attemptId !== value.attemptId
@@ -1368,6 +1372,7 @@ export class Database {
   async authoriseReturn(input: ReturnInput, requestId: string): Promise<StoredEvent> {
     taskActor(input.caller);
     const value = structuredClone(input);
+    if (value.discard !== undefined) nonblank(value.discard.reason);
     return this.write(() => {
       const attempt = this.completionGuard(value.attemptId), allocation = object(JSON.parse(String(attempt.allocation)));
       const command = this.decodeRequest(this.requestRow(requestId));
@@ -1387,7 +1392,7 @@ export class Database {
       if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
       this.completionEvent(key, 'return.authorised', value.attemptId, value.caller,
-        { allocation, discard: Boolean(value.discard), noProcesses: value.noProcesses, decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
+        { allocation, discard: Boolean(value.discard), discardReason: value.discard?.reason ?? null, noProcesses: value.noProcesses, decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
       return this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key)!);
     });
   }
@@ -1430,7 +1435,17 @@ export class Database {
       if (operation === 'integrate' && Number(this.taskRow(String(attempt.task_id)).decision_revision) !== stored.payload.decisionRevision) {
         throw new StorageError('conflict', 'A newer person decision prevents integration');
       }
-      if (operation === 'cleanup' && attempt.lease_state !== 'returned') throw new StorageError('conflict', 'Return must be confirmed before cleanup');
+      if (operation === 'integrate' && json(value) !== json({ ...object(stored.payload.plan), commit: object(stored.payload.candidate).commit })) throw new StorageError('conflict', 'Integration input differs from acceptance');
+      if (operation === 'return' && json(value) !== json({ allocation: stored.payload.allocation })) throw new StorageError('conflict', 'Return input differs from authorisation');
+      if (operation === 'cleanup') {
+        if (attempt.lease_state !== 'returned') throw new StorageError('conflict', 'Return must be confirmed before cleanup');
+        const result = this.validatedResultInTransaction(attemptId);
+        const reference = (result?.content.workReferences as JsonObject[] | undefined)?.find(item => item.kind === 'git');
+        const candidate = attempt.candidate === null ? { outputRef: reference?.branch, commit: reference?.commit } : object(JSON.parse(String(attempt.candidate)));
+        if (!candidate.commit || value.ref !== candidate.outputRef || value.commit !== candidate.commit) throw new StorageError('conflict', 'Cleanup does not name the recorded output');
+        const integrated = this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND operation = 'completion.integrate' AND state = 'succeeded' AND json_extract(input, '$.commit') = ?").get(attemptId, String(candidate.commit));
+        if (!stored.payload.discard && !integrated) throw new StorageError('conflict', 'Output is neither integrated nor discarded');
+      }
       if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
       const generation = randomUUID();
@@ -1444,12 +1459,38 @@ export class Database {
     });
   }
 
+  private checkCompletionEffectInTransaction(request: StoredRequest, executor: ClaimIdentity): void {
+    const claim = this.effectExecutor(request, executor), attempt = this.completionGuard(request.attemptId!);
+    if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Completion executor heartbeat is not fresh');
+    if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND id <> ? AND state IN ('pending','claimed','uncertain')
+      AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(request.attemptId!, request.id)) throw new StorageError('conflict', 'Attempt has another unresolved effect');
+    if (request.operation === 'completion.integrate') {
+      const accepted = this.db.prepare("SELECT * FROM events WHERE request_id = ? AND kind = 'candidate.accepted'").get(request.parentId!);
+      if (!accepted || Number(this.taskRow(String(attempt.task_id)).decision_revision) !== this.decodeEvent(accepted).payload.decisionRevision) {
+        throw new StorageError('conflict', 'A newer person decision prevents integration');
+      }
+    }
+  }
+
+  checkCompletionEffect(id: string, executor: ClaimIdentity): StoredRequest {
+    claimIdentity(executor);
+    return this.snapshot(() => {
+      const request = this.effect(id, 'claimed');
+      if (!request.operation.startsWith('completion.')) throw new StorageError('conflict', 'Not a completion effect');
+      this.checkCompletionEffectInTransaction(request, executor);
+      return request;
+    });
+  }
+
   /** Safe owner reads may settle a lost response; they never reopen permission to call. */
   async settleCompletionEffect(id: string, evidence: JsonObject): Promise<StoredRequest> {
     const proof = object(evidence);
     return this.write(() => {
       const request = this.decodeRequest(this.requestRow(id));
       if (!request.operation.startsWith('completion.') || !['claimed', 'uncertain'].includes(request.state) || proof.confirmed !== true) throw new StorageError('conflict', 'Completion effect is not reconcilable');
+      if ((request.operation === 'completion.integrate' && (proof.target !== request.input.target || proof.commit !== request.input.commit))
+        || (request.operation === 'completion.return' && proof.leaseId !== object(request.input.allocation).leaseId)
+        || (request.operation === 'completion.cleanup' && proof.ref !== request.input.ref)) throw new StorageError('conflict', 'Reconciliation evidence has the wrong scope');
       this.db.prepare("UPDATE requests SET state = 'succeeded', result = ?, revision = revision + 1 WHERE id = ?").run(json(proof), id);
       this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
         .run(new Date().toISOString(), json(proof), request.claimId!);
@@ -1738,15 +1779,7 @@ export class Database {
     const before = this.effect(id, 'pending');
     const claim = this.effectExecutor(before, expected);
     if (before.operation === 'worker.activate' || before.operation === 'worker.prepare') this.checkWorkerEffectInTransaction(before, expected);
-    if (before.operation.startsWith('completion.')) {
-      const attempt = this.completionGuard(before.attemptId!);
-      if (before.operation === 'completion.integrate') {
-        const accepted = this.db.prepare("SELECT * FROM events WHERE request_id = ? AND kind = 'candidate.accepted'").get(before.parentId!);
-        if (!accepted || Number(this.taskRow(String(attempt.task_id)).decision_revision) !== this.decodeEvent(accepted).payload.decisionRevision) {
-          throw new StorageError('conflict', 'A newer person decision prevents integration');
-        }
-      }
-    }
+    if (before.operation.startsWith('completion.')) this.checkCompletionEffectInTransaction(before, expected);
     if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Executor heartbeat is not fresh');
     this.changed(this.db.prepare(`UPDATE requests SET state = 'claimed', claimed_at = ?, revision = revision + 1
       WHERE id = ? AND state = 'pending' AND revision = ? AND claim_id = ?`)

@@ -5,6 +5,7 @@ import { acceptCandidate, returnAttempt, selectCandidate } from '../../src/compl
 import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
+import { runCandidateChecks } from '../../src/checks.ts';
 import { Database } from '../../src/storage/database.ts';
 import { checkFixture, contextChecks, head, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
 
@@ -89,6 +90,34 @@ test('R10: failed and missing checks require a nonblank person reason scoped to 
   const other = await fixture(t);
   await acceptCandidate(other.db, { ...other.accept, overrideReason: 'Checks unavailable; reviewed by person' }, other.services);
   assert.deepEqual(other.calls, []);
+});
+
+test('R10: acceptance reuses an explicit successful retry after the automatic check request failed', async t => {
+  const f = await fixture(t), run = f.services.run;
+  f.services.run = async () => ({ status: 'failed', exitCode: 1, timedOut: false, stdout: '', stderr: '', truncated: false });
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /passing checks/);
+  f.services.run = run;
+  await runCandidateChecks(f.db, f.a.id, person, f.services, 'explicit-check-retry');
+  await acceptCandidate(f.db, f.accept, f.services);
+  assert.deepEqual(f.calls, ['fast', 'full']);
+  assert.equal(f.db.task('task').state, 'done');
+});
+
+test('R10/R11: a check override never waives repository or allocation identity', async t => {
+  const f = await fixture(t);
+  f.services.repository.identity = async path => confirmed(path === f.a.allocation.path ? '/different-repository' : '/repo');
+  await assert.rejects(acceptCandidate(f.db, { ...f.accept, overrideReason: 'Known check failure' }, f.services), /different repository/);
+  assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+  assert.deepEqual(f.calls, []);
+});
+
+test('R10/R15: changed mandatory policy after checks cannot reuse an old pass for acceptance', async t => {
+  const f = await fixture(t), read = f.services.repository.readCheckPolicy;
+  let reads = 0;
+  f.services.repository.readCheckPolicy = async (...args) => ++reads === 1 ? read(...args) : parseCheckPolicy(start, policyContent + '\n', contextChecks);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /policy changed/);
+  assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+  assert.deepEqual(f.calls, ['fast', 'full']);
 });
 
 test('R10/R17: non-person callers and changed candidate identity cannot accept, even on replay', async t => {
@@ -190,6 +219,14 @@ test('R10: a person decision after acceptance but before integration prevents th
   assert.equal(f.calls.includes('integrate'), false);
 });
 
+test('R10: a person decision after claiming but immediately before the owner call prevents integration', async t => {
+  const f = await fixture(t, true), claim = f.db.claimEffect.bind(f.db);
+  f.db.claimEffect = async (...args) => { const result = await claim(...args); await f.db.holdTask('task', 'Stop before owner call', person); return result; };
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /did not succeed/);
+  assert.equal(f.calls.includes('integrate'), false);
+  assert.equal(f.db.task('task').holdReason, 'Stop before owner call');
+});
+
 test('R11: return refuses dirty work, missing or wrong confirmations, mismatched allocation and missing retention', async t => {
   for (const failure of ['dirty', 'missing', 'wrong', 'mismatch', 'retention', 'discard']) {
     const f = await fixture(t);
@@ -221,7 +258,7 @@ test('R11: discard returns once, holds unfinished work and preserves a newer don
   for (const done of [false, true]) {
     const f = await fixture(t);
     if (done) await f.db.markTaskDone('task', person);
-    const input = { ...f.returns, discard: { leaseId: f.a.allocation.leaseId, confirmed: true as const } };
+    const input = { ...f.returns, discard: { leaseId: f.a.allocation.leaseId, confirmed: true as const, reason: 'Output is no longer needed' } };
     await returnAttempt(f.db, input, f.services);
     await returnAttempt(f.db, input, f.services);
     assert.equal(f.db.task('task').state, done ? 'done' : 'queued');
@@ -259,6 +296,91 @@ test('R11: changed validated output refuses acceptance and return, even with a c
   await assert.rejects(acceptCandidate(f.db, { ...f.accept, overrideReason: 'Ignore checks' }, f.services));
   await assert.rejects(returnAttempt(f.db, f.returns, f.services));
   assert.deepEqual(f.calls, []);
+});
+
+test('R10/A24: unknown owner reads before and after integration intent retry without another check or effect', async t => {
+  for (const failAt of [1, 2]) {
+    const f = await fixture(t, true), read = f.services.readPolicy!;
+    let reads = 0;
+    f.services.readPolicy = async (...args) => ++reads === failAt ? uncertain('Owner read failed') : read(...args);
+    await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /Owner read failed/);
+    await acceptCandidate(f.db, f.accept, f.services);
+    assert.deepEqual(f.calls, ['fast', 'full', 'integrate']);
+    assert.equal(f.db.task('task').state, 'done');
+  }
+});
+
+test('R10/A24: concurrent acceptance inspects claimed integration and cannot call it again', async t => {
+  const f = await fixture(t, true), integrate = f.services.repository.conditionalFastForward;
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  f.services.repository.conditionalFastForward = async (...args) => { entered(); await ready; return integrate(...args); };
+  const first = acceptCandidate(f.db, f.accept, f.services);
+  await waiting;
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /unresolved/);
+  release(); await first;
+  await acceptCandidate(f.db, f.accept, f.services);
+  assert.deepEqual(f.calls, ['fast', 'full', 'integrate']);
+});
+
+test('R11/A24: return resumes after each durable step and never repeats the lease effect', async t => {
+  for (const step of ['recordCommand', 'authoriseReturn', 'beginCompletionEffect', 'recordEffectOutcome', 'finishReturn'] as const) {
+    const f = await fixture(t), original = (f.db[step] as Function).bind(f.db);
+    let interrupted = false;
+    (f.db as any)[step] = async (...args: any[]) => {
+      const value = await original(...args);
+      if (!interrupted) { interrupted = true; throw new Error(`crash:${step}`); }
+      return value;
+    };
+    await assert.rejects(returnAttempt(f.db, f.returns, f.services), /crash/);
+    const reopened = await Database.open(f.path, f.options); t.after(() => reopened.close());
+    await returnAttempt(reopened, f.returns, f.services);
+    await returnAttempt(reopened, f.returns, f.services);
+    assert.equal(reopened.attempt(f.a.id).leaseState, 'returned');
+    assert.deepEqual(f.calls, ['return']);
+  }
+});
+
+test('R11: a recreated output ref is not deleted again after successful cleanup', async t => {
+  const f = await fixture(t, true);
+  await acceptCandidate(f.db, f.accept, f.services);
+  await returnAttempt(f.db, f.returns, f.services);
+  f.refs.set(f.a.binding.outputRef, head);
+  await returnAttempt(f.db, f.returns, f.services);
+  assert.equal(f.refs.get(f.a.binding.outputRef), head);
+  assert.equal(f.calls.filter(call => call === 'cleanup').length, 1);
+});
+
+test('R10/R11/R25: task completion and returned state roll back with failed explanatory events', async t => {
+  for (const kind of ['acceptance.finished', 'lease.returned']) {
+    for (const after of [false, true]) {
+      const f = await fixture(t, true), target = f.db as any, original = target.insertEvent;
+      let failed = false;
+      target.insertEvent = function (event: any) {
+        if (!failed && event.kind === kind) {
+          failed = true;
+          if (after) original.call(this, event);
+          throw new Error('Injected event failure');
+        }
+        return original.call(this, event);
+      };
+      if (kind === 'acceptance.finished') {
+        await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /Injected/);
+        assert.notEqual(f.db.task('task').state, 'done');
+        await acceptCandidate(f.db, f.accept, f.services);
+        assert.equal(f.db.task('task').state, 'done');
+        assert.equal(f.calls.filter(call => call === 'integrate').length, 1);
+      } else {
+        await assert.rejects(returnAttempt(f.db, f.returns, f.services), /Injected/);
+        assert.equal(f.db.attempt(f.a.id).leaseState, 'held');
+        await returnAttempt(f.db, f.returns, f.services);
+        assert.equal(f.db.attempt(f.a.id).leaseState, 'returned');
+        assert.deepEqual(f.calls, ['return']);
+      }
+      assert.equal(f.db.events().filter(event => event.kind === kind).length, 1);
+    }
+  }
 });
 
 test('R11: explicit retained branch selection creates a fresh exact candidate and requires fresh checks', async t => {

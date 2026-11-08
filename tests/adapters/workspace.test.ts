@@ -7,6 +7,8 @@ import { commandRunner } from "../../src/adapters/command.ts";
 import type { Result, Runner } from "../../src/adapters/command.ts";
 import { GitRepository } from "../../src/adapters/repository.ts";
 import { startingBranch, TreehouseWorkspace } from "../../src/adapters/workspace.ts";
+import { completionWorkspace } from '../../src/adapters/completion-workspace.ts';
+import { canonicalJson } from '../../src/configuration.ts';
 
 function value<T>(result: Result<T>): T {
   assert.equal(result.status, "confirmed", JSON.stringify(result));
@@ -45,6 +47,25 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   });
   return { root, repository, poolRoot, receiptsDirectory, repo, workspace, options, request, git, run };
 }
+
+test('R11/R32: core return bridge retains acquisition pool identity and rechecks a real lease', async t => {
+  const f = await fixture(t), holder = { databaseId: 'database', attemptId: 'attempt', taskId: 'task', contextId: 'context' };
+  const allocation = value(await f.workspace.acquire({ ...f.request, holder: canonicalJson(holder) }));
+  const stored = { leaseId: allocation.leaseId, holder, path: allocation.path, pool: f.poolRoot,
+    repository: { path: f.repository }, outputRef: `refs/heads/${allocation.branch}`, startingCommit: allocation.startingCommit };
+  const bridge = completionWorkspace(f.workspace);
+  assert.equal(value(await bridge.inspect(stored)).state, 'matching');
+  assert.equal((await bridge.inspect({ ...stored, holder: { ...holder, taskId: 'other' } })).status, 'rejected');
+  await f.git('remote', 'add', 'origin', 'https://example.invalid/another-pool');
+  assert.equal((await bridge.inspect(stored)).status, 'uncertain');
+  await f.git('remote', 'remove', 'origin');
+  const retention = { references: [{ ref: stored.outputRef, commit: stored.startingCommit }], artefacts: [], recyclableRoots: [f.poolRoot] };
+  await writeFile(join(allocation.path, 'dirty'), 'untracked');
+  assert.equal((await bridge.returnLease(stored, { authorised: true, requestId: 'return', retention })).status, 'rejected');
+  await rm(join(allocation.path, 'dirty'));
+  assert.deepEqual(value(await bridge.returnLease(stored, { authorised: true, requestId: 'return', retention })), { returned: true });
+  assert.equal(value(await bridge.inspect(stored)).state, 'absent');
+});
 
 test("R32/A11 real Treehouse acquire verifies complete allocation and removes private starting ref", async t => {
   const f = await fixture(t);

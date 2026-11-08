@@ -14,7 +14,7 @@ export interface ReturnInput {
   attemptId: string;
   caller: TaskActor;
   noProcesses: { leaseId: string };
-  discard?: { leaseId: string; confirmed: true };
+  discard?: { leaseId: string; confirmed: true; reason: string };
 }
 export interface FinalisationPlan extends JsonObject {
   kind: 'manual' | 'local-merge';
