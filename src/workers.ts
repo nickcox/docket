@@ -34,9 +34,11 @@ export async function prepareWorker(db: Database, attemptId: string, host: Worke
   const intent = await db.beginWorkerPreparation(attemptId, claimId, host);
   if (!intent.claimed) return intent.effect;
   const executor = { claimId, generation: host.generation };
+  let prepared: Result<WorkerReference> | undefined;
   try {
     const effect = db.checkWorkerEffect(intent.effect.id, executor);
     const result = await launcher.prepare(effect.input as WorkerBinding, effect.id);
+    prepared = result;
     if (result.status === 'confirmed') {
       await db.bindWorkerReference(attemptId, claimId, result.value, host);
       return db.request(effect.id);
@@ -45,7 +47,9 @@ export async function prepareWorker(db: Database, attemptId: string, host: Worke
   } catch (error) {
     // Even a failure before the call is conservatively uncertain once intent was committed.
     if (db.request(intent.effect.id).state === 'claimed') {
-      await db.recordEffectOutcome(intent.effect.id, executor, 'uncertain', { reason: String(error) });
+      await db.recordEffectOutcome(intent.effect.id, executor, 'uncertain', {
+        reason: String(error), ...(prepared ? { result: evidence(prepared) } : {}),
+      });
     }
     throw error;
   }

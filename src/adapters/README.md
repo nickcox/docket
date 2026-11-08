@@ -1,4 +1,4 @@
-# Workspace and repository adapters
+# External-owner adapters
 
 These internal adapters implement R31's result contract and R32's owner boundaries. They do not write task, attempt, claim or effect records. The caller records intent and reconciles uncertain outcomes before authorising any further effect.
 
@@ -25,6 +25,22 @@ As with ordinary Git commands, callers must prevent unrelated simultaneous edits
 Return accepts an explicit authorised core request and the core-selected retention requirements. It checks the exact live allocation, rechecks exact Git reachability and readable regular artefacts outside recyclable roots, and checks the allocation again before Treehouse's holder/lease-ID-conditional return. It never forces dirty changes away. A successful command alone does not prove return: a complete subsequent listing of the same pool must also confirm it.
 
 Rebase passes exact commit IDs, disables automatic stash/ref updates and runs detached. Conflicts leave the workspace for inspection without moving the accepted/source branches. It does not automatically abort or resolve them.
+
+## Standalone Pi
+
+`PiLauncher` implements R31/R35 over the Pi RPC JSONL protocol. Construct it in the trusted, long-lived worker owner, with an absolute retained state directory outside the lease and person-controlled execution profiles. Each profile names an absolute executable, an optional absolute Node entrypoint, one credential environment variable and an explicit list of additional environment variable names. Unknown options and `DOCKET_` names refuse. The adapter snapshots this configuration and the host environment at construction.
+
+Use `prepareWorker` and `activateWorker` for durable effects. The mandatory `admit` callback is trusted host code, not worker input. Immediately before the prompt, it must call `db.checkWorkerEffect(effectId, { claimId, generation })` for the owning claim and compare the effect's operation (`worker.activate`), attempt, `target.reference` and `input.specification` with the supplied values. That core read verifies committed permission, the full bound reference, the claimed effect and fresh ownership. An absent/mismatched effect must refuse or throw. The callback does not claim the effect again. The synthetic-Pi operation tests demonstrate this binding.
+
+Preparation creates a fresh private home and session directory, selects the exact provider/model/reasoning and validates the returned idle session identity before confirming. It never sends a prompt. The private `HOME` intentionally replaces the host's home, excluding user settings, auth/model files and system prompts. Other approved base/proxy variables and configured credential/pass-through references retain their host values when present. Project approval, extensions, MCP, skills, templates, themes and context discovery are disabled. No general host environment is inherited. On macOS, CoreFoundation may itself add `__CF_USER_TEXT_ENCODING` inside the child; the launcher does not pass it.
+
+These are resource-loading controls, not an OS sandbox. Native coding tools remain available. A person who explicitly allows runtime configuration variables such as `NODE_OPTIONS` or `PI_CODING_AGENT_DIR` is trusting their effects, including changes to resource loading. Executables, the retained state root and execution profiles must remain person-controlled. The owning host, not the transport, enforces run deadlines and budget policy.
+
+Activation consumes its one prompt attempt before writing. A timeout, malformed acknowledgement or lost reply stays uncertain, even if a turn ends afterwards. Concurrent/replayed activation cannot send twice. Turn events and idle preparation are separate from observed direct-child exit. Stop/fence use bounded TERM/KILL and confirm only after the child exit event; neither a signal request nor pipe EOF proves termination. No claim is made about descendants. A new adapter owner cannot adopt a PID or infer absence: references it does not own are unknown. It never restarts a worker.
+
+Usage reads cumulative `get_session_stats`, not per-turn deltas. Missing/invalid values and failed reads are unknown; an explicit unsupported-command reply is unsupported. Regressing counters refuse reporting. The latest reported snapshot remains available after exit. Result transport returns only a bounded, single-link regular-file path in retained storage; the core must open and validate the result, its identity and retention before completion or acceptance. The prompt carries worker protocol version 1 as JSON, including the exact allocation, instructions, ordered criteria, delivery contract and result/question paths.
+
+The implementation consulted the **Pi** reference entry pinned at Switchboard `4077c10009c0ea895e990753d831a20e2fefaf15`: `rpc-client.ts`, `jsonl.ts` and `worker.ts`. It also checked the installed Pi CLI and RPC command documentation. Synthetic peers exercise the process boundary by default. Set `DOCKET_TEST_REAL_PI=1`, `DOCKET_TEST_PI_EXECUTABLE` (absolute), `DOCKET_TEST_PI_PROVIDER` and `DOCKET_TEST_PI_MODEL` to enable the optional real-Pi preparation/fencing probe. It sends no prompt or model request and is not real-dispatch release qualification.
 
 ## Verification
 

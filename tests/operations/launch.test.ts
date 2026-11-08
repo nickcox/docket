@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { applicationId, Database, StorageError } from '../../src/storage/database.ts';
@@ -13,6 +13,7 @@ import type { Allocation } from '../../src/storage/reservations.ts';
 import { activateWorker, prepareWorker } from '../../src/workers.ts';
 import { rejected, uncertain } from '../../src/adapters/command.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
+import { PiLauncher } from '../../src/adapters/pi.ts';
 
 const person = { kind: 'person' as const, id: 'operator' };
 const host: WorkerHost = { kind: 'host', id: 'backend', generation: 'generation-1' };
@@ -82,6 +83,35 @@ function inject(db: Database, kind: string, afterEvent = false) {
   };
   return () => { target.insertEvent = original; };
 }
+
+for (const mode of ['', 'lost-ack']) test(`R31/R35/A14/A15: synthetic Pi honours the committed reference and permission (${mode || 'acknowledged'})`, async t => {
+  const { db, root, started } = await fixture(t), value = await started('pi-task', 'other');
+  await mkdir(value.allocation.path, { recursive: true });
+  const record = join(root, 'pi-peer.jsonl');
+  const launcher = new PiLauncher({ stateDirectory: join(root, 'pi-state'), requestMs: 2000,
+    profiles: { test: { executable: process.execPath, entrypoint: resolve('tests/fixtures/pi-peer.ts'),
+      credentialVariable: 'TEST_KEY', passEnvironment: ['PEER_RECORD', 'PEER_MODE'] } },
+    environment: { PATH: process.env.PATH, PEER_RECORD: record, PEER_MODE: mode },
+    admit: async (reference, input, effectId, generation) => {
+      const effect = db.checkWorkerEffect(effectId, { claimId: value.claimId, generation });
+      return effect.operation === 'worker.activate' && effect.attemptId === value.attemptId
+        && JSON.stringify(effect.target!.reference) === JSON.stringify(reference)
+        && JSON.stringify(effect.input.specification) === JSON.stringify(input);
+    },
+  });
+  const prepared = await prepareWorker(db, value.attemptId, host, launcher);
+  const reference = prepared.result!.reference as WorkerReference;
+  t.after(async () => { await launcher.fence(reference, 'cleanup'); });
+  const records = async () => (await readFile(record, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal((await records()).filter(r => r.type === 'prompt').length, 0);
+  assert.equal(await activateWorker(db, value.attemptId, reference, host, launcher), null);
+  await launcher.activate(reference, db.attempt(value.attemptId).specification, 'uncommitted-effect', host.generation);
+  assert.equal((await records()).filter(r => r.type === 'prompt').length, 0);
+  await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
+  assert.equal((await activateWorker(db, value.attemptId, reference, host, launcher))!.state, mode ? 'uncertain' : 'succeeded');
+  assert.equal(await activateWorker(db, value.attemptId, reference, host, launcher), null);
+  assert.equal((await records()).filter(r => r.type === 'prompt').length, 1);
+});
 
 test('R05/A05: start rechecks definition and readiness, retaining allocation and newer person decisions', async t => {
   for (const change of ['definition', 'hold', 'done', 'dependency', 'newer-decision'] as const) {
@@ -355,7 +385,12 @@ test('A14/R09: failed binding and failed activation confirmation preserve uncert
   const { db, started } = await fixture(t), value = await started('binding'), launcher = new FakeLauncher();
   let restore = inject(db, 'attempt.worker_bound');
   await assert.rejects(prepareWorker(db, value.attemptId, host, launcher), /injected/); restore();
-  assert.equal((await prepareWorker(db, value.attemptId, host, launcher)).state, 'uncertain');
+  const uncertainPreparation = await prepareWorker(db, value.attemptId, host, launcher);
+  assert.equal(uncertainPreparation.state, 'uncertain');
+  const returnedReference = JSON.parse([...launcher.workers.keys()][0]!) as WorkerReference;
+  assert.deepEqual(uncertainPreparation.result!.result, { status: 'confirmed', value: returnedReference });
+  assert.match(String(uncertainPreparation.result!.reason), /injected/);
+  assert.equal((await launcher.inspect(returnedReference)).status, 'known');
   assert.equal(launcher.calls.length, 1); assert.equal(launcher.prompts.length, 0);
   // An uncertain external effect blocks new admission in this context.
   assert.equal(db.requests().find(request => request.operation === 'worker.prepare')!.state, 'uncertain');
