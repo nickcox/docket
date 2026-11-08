@@ -90,8 +90,8 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
       const registered = await openContext({ config: existingFile }, options);
       using registeredDatabase = registered.database;
       const existing = registered.configuration.resolved;
-      const currentRoots = [config.stateDirectory, config.workspace.poolRoot];
-      const existingRoots = [existing.stateDirectory, existing.workspace.poolRoot];
+      const currentRoots = [config.stateDirectory, config.databasePath, config.workspace.poolRoot];
+      const existingRoots = [existing.stateDirectory, existing.databasePath, existing.workspace.poolRoot];
       if (currentRoots.some(current => existingRoots.some(root => inside(current, root) || inside(root, current)))) {
         throw new ContextError('context_mismatch', 'Context storage collides with a registered context');
       }
@@ -124,7 +124,7 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
       contextId: config.contextId, stateDirectory: config.stateDirectory,
       repository: { path: config.repository }, createdBy: { kind: 'person' },
       configuration: { revision: 1, digest, resolved: config, provenance: { file } },
-    }, { location: { retainedRoot: config.stateDirectory, recyclableRoots: options.recyclableRoots ?? [] } });
+    }, { location: { retainedRoot: dirname(config.databasePath), recyclableRoots: options.recyclableRoots ?? [] } });
     const genesis = database.events()[0]!;
     try { await rename(temporary, path); }
     catch {
@@ -152,7 +152,7 @@ export async function openContext(selector: ContextSelector, options: ContextOpt
     throw error;
   }
   const database = await Database.open(config.databasePath, { readOnly: options.readOnly ?? true,
-    location: { retainedRoot: config.stateDirectory, recyclableRoots: options.recyclableRoots ?? [] } });
+    location: { retainedRoot: dirname(config.databasePath), recyclableRoots: options.recyclableRoots ?? [] } });
   try {
     const events = database.events();
     const genesis = events.find(event => event.kind === 'database.initialised');

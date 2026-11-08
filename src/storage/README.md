@@ -4,7 +4,7 @@
 
 ## Opening
 
-- `Database.initialise(path, initial, options)` deliberately creates an absent or zero-length regular file. It records a generated database UUID and the supplied resolved configuration in the same transaction as the schema. It never adopts a nonempty file.
+- `Database.initialise(path, initial, options)` deliberately creates an absent or zero-length regular file. It records a generated database UUID and the supplied resolved configuration in the same transaction as the schema. It never adopts a nonempty file. The database may have an explicit location outside the state directory, but must remain inside the trusted retained root.
 - `Database.open(path, options)` defaults to read-only. Missing databases give `not_initialised`. It checks family and version using a read-only connection before any persistent pragmas or exclusive-creation probe. Unsupported families/versions are not migrated or rewritten. Version 1 has no preceding supported schema to migrate.
 - A writable open uses `{ ...options, readOnly: false }`. All write methods recheck family/version under `BEGIN IMMEDIATE`. Future migrations and domain operations must extend admission checks here, not bypass them with another connection owner.
 - Use `using database = await Database.open(...)`, or close it in `finally`. Failed opens and failed initialisations close their connections. Transaction failures roll back before returning; the connection remains usable.

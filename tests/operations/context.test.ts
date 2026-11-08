@@ -48,13 +48,17 @@ test('A01/R39: explicit state/database/pool paths are honoured and existing regi
   await initialiseContext({ config: f.file }, f.options);
   const second = configuration(f.home, 'second');
   second.stateDirectory = join(f.home, 'custom');
-  second.databasePath = join(second.stateDirectory, 'database', 'custom.db');
+  second.databasePath = join(f.home, 'separate-database', 'custom.db');
   second.workspace.poolRoot = join(f.home, 'custom-pool');
   const file = join(f.home, 'second.json');
   await writeFile(file, JSON.stringify(second));
   const result = await initialiseContext({ config: file }, f.options);
   assert.equal(result.databasePath, second.databasePath);
   assert.ok((await lstat(second.workspace.poolRoot)).isDirectory());
+  const opened = await openContext({ context: 'second' }, f.options);
+  using secondDb = opened.database;
+  assert.equal(opened.databaseId, result.databaseId);
+  assert.equal(secondDb.events()[1]!.payload.digest, result.digest);
   assert.deepEqual(JSON.parse(await readFile(f.registry, 'utf8')), { first: f.file, second: file });
   const first = await openContext({ context: 'first' }, f.options);
   using firstDb = first.database;
@@ -148,6 +152,33 @@ test('R01/R39: different context names cannot collide on state or pool paths', a
   await writeFile(file, JSON.stringify(other));
   await assert.rejects(initialiseContext({ config: file }, f.options), contextError('context_mismatch'));
   assert.deepEqual(await readFile(f.registry), before);
+});
+
+test('R01/R39: a separate database path cannot collide with another registered context', async t => {
+  const f = await fixture(t);
+  f.config.databasePath = join(f.home, 'databases', 'shared.db');
+  await writeFile(f.file, JSON.stringify(f.config));
+  await initialiseContext({ config: f.file }, f.options);
+  const before = await readFile(f.registry);
+  const bytes = await readFile(f.config.databasePath);
+  const other = configuration(f.home, 'other');
+  other.databasePath = f.config.databasePath;
+  const file = join(f.home, 'other.json');
+  await writeFile(file, JSON.stringify(other));
+  await assert.rejects(initialiseContext({ config: file }, f.options), contextError('context_mismatch'));
+  assert.deepEqual(await readFile(f.registry), before);
+  assert.deepEqual(await readFile(f.config.databasePath), bytes);
+  await assert.rejects(lstat(other.stateDirectory), { code: 'ENOENT' });
+});
+
+test('A53/R29: equivalent file formatting remains admitted without a new configuration event', async t => {
+  const f = await fixture(t);
+  const result = await initialiseContext({ config: f.file }, f.options);
+  await writeFile(f.file, JSON.stringify(Object.fromEntries(Object.entries(f.config).reverse()), null, 4));
+  const context = await openContext({ context: 'example' }, f.options);
+  using database = context.database;
+  assert.equal(context.configuration.digest, result.digest);
+  assert.equal(database.events().length, 2);
 });
 
 test('R01/R39: an edited registered configuration cannot hide storage collisions during another init', async t => {

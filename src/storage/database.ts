@@ -280,7 +280,6 @@ export class Database {
     const actor = object(initial.createdBy);
     await canonical(initial.stateDirectory);
     const exists = await verifyPath(path, options.location, true);
-    if (!inside(path, initial.stateDirectory)) throw new StorageError('path', 'Database must be inside its state directory');
     if (exists && (await lstat(path)).size !== 0) throw new StorageError('not_empty', 'Initialisation requires an empty path; existing file was not changed');
     await exclusiveProbe(path);
     if (!exists) {

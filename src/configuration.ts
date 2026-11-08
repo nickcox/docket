@@ -135,7 +135,7 @@ export async function parseConfiguration(textValue: string, recyclableRoots: rea
   const workspace = object(config.workspace, '$.workspace', ['adapter', 'poolRoot']);
   choice(workspace.adapter, '$.workspace.adapter', ['treehouse']);
   await canonicalPath(workspace.poolRoot, '$.workspace.poolRoot');
-  if (config.databasePath === config.stateDirectory || !inside(String(config.databasePath), String(config.stateDirectory))) refuse('$.databasePath', 'Database must be below stateDirectory');
+  if (inside(String(config.stateDirectory), String(config.databasePath))) refuse('$.databasePath', 'Database file must not contain the state directory');
   if (inside(String(config.stateDirectory), String(workspace.poolRoot))) refuse('$.stateDirectory', 'State directory must be outside the workspace pool');
   if (inside(String(config.databasePath), String(workspace.poolRoot))) refuse('$.databasePath', 'Database must be outside the workspace pool');
   if (inside(String(workspace.poolRoot), String(config.databasePath))) refuse('$.workspace.poolRoot', 'Pool must not be below a database file');

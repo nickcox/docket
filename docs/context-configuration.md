@@ -8,7 +8,7 @@ Write absolute, normalised paths without symbolic links. Missing state/database/
 - database: `<stateDirectory>/docket.db`
 - workspace pool: `<stateDirectory>/pool`
 
-The database must be below the state directory and outside the pool. The pool may be below the state directory, as it is by default. Explicit paths are honoured. State directories and pools cannot overlap another registered context's storage.
+The database must be outside the pool; an explicit database path may be separate from the state directory. The pool may be below the state directory, as it is by default. Explicit paths are honoured. State directories, databases and pools cannot overlap another registered context's storage.
 
 When preparing a new file, the specified initial defaults are `maxAttempts=1`, `maxAttemptsPerTask=3`, `maxConcurrentFullChecks=1`, manual finalisation, `runMs=1800000` and `keepAwake=true`. Write these values explicitly, along with person-selected repository, provider, model and execution profiles. There is no interactive wizard in this implementation.
 
