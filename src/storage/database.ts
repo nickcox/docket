@@ -13,6 +13,7 @@ import type { ResultBinding, ValidatedResult, WorkerObservation } from './result
 import type { GitRepository } from '../adapters/repository.ts';
 import { checkEvidenceKey } from '../check-policy.ts';
 import type { CheckAdmission, CheckRunInput, CheckRunResult } from './checks.ts';
+import type { AcceptInput, ReturnInput, FinalisationPlan } from './completion.ts';
 import type { ContextChecks } from '../check-policy.ts';
 import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState } from './tasks.ts';
 
@@ -1259,6 +1260,204 @@ export class Database {
     });
   }
 
+  finalisationConfiguration(): { policy: JsonObject; revision: number; digest: string } {
+    return this.snapshot(() => {
+      const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get()!;
+      const payload = this.decodeEvent(row).payload;
+      return { policy: object(object(payload.resolved).finalisation), revision: Number(payload.revision), digest: String(payload.digest) };
+    });
+  }
+
+  private completionGuard(attemptId: string): Record<string, unknown> {
+    const attempt = this.attemptRow(attemptId);
+    const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
+      AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(attemptId);
+    if (!terminal || attempt.execution_open !== 0 || attempt.outcome === null || attempt.allocation === null) {
+      throw new StorageError('conflict', 'Completion requires a stopped terminal worker, recorded outcome and allocation');
+    }
+    return attempt;
+  }
+
+  private completionEvent(key: string, kind: string, attemptId: string, caller: TaskActor, payload: JsonObject, requestId: string): void {
+    this.insertEvent({ sourceKey: key, kind, payloadVersion: 1, correlationId: requestId, requestId,
+      attemptId, taskId: String(this.attemptRow(attemptId).task_id), actor: caller,
+      occurredAt: new Date().toISOString(), payload });
+  }
+
+  async selectRetainedCandidate(attemptId: string, commit: string, outputRef: string, caller: TaskActor): Promise<Attempt> {
+    taskActor(caller); text(commit); text(outputRef);
+    return this.write(() => {
+      const attempt = this.completionGuard(attemptId), spec = object(JSON.parse(String(attempt.specification)));
+      if (outputRef !== spec.outputRef || commit === spec.startingCommit || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new StorageError('conflict', 'Candidate must name the retained output and move beyond the start');
+      if (this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'candidate.accepted'").get(attemptId)) throw new StorageError('conflict', 'An accepted candidate cannot be replaced');
+      const previous = attempt.candidate === null ? null : object(JSON.parse(String(attempt.candidate)));
+      if (previous?.commit === commit && previous.outputRef === outputRef) return this.decodeAttempt(attempt);
+      const result = this.validatedResultInTransaction(attemptId);
+      if (!result) throw new StorageError('conflict', 'Candidate requires a validated result');
+      const candidate = { id: randomUUID(), commit, outputRef, selectedBy: caller, resultDigest: result.digest };
+      this.db.prepare('UPDATE attempts SET candidate = ?, revision = revision + 1 WHERE id = ?').run(json(candidate), attemptId);
+      this.insertEvent({ sourceKey: `candidate.selected:${candidate.id}`, kind: 'candidate.selected', payloadVersion: 1,
+        correlationId: attemptId, attemptId, taskId: String(attempt.task_id), actor: caller,
+        occurredAt: new Date().toISOString(), payload: candidate });
+      return this.decodeAttempt(this.attemptRow(attemptId));
+    });
+  }
+
+  acceptance(attemptId: string, candidateId: string): StoredEvent | null {
+    return this.snapshot(() => {
+      const row = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(`candidate.accepted:${attemptId}:${candidateId}`);
+      return row ? this.decodeEvent(row) : null;
+    });
+  }
+
+  /** The acceptance and its exact evidence scope commit together, before any integration. */
+  async recordAcceptance(input: AcceptInput, requestId: string, plan: FinalisationPlan,
+    checks: StoredRequest | null, config: { revision: number; digest: string }): Promise<StoredEvent> {
+    taskActor(input.caller);
+    const value = structuredClone(input), policy = object(plan);
+    if (value.overrideReason !== undefined) nonblank(value.overrideReason);
+    return this.write(() => {
+      const attempt = this.completionGuard(value.attemptId), task = this.taskRow(String(attempt.task_id));
+      const command = this.decodeRequest(this.requestRow(requestId));
+      if (command.operation !== 'attempt.accept' || json(command.caller) !== json(value.caller)
+        || json(command.input) !== json(value)) throw new StorageError('conflict', 'Acceptance must match its person command');
+      const candidate = object(JSON.parse(String(attempt.candidate)));
+      if (candidate.id !== value.candidateId || candidate.commit !== value.commit) throw new StorageError('conflict', 'Exact candidate changed');
+      const key = `candidate.accepted:${value.attemptId}:${value.candidateId}`;
+      const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
+      if (previous) return this.decodeEvent(previous);
+      const current = this.checkConfigurationInTransaction();
+      if (current.revision !== config.revision || current.digest !== config.digest) throw new StorageError('conflict', 'Configuration changed before acceptance');
+      const check = checks === null ? null : this.decodeRequest(this.requestRow(checks.id));
+      if (!value.overrideReason && (!check || check.operation !== 'checks.run' || check.attemptId !== value.attemptId
+        || check.input.commit !== value.commit || check.state !== 'succeeded' || check.result?.status !== 'passed')) {
+        throw new StorageError('conflict', 'Acceptance requires passing checks or a person override reason');
+      }
+      if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('claimed','uncertain')
+        AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) {
+        throw new StorageError('conflict', 'Attempt has an unresolved effect');
+      }
+      this.completionEvent(key, 'candidate.accepted', value.attemptId, value.caller,
+        { candidate, plan: policy, decisionRevision: Number(task.decision_revision),
+          checksRequestId: check?.id ?? null, overrideReason: value.overrideReason ?? null }, requestId);
+      return this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key)!);
+    });
+  }
+
+  async finishAcceptance(acceptance: StoredEvent): Promise<Attempt> {
+    return this.write(() => {
+      const stored = this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(acceptance.sourceKey)!);
+      const attemptId = stored.attemptId!, attempt = this.completionGuard(attemptId), task = this.taskRow(String(attempt.task_id));
+      const candidate = object(stored.payload.candidate), plan = object(stored.payload.plan);
+      if (json(candidate) !== json(JSON.parse(String(attempt.candidate)))) throw new StorageError('conflict', 'Accepted candidate changed');
+      if (plan.kind === 'local-merge' && !this.db.prepare(`SELECT 1 FROM requests WHERE request_key = ? AND state = 'succeeded'`)
+        .get(`integrate:${attemptId}:${String(candidate.id)}`)) throw new StorageError('conflict', 'Integration is not confirmed');
+      const key = `acceptance.finished:${stored.id}`;
+      if (!this.db.prepare('SELECT 1 FROM events WHERE source_key = ?').get(key)) {
+        if (Number(task.decision_revision) === stored.payload.decisionRevision) {
+          this.db.prepare("UPDATE tasks SET state = 'done', hold_reason = NULL WHERE id = ? AND decision_revision = ?")
+            .run(String(attempt.task_id), Number(task.decision_revision));
+        }
+        this.completionEvent(key, 'acceptance.finished', attemptId, stored.actor as TaskActor, { candidate, integrated: plan.kind === 'local-merge' }, stored.requestId!);
+      }
+      return this.decodeAttempt(this.attemptRow(attemptId));
+    });
+  }
+
+  /** Return authorisation never implies a process-tree observation by a launcher. */
+  async authoriseReturn(input: ReturnInput, requestId: string): Promise<StoredEvent> {
+    taskActor(input.caller);
+    const value = structuredClone(input);
+    return this.write(() => {
+      const attempt = this.completionGuard(value.attemptId), allocation = object(JSON.parse(String(attempt.allocation)));
+      const command = this.decodeRequest(this.requestRow(requestId));
+      if (command.operation !== (value.discard ? 'attempt.discard' : 'attempt.return') || json(command.caller) !== json(value.caller)
+        || json(command.input) !== json(value)) throw new StorageError('conflict', 'Return must match its person command');
+      if (value.noProcesses?.leaseId !== allocation.leaseId || (value.discard !== undefined
+        && (value.discard.leaseId !== allocation.leaseId || value.discard.confirmed !== true))) {
+        throw new StorageError('conflict', 'Person confirmations must name the exact lease');
+      }
+      const key = `return.authorised:${value.attemptId}`;
+      const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
+      if (previous) {
+        const recorded = this.decodeEvent(previous);
+        if (Boolean(recorded.payload.discard) !== Boolean(value.discard)) throw new StorageError('conflict', 'Return and discard decisions differ');
+        return recorded;
+      }
+      if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
+        AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
+      this.completionEvent(key, 'return.authorised', value.attemptId, value.caller,
+        { allocation, discard: Boolean(value.discard), noProcesses: value.noProcesses, decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
+      return this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key)!);
+    });
+  }
+
+  async finishReturn(authorisation: StoredEvent): Promise<Attempt> {
+    return this.write(() => {
+      const stored = this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(authorisation.sourceKey)!);
+      const attemptId = stored.attemptId!, attempt = this.completionGuard(attemptId);
+      if (!this.db.prepare("SELECT 1 FROM requests WHERE request_key = ? AND state = 'succeeded'").get(`return:${attemptId}`)) {
+        throw new StorageError('conflict', 'Lease return is not confirmed');
+      }
+      if (attempt.lease_state !== 'returned') {
+        this.db.prepare("UPDATE attempts SET lease_state = 'returned', revision = revision + 1 WHERE id = ?").run(attemptId);
+        const task = this.taskRow(String(attempt.task_id));
+        if (stored.payload.discard && task.state !== 'done') {
+          this.db.prepare("UPDATE tasks SET state = 'queued', hold_reason = 'discarded' WHERE id = ?").run(String(attempt.task_id));
+        }
+        this.completionEvent(`lease.returned:${attemptId}`, 'lease.returned', attemptId, stored.actor as TaskActor,
+          { discard: stored.payload.discard!, allocation: stored.payload.allocation! }, stored.requestId!);
+      }
+      return this.decodeAttempt(this.attemptRow(attemptId));
+    });
+  }
+
+  /** Reserve a single executor and immutable intent for a completion effect. */
+  async beginCompletionEffect(authorisation: StoredEvent, operation: 'integrate' | 'return' | 'cleanup', input: JsonObject): Promise<{ request: StoredRequest; executor: ClaimIdentity }> {
+    const value = object(input);
+    return this.write(() => {
+      const storedRow = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(authorisation.sourceKey);
+      if (!storedRow) throw new StorageError('conflict', 'Missing completion authorisation');
+      const stored = this.decodeEvent(storedRow), attemptId = stored.attemptId!, attempt = this.completionGuard(attemptId);
+      const suffix = operation === 'integrate' ? `:${String(object(stored.payload.candidate).id)}` : '';
+      const key = `${operation}:${attemptId}${suffix}`;
+      const existing = this.db.prepare('SELECT * FROM requests WHERE request_key = ?').get(key);
+      if (existing) {
+        const request = this.decodeRequest(existing), claim = this.decodeClaim(this.claimRow(request.claimId!));
+        return { request, executor: { claimId: claim.id, generation: claim.generation } };
+      }
+      if ((operation === 'integrate' && stored.kind !== 'candidate.accepted') || (operation !== 'integrate' && stored.kind !== 'return.authorised')) throw new StorageError('conflict', 'Wrong completion authorisation');
+      if (operation === 'integrate' && Number(this.taskRow(String(attempt.task_id)).decision_revision) !== stored.payload.decisionRevision) {
+        throw new StorageError('conflict', 'A newer person decision prevents integration');
+      }
+      if (operation === 'cleanup' && attempt.lease_state !== 'returned') throw new StorageError('conflict', 'Return must be confirmed before cleanup');
+      if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
+        AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
+      const generation = randomUUID();
+      const [claim] = this.registerClaimsInTransaction([{ resourceKey: `completion:${attemptId}`, role: 'maintenance', attemptId,
+        generation, ownerRef: stored.actor, schemaFamily: applicationId, schemaVersion, configRevision: this.configRevision(), heartbeatAt: new Date().toISOString() }], stored.actor);
+      const executor = { claimId: claim!.id, generation };
+      const request = this.recordEffectInTransaction({ requestKey: key, operation: `completion.${operation}`, caller: stored.actor,
+        input: value, fingerprint: json(value), parentId: stored.requestId!, executor, attemptId,
+        target: { kind: operation === 'return' ? 'workspace' : 'repository', reference: value } });
+      return { request, executor };
+    });
+  }
+
+  /** Safe owner reads may settle a lost response; they never reopen permission to call. */
+  async settleCompletionEffect(id: string, evidence: JsonObject): Promise<StoredRequest> {
+    const proof = object(evidence);
+    return this.write(() => {
+      const request = this.decodeRequest(this.requestRow(id));
+      if (!request.operation.startsWith('completion.') || !['claimed', 'uncertain'].includes(request.state) || proof.confirmed !== true) throw new StorageError('conflict', 'Completion effect is not reconcilable');
+      this.db.prepare("UPDATE requests SET state = 'succeeded', result = ?, revision = revision + 1 WHERE id = ?").run(json(proof), id);
+      this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
+        .run(new Date().toISOString(), json(proof), request.claimId!);
+      this.storageEvent('completion.reconciled', request.caller, { evidence: proof }, id);
+      return this.decodeRequest(this.requestRow(id));
+    });
+  }
+
   private configRevision(): number {
     const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
     if (!row) throw new StorageError('conflict', 'Missing context configuration');
@@ -1539,6 +1738,15 @@ export class Database {
     const before = this.effect(id, 'pending');
     const claim = this.effectExecutor(before, expected);
     if (before.operation === 'worker.activate' || before.operation === 'worker.prepare') this.checkWorkerEffectInTransaction(before, expected);
+    if (before.operation.startsWith('completion.')) {
+      const attempt = this.completionGuard(before.attemptId!);
+      if (before.operation === 'completion.integrate') {
+        const accepted = this.db.prepare("SELECT * FROM events WHERE request_id = ? AND kind = 'candidate.accepted'").get(before.parentId!);
+        if (!accepted || Number(this.taskRow(String(attempt.task_id)).decision_revision) !== this.decodeEvent(accepted).payload.decisionRevision) {
+          throw new StorageError('conflict', 'A newer person decision prevents integration');
+        }
+      }
+    }
     if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Executor heartbeat is not fresh');
     this.changed(this.db.prepare(`UPDATE requests SET state = 'claimed', claimed_at = ?, revision = revision + 1
       WHERE id = ? AND state = 'pending' AND revision = ? AND claim_id = ?`)
@@ -1559,6 +1767,10 @@ export class Database {
       if (json(before.caller) !== json(actor)) throw new StorageError('conflict', 'Effect caller does not match');
       this.changed(this.db.prepare(`UPDATE requests SET state = ?, result = ?, revision = revision + 1
         WHERE id = ? AND state = 'pending' AND revision = ?`).run(state, json(outcome), id, before.revision));
+      if (before.operation.startsWith('completion.')) {
+        this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
+          .run(new Date().toISOString(), json(outcome), before.claimId!);
+      }
       const request = this.decodeRequest(this.requestRow(id));
       this.storageEvent(`request.${state}`, actor, { request: object(request) }, id);
       return request;
@@ -1581,6 +1793,10 @@ export class Database {
     this.changed(this.db.prepare(`UPDATE requests SET state = ?, result = ?, revision = revision + 1
       WHERE id = ? AND state = 'claimed' AND revision = ? AND claim_id = ?`)
       .run(state, json(outcome), id, before.revision, expected.claimId));
+    if (before.operation.startsWith('completion.') && state !== 'uncertain') {
+      this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
+        .run(new Date().toISOString(), json(outcome), claim.id);
+    }
     const request = this.decodeRequest(this.requestRow(id));
     this.storageEvent(`request.${state}`, claim.ownerRef, { request: object(request), generation: expected.generation }, id);
     return request;

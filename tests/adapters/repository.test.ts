@@ -42,6 +42,18 @@ test("R32/R08 ref reads distinguish absence from failed, corrupt and truncated r
   const f = await fixture(t);
   assert.deepEqual(value(await f.repo.inspectRef("refs/heads/missing")), { state: "absent" });
   assert.deepEqual(value(await f.repo.inspectRef("refs/heads/main")), { state: "present", commit: f.base });
+  await f.git('branch', 'prefix/child', f.head);
+  assert.deepEqual(value(await f.repo.inspectRef('refs/heads/prefix')), { state: 'absent' });
+  assert.deepEqual(value(await f.repo.inspectRef('refs/heads/prefix/child')), { state: 'present', commit: f.head });
+  const commands: string[][] = [];
+  const lookup: Runner = async (_program, args) => {
+    commands.push(args);
+    return { code: 0, complete: true, stdout: `refs/heads/prefix/child ${f.head}\n`, stderr: '' };
+  };
+  assert.deepEqual(value(await new GitRepository({ repository: f.path, run: lookup }).inspectRef('refs/heads/prefix')), { state: 'absent' });
+  assert.deepEqual(commands, [['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/prefix']]);
+  const failed: Runner = async () => ({ code: 1, complete: true, stdout: '', stderr: 'lookup failed' });
+  assert.equal((await new GitRepository({ repository: f.path, run: failed }).inspectRef('refs/heads/prefix')).status, 'uncertain');
   assert.equal((await new GitRepository({ repository: join(f.root, "missing") }).inspectRef("refs/heads/main")).status, "uncertain");
   await writeFile(join(f.path, ".git/refs/heads/broken"), "not-an-object\n");
   assert.equal((await f.repo.inspectRef("refs/heads/broken")).status, "uncertain");

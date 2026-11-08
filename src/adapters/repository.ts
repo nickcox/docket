@@ -42,12 +42,17 @@ export class GitRepository {
   }
   async inspectRef(ref: string): Promise<Result<RefState>> {
     if (!isRef(ref)) return rejected("Invalid full ref name", ref);
-    // show-ref --exists distinguishes missing (2) from failed lookup (1). rev-parse --quiet alone does not.
-    const exists = await this.command(["show-ref", "--exists", ref]);
-    if (!exists.complete) return uncertain("Ref lookup failed", exists);
-    if (exists.code === 2) return confirmed({ state: "absent" });
-    if (exists.code !== 0) return uncertain("Ref lookup failed", exists);
-    const read = await this.command(["rev-parse", "--verify", `${ref}^{commit}`]);
+    const exists = await this.command(["for-each-ref", "--format=%(refname) %(objectname)", ref]);
+    if (!exists.complete || exists.code !== 0 || exists.stderr.trim() !== '') return uncertain("Ref lookup failed", exists);
+    if (exists.stdout !== '' && !exists.stdout.endsWith('\n')) return uncertain("Truncated ref lookup", exists);
+    const lines = exists.stdout.split('\n').filter(Boolean);
+    if (lines.some(line => !/^refs\/\S+ [a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(line))) return uncertain("Malformed ref lookup", exists);
+    // for-each-ref takes a prefix pattern, not an exact name.
+    const exact = lines.filter(line => line.split(' ')[0] === ref);
+    if (exact.length === 0) return confirmed({ state: "absent" });
+    if (exact.length !== 1) return uncertain("Ambiguous ref lookup", exists);
+    const objectId = exact[0]!.split(' ')[1]!;
+    const read = await this.command(["rev-parse", "--verify", `${objectId}^{commit}`]);
     const commit = read.stdout.trim();
     if (!read.complete || read.code !== 0 || !isCommit(commit)) return uncertain("Ref commit could not be read", read);
     return confirmed({ state: "present", commit });

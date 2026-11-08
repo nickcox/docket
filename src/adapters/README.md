@@ -71,6 +71,6 @@ This implementation consulted the **Processes** reference entry pinned at Switch
 
 ## Verification
 
-`npm run check` and `npm test` include real temporary Git repositories and isolated real Treehouse pools. Treehouse must be installed; adapter tests are not silently skipped. The implementation uses `git show-ref --exists` (Git 2.46 or later) so missing refs are distinct from lookup failures. Qualification here used Node 26.7.0, Git 2.53.0 and Treehouse 3.1.4 on macOS.
+`npm run check` and `npm test` include real temporary Git repositories and isolated real Treehouse pools. Treehouse must be installed; adapter tests are not silently skipped. The implementation uses `git for-each-ref` with exact-name matching so missing refs are distinct from lookup failures. Qualification here used Node 26.7.0, Git 2.53.0 and Treehouse 3.1.4 on macOS.
 
 The implementation consulted the **Treehouse and Git** reference entry pinned at Switchboard `4077c10009c0ea895e990753d831a20e2fefaf15`: `treehouse.ts`, `retention.ts`, `integration.ts`, `output-branch.ts` and `starting-point.ts`. Docket's specification governs the contract; notably checked-out fast-forwards use a ref transaction rather than an unprotected read followed by merge.
