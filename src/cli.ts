@@ -7,6 +7,8 @@ import { ConfigurationError } from './configuration.ts';
 import { ContextError } from './context.ts';
 import type { ContextSelector } from './context.ts';
 import { StorageError } from './storage/database.ts';
+import { validateSchema } from './operation-schemas.ts';
+import { randomUUID } from 'node:crypto';
 
 export const MAX_RESPONSE_BYTES = 256 * 1024;
 export const MAX_INPUT_BYTES = 256 * 1024;
@@ -23,6 +25,7 @@ export type OperationRunner = (
   args: Record<string, unknown>,
   progress: (message: string) => void,
   selector?: ContextSelector,
+  requestId?: string,
 ) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
 interface Options {
@@ -88,19 +91,8 @@ async function readArgs(options: Options, io: CliIO): Promise<Record<string, unk
 }
 
 function validateArgs(operation: OperationDefinition, args: Record<string, unknown>): void {
-  // The only current input schema is the strict empty object. Refuse rather than
-  // silently accepting fields if an operation with a different schema is added.
-  const properties = operation.inputSchema.properties;
-  if (
-    operation.inputSchema.type !== "object" ||
-    operation.inputSchema.additionalProperties !== false ||
-    !Array.isArray(operation.inputSchema.required) ||
-    operation.inputSchema.required.length !== 0 ||
-    properties === null || typeof properties !== "object" || Object.keys(properties).length !== 0
-  ) {
-    throw new Error("Input schema requires a validator.");
-  }
-  if (Object.keys(args).length !== 0) throw new CommandFailure("invalid_input");
+  const invalid = validateSchema(operation.inputSchema, args);
+  if (invalid) throw new CommandFailure('invalid_input', { field: invalid.slice(0, 200) });
 }
 
 /** One invocation writes one envelope, including when parsing or execution throws. */
@@ -125,7 +117,8 @@ export async function runCli(
     if ((definition.name === 'catalog.show' && options.selector) || (definition.name !== 'catalog.show' && !options.selector)) throw new CommandFailure('invalid_input');
     const args = await readArgs(options, io);
     validateArgs(definition, args);
-    const data = await runOperation(definition, args, (message) => io.stderr(`${message}\n`), options.selector);
+    if (definition.mutates && args.dryRun !== true) requestId ??= randomUUID();
+    const data = await runOperation(definition, args, (message) => io.stderr(`${message}\n`), options.selector, requestId ?? undefined);
     const envelope = successEnvelope(operation, requestId, data);
     exitCode = exitCodeFor(envelope.outcome);
     // Serialise once, inside the failure boundary (for example circular data).
@@ -142,7 +135,7 @@ export async function runCli(
       const field = error.field.replace(/[^A-Za-z0-9_.$\[\]-]/gu, '?').slice(0, 200);
       failure.envelope.diagnostics[0]!.message = `Invalid configuration at ${field}.`;
     }
-    if (error instanceof ContextError) failure.envelope.data = error.data;
+    if (error instanceof ContextError || error instanceof CommandFailure) failure.envelope.data = error.data;
     exitCode = failure.exitCode;
     output = `${JSON.stringify(failure.envelope)}\n`;
     io.stderr(`${failure.envelope.diagnostics[0]?.message}\n`);

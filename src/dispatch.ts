@@ -1,0 +1,141 @@
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { canonicalJson } from './configuration.ts';
+import { Database, applicationId, schemaVersion } from './storage/database.ts';
+import type { JsonObject } from './storage/database.ts';
+import type { ReservationInput, Allocation } from './storage/reservations.ts';
+import type { TaskActor } from './storage/tasks.ts';
+import type { Runtime } from './runtime.ts';
+import { prepareWorker, activateWorker } from './workers.ts';
+import type { WorkerHost, WorkerReference } from './storage/launch.ts';
+import { runCandidateChecks } from './checks.ts';
+import { CommandFailure } from './response.ts';
+import { step } from './plans.ts';
+import { known } from './operation-utils.ts';
+
+export async function dispatch(db: Database, args: { taskId: string | null; profile: string | null; dryRun: boolean },
+  caller: TaskActor, requestKey: string, runtime: Runtime, progress: (message: string) => void) {
+  const previous = db.requests().find(r => r.requestKey === requestKey);
+  // A replay never starts another owner or resumes an interrupted remote call.
+  if (previous && !args.dryRun) {
+    const replay = await db.reserveAttempt({ requestKey, caller, ...(args.taskId === null ? {} : { taskId: args.taskId }),
+      ...(args.profile === null ? {} : { profile: args.profile }), startingCommit: '', checks: {} as ReservationInput['checks'],
+      delivery: {} as ReservationInput['delivery'] });
+    return { attempt: replay.attempt, replayed: true, steps: [] };
+  }
+  const config = db.checkConfiguration();
+  const configured = db.events().findLast(e => e.kind === 'context.configured')!.payload.resolved as JsonObject;
+  const starting = known(await runtime.repository.inspectRef(`refs/heads/${String(configured.baseBranch).replace(/^refs\/heads\//u, '')}`));
+  if (starting.state !== 'present') throw new CommandFailure('candidate_missing');
+  const checks = await runtime.repository.readCheckPolicy(config.targetBranch.startsWith('refs/') ? config.targetBranch : `refs/heads/${config.targetBranch}`, config.checks);
+  const input: ReservationInput = { requestKey, caller, startingCommit: starting.commit, checks,
+    ...(args.taskId === null ? {} : { taskId: args.taskId }), ...(args.profile === null ? {} : { profile: args.profile }),
+    expectedConfigRevision: config.revision, expectedConfigDigest: config.digest,
+    delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } };
+  const preview = await db.reserveAttempt(input, true);
+  const task = db.task(preview.attempt.taskId);
+  input.delivery.kind = task.kind === 'report' ? 'report' : 'code';
+  input.expectedDefinitionRevision = task.definitionRevision;
+  input.expectedDecisionRevision = task.decisionRevision;
+  const profile = preview.attempt.specification.profile as JsonObject;
+  const capabilities = runtime.launcher.capabilities(profile);
+  if (capabilities.preparation === 'unsupported' || !capabilities.admission) throw new CommandFailure('policy_refused');
+  const leases = known(await runtime.workspace.list());
+  const allocations = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!)).filter(a => a.leaseState !== 'returned');
+  if (leases.some(lease => !allocations.some(a => a.allocation?.leaseId === lease.leaseId))) throw new CommandFailure('owner_unresolved');
+  const steps = ['attempt.reserve', 'workspace.acquire', 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
+    'worker.activate', 'worker.wait', 'worker.fence', 'attempt.complete', 'checks.run'].map(operation => step(operation, task.id,
+      operation === 'attempt.reserve' ? ['ready', 'capacity', 'resolved_owners'] : ['current_authority'], operation === 'checks.run'));
+  if (args.dryRun) return { taskId: task.id, steps };
+  progress('attempt.reserve');
+  const reservation = await db.reserveAttempt(input);
+  if (reservation.replayed) return { attempt: reservation.attempt, replayed: true, steps: [] };
+  const id = reservation.attempt.id;
+  const generation = randomUUID(), host: WorkerHost = { kind: 'host', id: `cli:${process.pid}:${randomUUID()}`, generation };
+  const [claim] = await db.registerClaims([{ resourceKey: `dispatch:${id}`, role: 'maintenance', generation, ownerRef: caller,
+    schemaFamily: applicationId, schemaVersion, configRevision: config.revision, heartbeatAt: new Date().toISOString() }], caller);
+  const executor = { claimId: claim!.id, generation };
+  let reference: WorkerReference | undefined;
+  let terminal = false, sequence = 0;
+  const refresh = async () => {
+    const now = new Date().toISOString();
+    await db.refreshClaim(executor, now, caller);
+    if (reference) {
+      const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);
+      if (owner) await db.heartbeatWorkerOwner(id, owner.id, host);
+    }
+  };
+  const fence = async () => {
+    const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt)!;
+    const identity = { claimId: owner.id, generation };
+    const effect = await db.recordEffect({ requestKey: `fence:${id}`, operation: 'worker.fence', caller,
+      fingerprint: canonicalJson(reference), input: { reference: reference! }, parentId: reservation.requestId,
+      executor: identity, attemptId: id, target: { kind: 'worker', reference: reference! } });
+    if (effect.state !== 'pending') throw new CommandFailure('effect_uncertain', { attemptId: id });
+    await db.claimEffect(effect.id, identity);
+    const result = await runtime.launcher.fence(reference!, effect.id);
+    await db.recordEffectOutcome(effect.id, identity, result.status === 'confirmed' ? 'succeeded' : result.status === 'rejected' ? 'rejected' : 'uncertain', JSON.parse(JSON.stringify(result)));
+    known(result);
+  };
+  try {
+    progress('workspace.acquire');
+    const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, caller);
+    try {
+      const spec = reservation.attempt.specification;
+      const allocation = known(await runtime.workspace.acquire({ databaseId: String(spec.databaseId), attemptId: id,
+        holder: canonicalJson((spec.workspace as JsonObject).holder), branch: String(spec.outputRef).replace(/^refs\/heads\//u, ''), startingCommit: starting.commit }));
+      const stored: Allocation = { leaseId: allocation.leaseId, holder: (spec.workspace as JsonObject).holder as JsonObject,
+        path: allocation.path, pool: runtime.workspace.options.poolRoot, repository: spec.repository as JsonObject,
+        outputRef: String(spec.outputRef), startingCommit: allocation.startingCommit };
+      await db.recordAllocation(id, acquisition.effect.id, executor, stored);
+    } catch (error) {
+      await db.recordUncertainAcquisition(id, acquisition.effect.id, executor, { reason: 'Workspace acquisition could not be confirmed' });
+      throw error;
+    }
+    await refresh();
+    progress('attempt.start'); await db.startAttempt(id, caller);
+    progress('worker.prepare');
+    const prepared = await prepareWorker(db, id, host, runtime.launcher);
+    if (prepared.state !== 'succeeded') throw new CommandFailure('effect_uncertain', { attemptId: id });
+    reference = prepared.result!.reference as WorkerReference;
+    progress('worker.bind');
+    await refresh();
+    progress('worker.permit'); await db.decideWorkerLaunch(id, prepared.claimId!, 'permit', host);
+    progress('worker.activate');
+    const activation = await activateWorker(db, id, reference, host, runtime.launcher);
+    if (activation?.state !== 'succeeded') throw new CommandFailure('effect_uncertain', { attemptId: id });
+    progress('worker.wait');
+    const deadline = Date.now() + Number(profile.runMs);
+    let refreshed = Date.now();
+    while (true) {
+      const observation = await runtime.launcher.inspect(reference);
+      if (observation.status !== 'known') throw new CommandFailure('owner_unknown', { attemptId: id });
+      if (observation.terminal) { terminal = true; break; }
+      if (observation.turn === 'ended' || Date.now() >= deadline) break;
+      if (Date.now() - refreshed >= 5000) { await refresh(); refreshed = Date.now(); }
+      await delay(50);
+    }
+    progress('worker.fence');
+    if (!terminal) { await refresh(); await fence(); }
+    const observed = await runtime.launcher.inspect(reference);
+    if (observed.status !== 'known' || !observed.terminal) throw new CommandFailure('owner_unknown', { attemptId: id });
+    terminal = true;
+    await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: ++sequence, attemptId: id, workerRef: reference,
+      observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
+      payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
+    progress('attempt.complete');
+    await db.completeWorker(id, host, runtime.repository);
+    if (db.attempt(id).candidate) { progress('checks.run'); await runCandidateChecks(db, id, caller, runtime.completion); }
+    return { attempt: db.attempt(id), steps };
+  } finally {
+    // Do not leave a direct child behind when this foreground command fails.
+    if (reference && !terminal) {
+      await runtime.launcher.fence(reference, `emergency-stop:${id}`);
+    }
+    await db.releaseClaim(executor, { stopped: true, attemptId: id }, caller);
+    if (terminal) {
+      const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);
+      if (owner) await db.releaseClaim({ claimId: owner.id, generation }, { terminal: true, attemptId: id }, caller);
+    }
+  }
+}

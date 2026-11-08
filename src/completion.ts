@@ -15,6 +15,7 @@ import { taskActor } from './storage/tasks.ts';
 import type { GitRepository, RetentionRequest } from './adapters/repository.ts';
 import type { Result } from './adapters/command.ts';
 import { readFinalisationPolicy } from './adapters/finalisation.ts';
+import { step } from './plans.ts';
 
 export interface ReturnWorkspace {
   inspect(allocation: Allocation): Promise<Result<{ state: 'matching' | 'absent' | 'mismatch' }>>;
@@ -119,6 +120,47 @@ async function effect(db: Database, authorisation: StoredEvent, operation: 'inte
   return request;
 }
 
+export async function planCandidateAcceptance(db: Database, input: AcceptInput, services: CompletionServices) {
+  taskActor(input.caller);
+  const attempt = db.attempt(input.attemptId);
+  exactCandidate(db, input);
+  if (attempt.executionOpen || !attempt.outcome || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) refuse('Acceptance requires a stopped terminal worker and recorded outcome');
+  const accepted = db.acceptance(attempt.id, input.candidateId);
+  const finished = accepted && db.events().some(e => e.sourceKey === `acceptance.finished:${accepted.id}`);
+  if (finished) return { steps: [] };
+  if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
+  await retainedOutput(db, attempt.id, services);
+  const policy = await planAcceptance(db, input, services);
+  const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['claimed', 'uncertain'].includes(r.state));
+  // Interrupted integration is reconciled by the executor, not reissued by a plan.
+  if (unresolved && !unresolved.operation.startsWith('completion.')) refuse('Attempt has an unresolved effect');
+  const steps = [];
+  if (!accepted) {
+    if (input.overrideReason === undefined) {
+      const config = db.checkConfiguration();
+      const current = await services.repository.readCheckPolicy(policy.target, config.checks);
+      const checks = mandatoryChecks(attempt.specification.checks as TrustedChecks, current);
+      const key = checkEvidenceKey(attempt.specification.repository as JsonObject, input.commit,
+        attempt.specification.criteria as string[], checks, services.profile);
+      const result = db.requests().findLast(r => r.operation === 'checks.run' && r.attemptId === attempt.id && r.input.evidenceKey === key);
+      if (result && result.state === 'succeeded' && result.result?.status === 'passed') { /* Reuse exact evidence. */ }
+      else if (result && result.state !== 'pending') refuse('Acceptance requires passing checks or a person override reason');
+      else {
+        const workspace = known(await services.repository.inspectWorkspace(attempt.allocation!.path));
+        if (!workspace.clean || workspace.head !== input.commit) refuse('Workspace has uncommitted or untracked work or candidate moved');
+        steps.push(step('checks.run', attempt.id, ['terminal', 'exact_candidate', 'clean_workspace']));
+      }
+    }
+    steps.push(step('candidate.accept', attempt.id, ['retained_output', ...(input.overrideReason === undefined ? ['checks_passed'] : ['person_override'])], input.overrideReason === undefined));
+  }
+  if (policy.kind === 'local-merge' && !db.requests().some(r => r.requestKey === `integrate:${attempt.id}:${input.candidateId}` && r.state === 'succeeded')) {
+    if (!known(await services.repository.compare(policy.expected, input.commit)) && !known(await services.repository.compare(input.commit, policy.expected))) refuse('Target cannot fast-forward');
+    steps.push(step(unresolved ? 'integration.reconcile' : 'repository.integrate', policy.target, ['exact_candidate', 'policy_allows'], !accepted));
+  }
+  steps.push(step('task.complete', attempt.taskId, ['acceptance', 'unchanged_decision'], true));
+  return { steps };
+}
+
 export async function acceptCandidate(db: Database, input: AcceptInput, services: CompletionServices) {
   input = structuredClone(input);
   services = { ...services, profile: structuredClone(services.profile) };
@@ -169,6 +211,22 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
 }
 
 /** Return and discard share the same conditional lease effect; neither acceptance nor discard returns it implicitly. */
+export async function planAttemptReturn(db: Database, input: ReturnInput, services: CompletionServices) {
+  taskActor(input.caller);
+  const attempt = db.attempt(input.attemptId), allocation = attempt.allocation;
+  if (!allocation || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) throw new StorageError('conflict', 'Return requires a stopped terminal worker and allocation');
+  if (input.noProcesses?.leaseId !== allocation.leaseId) refuse('Person confirmations must name the exact lease');
+  if (input.discard && (input.discard.leaseId !== allocation.leaseId || input.discard.confirmed !== true || !input.discard.reason.trim())) refuse('Person discard confirmations must name the exact lease');
+  if (attempt.leaseState === 'returned') return { steps: [] };
+  if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
+  const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
+  if (unresolved) refuse('Attempt has an unresolved effect');
+  if (attempt.outcome) await retainedOutput(db, attempt.id, services);
+  if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
+  if (!known(await services.repository.inspectWorkspace(allocation.path)).clean) refuse('Workspace has uncommitted or untracked work');
+  return { steps: [step(input.discard ? 'attempt.discard' : 'attempt.return', allocation.leaseId, ['terminal', 'no_processes', 'matching_allocation', 'clean_workspace'])] };
+}
+
 export async function returnAttempt(db: Database, input: ReturnInput, services: CompletionServices) {
   input = structuredClone(input);
   taskActor(input.caller);

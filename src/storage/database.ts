@@ -457,12 +457,28 @@ export class Database {
     return true;
   }
 
-  async addTask(input: AddTaskInput, actor: TaskActor): Promise<Task> {
+  private writeTask<T>(command: CommandInput | undefined, change: () => T): Promise<T> {
+    if (command) commandInput(command);
+    return this.write(() => {
+      const previous = command && this.duplicateRequest(command, 'command');
+      if (previous) return previous.result!.value as T;
+      const value = change();
+      if (command) {
+        const id = randomUUID();
+        this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, state, result, created_at)
+          VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', 'succeeded', ?, ?)`)
+          .run(id, command.requestKey, command.operation, json(command.caller), command.fingerprint, json(command.input), json({ value }), new Date().toISOString());
+      }
+      return value;
+    });
+  }
+
+  async addTask(input: AddTaskInput, actor: TaskActor, command?: CommandInput): Promise<Task> {
     addTaskInput(input);
     taskActor(actor);
     const value = JSON.parse(json(input)) as AddTaskInput;
     const person = object(actor) as TaskActor;
-    return this.write(() => {
+    return this.writeTask(command, () => {
       let id = value.id;
       if (id === undefined) {
         const base = taskSlug(value.title);
@@ -481,14 +497,16 @@ export class Database {
     });
   }
 
-  async updateTaskDefinition(id: string, patch: Partial<TaskDefinition>, actor: TaskActor): Promise<Task> {
+  async updateTaskDefinition(id: string, patch: Partial<TaskDefinition>, actor: TaskActor, command?: CommandInput, expectedRevision?: number): Promise<Task> {
     taskText(id);
     taskDefinition(patch);
     taskActor(actor);
     const value = JSON.parse(json(patch)) as Partial<TaskDefinition>;
     const person = object(actor) as TaskActor;
-    return this.write(() => {
+    return this.writeTask(command, () => {
       const before = this.decodeTask(this.taskRow(id));
+      if (expectedRevision !== undefined && before.definitionRevision !== expectedRevision) throw new StorageError('conflict', 'Task revision changed');
+      if (before.kind === 'review' && (value.kind !== undefined || value.criteria !== undefined || value.instructions !== undefined)) throw new StorageError('conflict', 'Linked review definition cannot change');
       const after = { ...before, ...value };
       if (json(before) === json(after)) return before;
       this.changed(this.db.prepare(`UPDATE tasks SET title = ?, instructions = ?, criteria = ?, kind = ?,
@@ -501,19 +519,19 @@ export class Database {
     });
   }
 
-  async addBlocker(taskId: string, blockerId: string, actor: TaskActor): Promise<Task> {
+  async addBlocker(taskId: string, blockerId: string, actor: TaskActor, command?: CommandInput): Promise<Task> {
     taskText(taskId); taskText(blockerId); taskActor(actor);
     const person = object(actor) as TaskActor;
-    return this.write(() => {
+    return this.writeTask(command, () => {
       if (this.insertBlocker(taskId, blockerId)) this.taskEvent('task.block', person, taskId, { blockerId });
       return this.decodeTask(this.taskRow(taskId));
     });
   }
 
-  async removeBlocker(taskId: string, blockerId: string, actor: TaskActor): Promise<Task> {
+  async removeBlocker(taskId: string, blockerId: string, actor: TaskActor, command?: CommandInput): Promise<Task> {
     taskText(taskId); taskText(blockerId); taskActor(actor);
     const person = object(actor) as TaskActor;
-    return this.write(() => {
+    return this.writeTask(command, () => {
       this.taskRow(taskId); this.taskRow(blockerId);
       const result = this.db.prepare('DELETE FROM dependencies WHERE task_id = ? AND blocker_id = ?').run(taskId, blockerId);
       if (Number(result.changes) !== 0) this.taskEvent('task.unblock', person, taskId, { blockerId });
@@ -522,11 +540,11 @@ export class Database {
   }
 
   /** A complete permutation avoids ambiguous partial-order edits. */
-  async reorderTasks(ids: readonly string[], actor: TaskActor): Promise<Task[]> {
+  async reorderTasks(ids: readonly string[], actor: TaskActor, command?: CommandInput): Promise<Task[]> {
     taskIds(ids); taskActor(actor);
     const order = [...ids];
     const person = object(actor) as TaskActor;
-    return this.write(() => {
+    return this.writeTask(command, () => {
       const before = this.db.prepare('SELECT id, position FROM tasks ORDER BY position').all();
       if (before.length !== order.length || before.some(row => !order.includes(String(row.id)))) {
         throw new StorageError('conflict', 'Reorder must name every task exactly once');
@@ -549,10 +567,10 @@ export class Database {
     });
   }
 
-  private async decideTask(id: string, operation: 'hold' | 'release' | 'done' | 'reopen', actor: TaskActor, reason?: string): Promise<Task> {
+  private async decideTask(id: string, operation: 'hold' | 'release' | 'done' | 'reopen', actor: TaskActor, reason?: string, command?: CommandInput): Promise<Task> {
     taskText(id); taskActor(actor);
     const person = object(actor) as TaskActor;
-    return this.write(() => {
+    return this.writeTask(command, () => {
       const before = this.decodeTask(this.taskRow(id));
       const state = operation === 'done' ? 'done' : operation === 'reopen' ? 'queued' : before.state;
       const holdReason = operation === 'hold' ? reason! : operation === 'release' ? null : before.holdReason;
@@ -566,15 +584,15 @@ export class Database {
     });
   }
 
-  async holdTask(id: string, reason: string, actor: TaskActor): Promise<Task> {
+  async holdTask(id: string, reason: string, actor: TaskActor, command?: CommandInput): Promise<Task> {
     taskText(reason);
     if ([...reason].length > 200 || /[\r\n\u2028\u2029]/u.test(reason)) throw new TypeError('Hold reason must be one line of at most 200 characters');
-    return this.decideTask(id, 'hold', actor, reason);
+    return this.decideTask(id, 'hold', actor, reason, command);
   }
 
-  releaseTask(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'release', actor); }
-  markTaskDone(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'done', actor); }
-  reopenTask(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'reopen', actor); }
+  releaseTask(id: string, actor: TaskActor, command?: CommandInput): Promise<Task> { return this.decideTask(id, 'release', actor, undefined, command); }
+  markTaskDone(id: string, actor: TaskActor, command?: CommandInput): Promise<Task> { return this.decideTask(id, 'done', actor, undefined, command); }
+  reopenTask(id: string, actor: TaskActor, command?: CommandInput): Promise<Task> { return this.decideTask(id, 'reopen', actor, undefined, command); }
 
   private attemptRow(id: string): Record<string, unknown> {
     const row = this.db.prepare('SELECT * FROM attempts WHERE id = ?').get(id);
@@ -597,14 +615,14 @@ export class Database {
   }
 
   /** The key comparison precedes selection, policy resolution and all admission decisions. */
-  async reserveAttempt(input: ReservationInput): Promise<Reservation> {
+  async reserveAttempt(input: ReservationInput, dryRun = false): Promise<Reservation> {
     reservationInput(input);
     const value = JSON.parse(json(input)) as ReservationInput;
     const logicalInput = { taskId: value.taskId ?? null, profile: value.profile ?? null,
       sourceAttemptId: value.sourceAttemptId ?? null, note: value.note ?? null };
     const command: CommandInput = { requestKey: value.requestKey, operation: 'attempt.dispatch', caller: value.caller,
       input: logicalInput, fingerprint: createHash('sha256').update(json(logicalInput)).digest('hex') };
-    return this.write(() => {
+    const build = () => {
       const previous = this.duplicateRequest(command, 'command');
       if (previous) {
         if (!previous.attemptId) throw new StorageError('conflict', 'Dispatch request has no reservation');
@@ -659,6 +677,9 @@ export class Database {
           profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
           finalisation: config.finalisation, checks: value.checks,
           configuration: { revision: config.revision, digest: config.digest, sourceEventId: configEvent.id } };
+        if (dryRun) return { requestId, replayed: false, attempt: { id, taskId: task.id, number, revision: 1,
+          executionOpen: true, phase: 'reserved', launchState: 'pending', specification, allocation: null,
+          leaseState: 'none', outcome: null, candidate: null } };
         this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, created_at)
           VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?)`).run(requestId, command.requestKey, command.operation,
             json(command.caller), command.fingerprint, json(command.input), now);
@@ -671,7 +692,8 @@ export class Database {
         return { requestId, replayed: false, attempt: this.decodeAttempt(this.attemptRow(id)) };
       }
       throw new StorageError('conflict', 'No eligible task');
-    });
+    };
+    return dryRun ? this.snapshot(build) : this.write(build);
   }
 
   /** One durable intent per reservation. An existing intent is never permission to call again. */
@@ -1624,6 +1646,32 @@ export class Database {
   claim(id: string): Claim {
     text(id);
     return this.snapshot(() => this.decodeClaim(this.claimRow(id)));
+  }
+
+  async resolveClaimByPerson(id: string, evidence: string, caller: TaskActor, command: CommandInput): Promise<Claim> {
+    taskActor(caller); nonblank(evidence);
+    return this.writeTask(command, () => {
+      const claim = this.decodeClaim(this.claimRow(id));
+      if (claim.releasedAt) return claim;
+      const proof = { claimId: id, generation: claim.generation, ownerRef: claim.ownerRef, evidence, confirmStopped: true };
+      this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
+        .run(new Date().toISOString(), json(proof), id);
+      this.storageEvent('claim.resolved', caller, proof);
+      return this.decodeClaim(this.claimRow(id));
+    });
+  }
+
+  async resolveEffectByPerson(id: string, happened: boolean, evidence: string, caller: TaskActor, command: CommandInput): Promise<StoredRequest> {
+    taskActor(caller); nonblank(evidence);
+    return this.writeTask(command, () => {
+      const request = this.decodeRequest(this.requestRow(id));
+      if (request.category !== 'effect' || !['claimed', 'uncertain'].includes(request.state)) throw new StorageError('conflict', 'Effect is not unresolved');
+      const proof = object({ effectId: id, target: request.target, evidence, confirmStopped: true, happened });
+      this.db.prepare('UPDATE requests SET state = ?, result = ?, revision = revision + 1 WHERE id = ?')
+        .run(happened ? 'succeeded' : 'rejected', json(proof), id);
+      this.storageEvent('effect.resolved', caller, proof, id);
+      return this.decodeRequest(this.requestRow(id));
+    });
   }
 
   claims(): Claim[] {

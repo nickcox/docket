@@ -1,5 +1,6 @@
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 
 const args = process.argv.slice(2);
@@ -50,18 +51,26 @@ function receive(line: string) {
     active = true;
     emit({ type: 'agent_start' });
     if (mode !== 'lost-ack') respond({ disposition: 'started' });
-    if (mode !== 'running') {
-      active = false;
-      emit({ type: 'agent_end' });
-      emit({ type: 'agent_settled', aborted: false });
-    }
-    if (mode === 'result') {
+    if (mode === 'result' || mode === 'code-result') {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
+      let commit = 'b'.repeat(40);
+      if (mode === 'code-result') {
+        writeFileSync(join(process.cwd(), 'implementation.txt'), 'Synthetic implementation\n');
+        const git = (...args: string[]) => execFileSync('git', args, { cwd: process.cwd(), encoding: 'utf8' }).trim();
+        git('add', 'implementation.txt');
+        git('-c', 'user.name=Synthetic peer', '-c', 'user.email=peer@example.invalid', 'commit', '-qm', 'Implement task');
+        commit = git('rev-parse', 'HEAD');
+      }
       writeFileSync(protocol.resultPath, JSON.stringify({ version: 1, identity: protocol.identity,
         startingCommit: protocol.startingCommit, outputRef: protocol.outputRef, outcome: 'completed', summary: 'Synthetic result', reason: null,
         criteriaReport: protocol.criteria.map((criterion: string, index: number) => ({ position: index + 1, criterion, status: 'met', evidence: 'Synthetic check' })),
         evidence: [{ name: 'tests', summary: 'Synthetic tests pass' }],
-        workReferences: [{ kind: 'git', name: 'code', branch: protocol.outputRef, commit: 'b'.repeat(40) }] }));
+        workReferences: [{ kind: 'git', name: 'code', branch: protocol.outputRef, commit }] }));
+    }
+    if (mode !== 'running') {
+      active = false;
+      emit({ type: 'agent_end' });
+      emit({ type: 'agent_settled', aborted: false });
     }
   }
 }

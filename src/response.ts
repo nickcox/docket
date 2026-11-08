@@ -25,7 +25,9 @@ export interface Envelope {
 
 // Messages are fixed, rather than copied from parser, filesystem or runtime errors.
 // Those errors can contain credentials, input contents or environment values.
+const refusalCodes = ['not_ready', 'task_changed', 'capacity', 'attempt_limit', 'request_input_mismatch', 'outside_objective', 'permission_denied', 'person_required', 'effect_uncertain', 'claim_unresolved', 'owner_unresolved', 'launch_fenced', 'result_invalid', 'result_identity_mismatch', 'result_discrepancy', 'candidate_missing', 'candidate_moved', 'not_retained', 'workspace_dirty', 'check_missing', 'check_failed', 'review_missing', 'process_confirmation_required', 'discard_confirmation_required', 'already_complete', 'not_fast_forward'] as const;
 const failures = {
+  ...Object.fromEntries(refusalCodes.map(code => [code, { exit: 1 as const, message: `Operation refused: ${code}.`, retryable: false }])) as Record<typeof refusalCodes[number], { exit: 1; message: string; retryable: boolean }>,
   invalid_configuration: { exit: 2, message: "Invalid context configuration.", retryable: false },
   context_registered: { exit: 1, message: "The context name is already registered.", retryable: false },
   database_not_empty: { exit: 1, message: "Initialisation requires an empty database path.", retryable: false },
@@ -47,9 +49,11 @@ export type FailureCode = keyof typeof failures;
 export class CommandFailure extends Error {
   readonly code: FailureCode;
 
-  constructor(code: FailureCode) {
+  readonly data: Record<string, unknown>;
+  constructor(code: FailureCode, data: Record<string, unknown> = {}) {
     super(failures[code].message);
     this.code = code;
+    this.data = data;
   }
 }
 
@@ -80,7 +84,8 @@ export function successEnvelope(operation: string, requestId: string | null, dat
     operation,
     requestId,
     outcome: "succeeded",
-    code: operation === "context.init" ? "context_initialised" : "catalog_shown",
+    code: operation === 'context.init' ? 'context_initialised' : operation === 'catalog.show' ? 'catalog_shown'
+      : Array.isArray(data.steps) && data.steps.length === 0 ? 'already_complete' : operation.replaceAll('.', '_'),
     data,
     diagnostics: [],
     nextAction: null,

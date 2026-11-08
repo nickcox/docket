@@ -23,18 +23,21 @@ function checkInputSchema(schema: JsonSchema): void {
 
 test("R28/A52: one version-1 catalogue exposes context.init and catalog.show with complete definitions", () => {
   assert.equal(catalogue.catalogueVersion, 1);
-  assert.deepEqual(catalogue.operations.map((operation) => operation.name), ["context.init", "catalog.show"]);
+  assert.deepEqual(catalogue.operations.map(operation => operation.name).sort(), ['catalog.show', 'context.init', 'status.show',
+    'task.add', 'task.show', 'task.list', 'task.update', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
+    'attempt.dispatch', 'attempt.show', 'attempt.accept', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].sort());
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
-    assert.deepEqual(operation.roles, operation.name === 'context.init' ? ['person'] : ["person", "supervisor", "worker", "host"]);
+    assert.ok(operation.roles.includes('person'));
+    if (['context.init', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
     assert.deepEqual(operation.bindingDerivedFields, []);
-    assert.equal(operation.mutates, operation.name === 'context.init');
-    assert.equal(operation.plans, false);
+    assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show'].includes(operation.name));
+    assert.equal(operation.plans, ['attempt.dispatch', 'attempt.accept', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);
     checkInputSchema(operation.inputSchema);
     assert.equal(operation.outputSchema.type, "object");
-    assert.equal(operation.outputSchema.additionalProperties, false);
+    if (['context.init', 'catalog.show'].includes(operation.name)) assert.equal(operation.outputSchema.additionalProperties, false);
     assert.equal(findOperation(operation.name), operation);
     if (operation.name === 'catalog.show') {
       assert.deepEqual(operation.outputSchema.required, ["catalogueVersion", "operations"]);
@@ -43,7 +46,7 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
       assert.throws(() => executeOperation(operation), /Invalid arguments/u, 'initialisation requires a trusted CLI selector');
     }
   }
-  assert.equal(findOperation("task.add"), undefined);
+  assert.equal(findOperation('not.an-operation'), undefined);
 });
 
 test("R28/A52: the no-argument input schema is a described strict empty object", () => {

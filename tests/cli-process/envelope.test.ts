@@ -42,11 +42,11 @@ test("R27/R28/A51/A52: docket catalog show --json emits the core catalogue witho
 });
 
 test("R27/A51: real parser and unknown-operation errors use exit 2 and one envelope", () => {
-  for (const args of [[], ["catalog"], ["catalog", "show", "--invalid", secret], ["task", "add", "--json"]]) {
+  for (const args of [[], ["catalog"], ["catalog", "show", "--invalid", secret], ["unknown", "add", "--json"]]) {
     const result = invoke(args);
     assert.equal(result.status, 2);
     assert.equal(result.envelope.outcome, "refused");
-    assert.equal(result.envelope.code, args[0] === "task" ? "unknown_operation" : "invalid_input");
+    assert.equal(result.envelope.code, args[0] === "unknown" ? "unknown_operation" : "invalid_input");
     assert.ok(result.stderr.length > 0);
   }
 });

@@ -1,4 +1,5 @@
-import { initialiseContext } from './context.ts';
+import { coreOperations } from './operation-schemas.ts';
+import { executeCoreOperation } from './operations.ts';
 import type { ContextSelector } from './context.ts';
 import { CommandFailure } from './response.ts';
 
@@ -47,6 +48,7 @@ const operationSchema = {
 export const catalogue: { readonly catalogueVersion: 1; readonly operations: readonly OperationDefinition[] } = {
   catalogueVersion: 1,
   operations: [
+    ...coreOperations,
     {
       name: "context.init",
       description: "Initialise an empty context and register its configuration file.",
@@ -102,15 +104,9 @@ export function findOperation(name: string): OperationDefinition | undefined {
   return catalogue.operations.find((operation) => operation.name === name);
 }
 
-export function executeOperation(operation: OperationDefinition, _args?: Record<string, unknown>, _progress?: (message: string) => void,
-  selector?: ContextSelector): Record<string, unknown> | Promise<Record<string, unknown>> {
-  switch (operation.name) {
-    case "context.init":
-      if (!selector) throw new CommandFailure("invalid_input");
-      return initialiseContext(selector);
-    case "catalog.show":
-      return catalogue;
-    default:
-      throw new Error("Operation has no implementation.");
-  }
+export function executeOperation(operation: OperationDefinition, args: Record<string, unknown> = {}, progress: (message: string) => void = () => {},
+  selector?: ContextSelector, requestId?: string): Record<string, unknown> | Promise<Record<string, unknown>> {
+  if (operation.name === 'catalog.show') return catalogue;
+  if (!selector) throw new CommandFailure('invalid_input');
+  return executeCoreOperation(operation, args, progress, selector, requestId);
 }
