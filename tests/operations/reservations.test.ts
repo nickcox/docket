@@ -151,7 +151,11 @@ test('R04/R29: named revisions and missing or invalid policy refuse without reco
   const original = db.events().find(event => event.kind === 'context.configured')!;
   for (const broken of [ {}, { ...configuration(root), limits: { maxAttempts: 0, maxAttemptsPerTask: 3 } },
     { ...configuration(root), finalisation: {} }, { ...configuration(root), baseBranch: '' },
-    { ...configuration(root), profiles: { worker: { ...(configuration(root).profiles as JsonObject).worker as JsonObject, secret: 'do not persist' } } } ]) {
+    { ...configuration(root), profiles: { worker: { ...(configuration(root).profiles as JsonObject).worker as JsonObject, secret: 'do not persist' } } },
+    { ...configuration(root), profiles: { ...(configuration(root).profiles as JsonObject), inactive: { launcher: 'bb' } } },
+    { ...configuration(root), defaultProfile: 'toString' },
+    { ...configuration(root), profileByKind: { code: 'worker', report: 'worker', review: 'toString' } },
+    { ...configuration(root), profileByKind: { code: 'worker', report: 'worker', review: 'worker', unknown: 'worker' } } ]) {
     seed.prepare("UPDATE events SET payload = ? WHERE kind = 'context.configured'").run(JSON.stringify({ ...original.payload, resolved: broken }));
     const before = snapshot(db, path);
     await assert.rejects(db.reserveAttempt(input()));
@@ -187,14 +191,15 @@ test('A16/A49/R08: stale, future and unreadable claims refuse reservation naming
 });
 
 test('R08/R09: a fresh executor permits other reservations, stale/released claimed work and all uncertainty block', async t => {
-  for (const mode of ['fresh', 'stale', 'released', 'uncertain'] as const) await t.test(mode, async t => {
+  for (const mode of ['fresh', 'stale', 'future', 'unreadable', 'released', 'uncertain'] as const) await t.test(mode, async t => {
     const { db, executor, path } = await fixture(t);
     await add(db, 'one'); await add(db, 'two');
     const first = await db.reserveAttempt(input('first', 'one'));
     const { effect } = await db.beginWorkspaceAcquisition(first.attempt.id, first.requestId, executor, actor);
-    if (mode === 'stale') {
+    if (mode === 'stale' || mode === 'future' || mode === 'unreadable') {
       using sql = new DatabaseSync(path);
-      sql.prepare('UPDATE claims SET heartbeat_at = ? WHERE id = ?').run('2000-01-01', executor.claimId);
+      const heartbeat = mode === 'stale' ? '2000-01-01' : mode === 'future' ? '2999-01-01' : 'unreadable';
+      sql.prepare('UPDATE claims SET heartbeat_at = ? WHERE id = ?').run(heartbeat, executor.claimId);
     } else if (mode === 'released') await db.releaseClaim(executor, { stopped: true }, actor);
     else if (mode === 'uncertain') await db.recordUncertainAcquisition(first.attempt.id, effect.id, executor, { reason: 'lost response' });
     if (mode === 'fresh') {
@@ -242,6 +247,28 @@ test('A11/R05: wrong provider holder, path, pool, repository, ref or commit neve
   });
 });
 
+test('R05/R09/R25: acquisition uses detached caller/executor identity and commits its claim before calling the provider', async t => {
+  const { db, executor, path } = await fixture(t);
+  await add(db, 'one');
+  const command = { ...input(), caller: { ...actor } }, identity = { ...executor };
+  let calls = 0;
+  const pending = reserveAndAllocate(db, command, identity, { acquire: async request => {
+    calls++;
+    using observer = new DatabaseSync(path, { readOnly: true });
+    const effect = observer.prepare('SELECT state, claim_id FROM requests WHERE id = ?').get(request.requestId)!;
+    assert.equal(effect.state, 'claimed');
+    assert.equal(effect.claim_id, executor.claimId);
+    assert.equal(db.request(request.requestId).parentId, db.requests().find(value => value.category === 'command')!.id);
+    return allocation(request);
+  } });
+  command.caller.id = 'changed';
+  identity.generation = 'changed';
+  const result = await pending;
+  assert.equal(calls, 1);
+  assert.equal(result.attempt.phase, 'allocated');
+  assert.equal(db.requests().find(value => value.category === 'command')!.caller.id, actor.id);
+});
+
 test('A12/R05/R09: lost acquisition response retains path/holder/request evidence without lease and never acquires twice', async t => {
   const { db, executor } = await fixture(t);
   await add(db, 'one');
@@ -261,7 +288,7 @@ test('A12/R05/R09: lost acquisition response retains path/holder/request evidenc
 });
 
 test('A09/R25: failure inside every new transaction rolls back its state and every event', async t => {
-  for (const operation of ['reserve', 'begin', 'allocate', 'uncertain']) for (const afterEvent of [false, true]) await t.test(`${operation}, after event=${afterEvent}`, async t => {
+  for (const operation of ['reserve', 'begin', 'allocate', 'uncertain']) for (const point of ['before-first', 'after-last']) await t.test(`${operation}, ${point}`, async t => {
     const { db, path, executor } = await fixture(t);
     await add(db, 'one');
     const reservation = operation === 'reserve' ? undefined : await db.reserveAttempt(input());
@@ -270,9 +297,13 @@ test('A09/R25: failure inside every new transaction rolls back its state and eve
     const before = snapshot(db, path);
     const internal = db as unknown as { insertEvent: (event: EventInput) => StoredEvent };
     const original = internal.insertEvent;
+    const eventCount = operation === 'allocate' || operation === 'uncertain' ? 2 : 1;
+    let inserted = 0;
     internal.insertEvent = function (event) {
-      if (afterEvent) original.call(this, event);
-      throw new Error('injected transaction failure');
+      if (point === 'before-first') throw new Error('injected transaction failure');
+      const result = original.call(this, event);
+      if (++inserted === eventCount) throw new Error('injected transaction failure');
+      return result;
     };
     try {
       const change = operation === 'reserve' ? () => db.reserveAttempt(input()) : operation === 'begin'

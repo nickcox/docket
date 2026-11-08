@@ -136,15 +136,26 @@ export function resolveReservationConfig(payload: JsonObject, task: Task, explic
   if (!Array.isArray(finalisation.forbid)) throw new TypeError('Invalid finalisation restrictions');
   finalisation.forbid.forEach(text);
   const profiles = record(config.profiles), byKind = record(config.profileByKind);
+  fields(byKind, ['code', 'report', 'review']);
+  if (Object.keys(profiles).length === 0) throw new TypeError('Expected configured profiles');
+  for (const [name, settings] of Object.entries(profiles)) {
+    text(name);
+    profileSettings(record(settings));
+  }
   text(config.defaultProfile);
   for (const kind of ['code', 'report', 'review']) {
     text(byKind[kind]);
-    if (!(String(byKind[kind]) in profiles)) throw new TypeError('Unknown kind profile');
+    if (!Object.hasOwn(profiles, String(byKind[kind]))) throw new TypeError('Unknown kind profile');
   }
-  if (!(config.defaultProfile in profiles)) throw new TypeError('Unknown default profile');
+  if (!Object.hasOwn(profiles, config.defaultProfile)) throw new TypeError('Unknown default profile');
   const profileName = explicitProfile ?? task.profile ?? String(byKind[task.kind]);
   if (!Object.hasOwn(profiles, profileName)) throw new TypeError('Unknown execution profile');
   const profile = record(profiles[profileName]);
+  return { revision: Number(payload.revision), digest: payload.digest, baseBranch: config.baseBranch,
+    poolRoot: workspace.poolRoot, maxAttempts: Number(limits.maxAttempts), maxAttemptsPerTask: Number(limits.maxAttemptsPerTask),
+    profile, profileName, profileSource: explicitProfile !== undefined ? 'dispatch' : task.profile !== null ? 'task' : `profileByKind.${task.kind}`, finalisation };
+}
+function profileSettings(profile: JsonObject): void {
   fields(profile, ['launcher', 'provider', 'model', 'reasoning', 'runMs', 'maxCost', 'maxTokens', 'executionProfile']);
   if (!['bb', 'pi'].includes(String(profile.launcher))) throw new TypeError('Invalid launcher');
   text(profile.provider); text(profile.model); text(profile.executionProfile); positive(profile.runMs);
@@ -153,9 +164,6 @@ export function resolveReservationConfig(payload: JsonObject, task: Task, explic
     const limit = profile[key];
     if (limit !== null && (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 0 || (key === 'maxTokens' && !Number.isSafeInteger(limit)))) throw new TypeError('Invalid profile budget');
   }
-  return { revision: Number(payload.revision), digest: payload.digest, baseBranch: config.baseBranch,
-    poolRoot: workspace.poolRoot, maxAttempts: Number(limits.maxAttempts), maxAttemptsPerTask: Number(limits.maxAttemptsPerTask),
-    profile, profileName, profileSource: explicitProfile !== undefined ? 'dispatch' : task.profile !== null ? 'task' : `profileByKind.${task.kind}`, finalisation };
 }
 export function allocationInput(value: Allocation): void {
   fields(value, ['leaseId', 'holder', 'path', 'pool', 'repository', 'outputRef', 'startingCommit']);
