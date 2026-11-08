@@ -160,6 +160,38 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(records.filter(r => r.type === 'prompt').length, 1);
 });
 
+test('R27/R30: moved targets name exact commits and rebase action; target restrictions remain policy_refused', async t => {
+  const f = await fixture(t);
+  assert.equal(f.invoke('task.add', { id: 'feature', definition, objectiveId: null }).status, 0);
+  const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false });
+  assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope));
+  const attempt = dispatched.data.attempt;
+  f.git('commit', '--allow-empty', '-qm', 'Target moved independently');
+  const targetCommit = f.git('rev-parse', 'main');
+  for (const dryRun of [true, false]) {
+    const before = await snapshot(f.home);
+    const refused = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun });
+    assert.equal(refused.status, 1);
+    assert.equal(refused.envelope.code, 'not_fast_forward');
+    assert.deepEqual(refused.data, { attemptId: attempt.id, targetRef: 'refs/heads/main', targetCommit, candidateCommit: attempt.candidate.commit });
+    assert.equal(refused.envelope.nextAction.operation, 'attempt.rebase');
+    assert.deepEqual(refused.envelope.nextAction.args, { attemptId: attempt.id, dryRun: true });
+    assert.ok(refused.envelope.nextAction.description);
+    assert.deepEqual(await snapshot(f.home), before, 'Refusal preserves work and records');
+  }
+  for (const restrictions of [{ forbid: [], protectedTargets: ['main'] }, { forbid: ['local-merge'], protectedTargets: [] }]) {
+    await writeFile(join(f.home, '.config', 'docket', 'finalisation.json'), JSON.stringify({ version: 1, ...restrictions }));
+    for (const dryRun of [true, false]) {
+      const refused = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun });
+      assert.equal(refused.status, 1);
+      assert.equal(refused.envelope.code, 'policy_refused');
+      assert.equal(refused.envelope.nextAction, null);
+    }
+  }
+  assert.equal(f.git('rev-parse', attempt.specification.outputRef), attempt.candidate.commit);
+  assert.equal(f.git('rev-parse', 'main'), targetCommit);
+});
+
 test('R27/A52: failed checks appear in compact attention status with a reason and next action', async t => {
   const f = await fixture(t);
   await mkdir(join(f.repo, '.docket'));

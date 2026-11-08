@@ -16,6 +16,7 @@ import type { GitRepository, RetentionRequest } from './adapters/repository.ts';
 import type { Result } from './adapters/command.ts';
 import { readFinalisationPolicy } from './adapters/finalisation.ts';
 import { step } from './plans.ts';
+import { CommandFailure } from './response.ts';
 
 export interface ReturnWorkspace {
   inspect(allocation: Allocation): Promise<Result<{ state: 'matching' | 'absent' | 'mismatch' }>>;
@@ -72,6 +73,14 @@ async function planAcceptance(db: Database, input: AcceptInput, services: Comple
   const expected = (targetState as { state: 'present'; commit: string }).commit;
   const policy = known(await (services.readPolicy ?? readFinalisationPolicy)(services.repository, expected, target, config.policy, recorded));
   if (config.policy.kind === 'local-merge' && (policy.protected || policy.forbidden)) refuse('Protected target or finalisation policy refuses local-merge');
+  if (config.policy.kind === 'local-merge'
+    && !known(await services.repository.compare(expected, input.commit))
+    && !known(await services.repository.compare(input.commit, expected))) {
+    throw new CommandFailure('not_fast_forward', { attemptId: input.attemptId, targetRef: target, targetCommit: expected, candidateCommit: input.commit }, {
+      operation: 'attempt.rebase', args: { attemptId: input.attemptId, dryRun: true },
+      description: 'Plan rebasing the attempt onto the current target.',
+    });
+  }
   return { kind: config.policy.kind as FinalisationPlan['kind'], target, expected, policyDigest: policy.digest };
 }
 
@@ -163,7 +172,6 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
     steps.push(step('candidate.accept', attempt.id, ['retained_output', ...(input.overrideReason === undefined ? ['checks_passed'] : ['person_override'])], input.overrideReason === undefined));
   }
   if (policy.kind === 'local-merge' && !db.requests().some(r => r.requestKey === `integrate:${attempt.id}:${input.candidateId}` && r.state === 'succeeded')) {
-    if (!known(await services.repository.compare(policy.expected, input.commit)) && !known(await services.repository.compare(input.commit, policy.expected))) refuse('Target cannot fast-forward');
     steps.push(step(unresolved ? 'integration.reconcile' : 'repository.integrate', policy.target, ['exact_candidate', 'policy_allows'], !accepted));
   }
   steps.push(step('task.complete', attempt.taskId, ['acceptance', 'unchanged_decision'], true));

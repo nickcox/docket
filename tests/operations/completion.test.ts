@@ -7,6 +7,7 @@ import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
 import { Database } from '../../src/storage/database.ts';
+import { CommandFailure } from '../../src/response.ts';
 import { checkFixture, contextChecks, head, host, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
 
 async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
@@ -211,14 +212,40 @@ test('R10/R32: protected or unreadable target protection refuses local-merge and
   }
 });
 
-test('R32: target movement after acceptance planning refuses without moving or deleting output', async t => {
+test('R27/R30: a divergent target refuses planning and execution with exact commits and a rebase action', async t => {
+  const f = await fixture(t, true), moved = 'c'.repeat(40);
+  f.refs.set('refs/heads/main', moved);
+  const events = f.db.events(), requests = f.db.requests();
+  const refusal = (error: unknown) => {
+    assert.ok(error instanceof CommandFailure);
+    assert.equal(error.code, 'not_fast_forward');
+    assert.deepEqual(error.data, { attemptId: f.a.id, targetRef: 'refs/heads/main', targetCommit: moved, candidateCommit: head });
+    assert.deepEqual(error.nextAction?.args, { attemptId: f.a.id, dryRun: true });
+    assert.equal(error.nextAction?.operation, 'attempt.rebase');
+    return true;
+  };
+  await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), refusal);
+  assert.deepEqual(f.db.events(), events);
+  assert.deepEqual(f.db.requests(), requests);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), refusal);
+  assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+  assert.equal(f.calls.includes('integrate'), false);
+  assert.ok(f.refs.has(f.a.binding.outputRef));
+});
+
+test('R27/R32: target movement after acceptance planning refuses without moving or deleting output', async t => {
   const f = await fixture(t, true), record = f.db.recordAcceptance.bind(f.db);
   f.db.recordAcceptance = async (...args) => {
     const result = await record(...args);
     f.refs.set('refs/heads/main', 'c'.repeat(40));
     return result;
   };
-  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /Target moved/);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), (error: unknown) => {
+    assert.ok(error instanceof CommandFailure);
+    assert.equal(error.code, 'not_fast_forward');
+    assert.equal(error.data.targetCommit, 'c'.repeat(40));
+    return true;
+  });
   assert.equal(f.calls.includes('integrate'), false);
   assert.ok(f.refs.has(f.a.binding.outputRef));
 });

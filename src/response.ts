@@ -50,10 +50,12 @@ export class CommandFailure extends Error {
   readonly code: FailureCode;
 
   readonly data: Record<string, unknown>;
-  constructor(code: FailureCode, data: Record<string, unknown> = {}) {
+  readonly nextAction: Envelope['nextAction'];
+  constructor(code: FailureCode, data: Record<string, unknown> = {}, nextAction: Envelope['nextAction'] = null) {
     super(failures[code].message);
     this.code = code;
     this.data = data;
+    this.nextAction = nextAction;
   }
 }
 
