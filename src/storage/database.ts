@@ -430,7 +430,7 @@ export class Database {
   }
 
   private changed(result: { changes: number | bigint }): void {
-    if (Number(result.changes) !== 1) throw new StorageError('conflict', 'Task changed since it was read');
+    if (Number(result.changes) !== 1) throw new StorageError('conflict', 'Record changed since it was read');
   }
 
   private insertBlocker(taskId: string, blockerId: string): boolean {
@@ -777,6 +777,15 @@ export class Database {
     return claim;
   }
 
+  private validateScope(attemptId: string | undefined, objectiveId: string | undefined): void {
+    if (attemptId !== undefined) {
+      const attempt = this.db.prepare('SELECT objective_id FROM attempts WHERE id = ?').get(attemptId);
+      if (!attempt || attempt.objective_id !== (objectiveId ?? null)) {
+        throw new StorageError('conflict', 'Attempt and objective scope do not match');
+      }
+    }
+  }
+
   private compatibleClaim(claim: ClaimInput): void {
     if (claim.schemaFamily !== applicationId || claim.schemaVersion !== schemaVersion) {
       throw new StorageError('version', 'Claim schema family/version does not match this database');
@@ -810,6 +819,7 @@ export class Database {
     const owner = object(actor);
     return this.write(() => values.map(value => {
       this.compatibleClaim(value);
+      this.validateScope(value.attemptId, value.objectiveId);
       if (this.db.prepare('SELECT 1 FROM claims WHERE resource_key = ? AND released_at IS NULL').get(value.resourceKey)) {
         throw new StorageError('conflict', `Resource has an unreleased claim: ${value.resourceKey}`);
       }
@@ -945,6 +955,7 @@ export class Database {
       const parent = this.decodeRequest(this.requestRow(value.parentId));
       if (parent.category !== 'command' || json(parent.caller) !== json(value.caller)) throw new StorageError('conflict', 'Effect must belong to its authorising command and caller');
       const claim = this.activeClaim(value.executor);
+      this.validateScope(value.attemptId, value.objectiveId);
       if ((claim.attemptId !== undefined && claim.attemptId !== value.attemptId) ||
         (claim.objectiveId !== undefined && claim.objectiveId !== value.objectiveId)) throw new StorageError('conflict', 'Effect scope differs from its executor claim');
       const id = randomUUID();

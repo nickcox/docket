@@ -9,7 +9,7 @@ import type { EventInput, StoredEvent } from '../../src/storage/database.ts';
 import type { Claim, ClaimInput } from '../../src/storage/claims.ts';
 import type { CommandInput, EffectInput, EffectState } from '../../src/storage/requests.ts';
 
-const actor = { kind: 'person', id: 'operator' };
+const actor = { kind: 'person' as const, id: 'operator' };
 const conflict = (error: unknown) => error instanceof StorageError && error.code === 'conflict';
 const mismatch = (error: unknown) => error instanceof StorageError && error.code === 'request_input_mismatch';
 const identity = (claim: Claim) => ({ claimId: claim.id, generation: claim.generation });
@@ -176,7 +176,7 @@ test('R09: pending -> claimed/withdrawn/rejected; claimed -> succeeded/rejected/
   for (const final of ['withdrawn', 'rejected', 'succeeded', 'uncertain', 'claimed-rejected'] as const) {
     const { claim, effect } = await effectFixture(db, final);
     const result = { evidence: final };
-    let state: EffectState = final === 'claimed-rejected' ? 'rejected' : final;
+    const state: EffectState = final === 'claimed-rejected' ? 'rejected' : final;
     if (final === 'withdrawn' || final === 'rejected') {
       await assert.rejects(db.closePendingEffect(effect.id, final, result, { id: 'not-caller' }), conflict);
       await db.closePendingEffect(effect.id, final, result, actor);
@@ -195,7 +195,7 @@ test('R09: pending -> claimed/withdrawn/rejected; claimed -> succeeded/rejected/
   }
 });
 
-test('R25/R26: stale config/schema, released/stale executor and mismatched scope refuse under the write lock', async t => {
+test('R25/R26: stale config/schema and released/stale executor refuse under the write lock', async t => {
   const { db, path } = await fixture(t);
   for (const patch of [{ configRevision: 2 }, { schemaFamily: 123 }, { schemaVersion: 2 }]) {
     await assert.rejects(db.registerClaims([{ ...claimInput(), ...patch }], actor), StorageError);
@@ -210,6 +210,53 @@ test('R25/R26: stale config/schema, released/stale executor and mismatched scope
   seed.prepare("UPDATE events SET payload = json_set(payload, '$.revision', 2) WHERE kind = 'context.configured'").run();
   await assert.rejects(db.refreshClaim(identity(other.claim), new Date().toISOString(), actor), conflict);
   await assert.rejects(db.claimEffect(other.effect.id, identity(other.claim)), conflict);
+});
+
+test('R25: claim and effect references must agree on attempt/objective and executor scope', async t => {
+  const { db, path } = await fixture(t);
+  using seed = new DatabaseSync(path);
+  for (const objective of ['objective', 'other-objective']) {
+    seed.prepare(`INSERT INTO objectives (id, request, criteria, scope, constraints_text, permissions, budget, creator, state, created_at)
+      VALUES (?, 'Request', '[]', '', '', '{}', '{}', 'operator', 'open', '2026-11-08')`).run(objective);
+  }
+  await db.addTask({ id: 'task', title: 'Task', objectiveId: 'objective' }, actor);
+  for (const attempt of ['attempt', 'other-attempt']) {
+    seed.prepare(`INSERT INTO attempts (id, task_id, number, execution_open, phase, specification, objective_id, output_ref, created_at)
+      VALUES (?, 'task', ?, 0, 'settled', '{}', 'objective', ?, '2026-11-08')`).run(attempt, attempt === 'attempt' ? 1 : 2, attempt);
+  }
+  const input: ClaimInput = { ...claimInput('worker:attempt'), role: 'worker_owner', attemptId: 'attempt', objectiveId: 'objective' };
+  const { objectiveId: _objectiveId, ...withoutObjective } = input;
+  for (const value of [{ ...input, objectiveId: 'other-objective' }, withoutObjective]) {
+    await assert.rejects(db.registerClaims([value], actor), /scope/);
+  }
+  const [claim] = await db.registerClaims([input], actor);
+  const parent = await db.recordCommand(command());
+  const effect: EffectInput = { ...command('effect'), parentId: parent.id, executor: identity(claim!),
+    target: { kind: 'worker', reference: { attemptId: 'attempt' } }, attemptId: 'attempt', objectiveId: 'objective' };
+  for (const patch of [{ objectiveId: 'other-objective' }, { attemptId: 'other-attempt' }]) {
+    await assert.rejects(db.recordEffect({ ...effect, ...patch }), /scope/);
+  }
+  await db.recordEffect(effect);
+  const { input: unscoped } = await effectFixture(db, 'unscoped');
+  await assert.rejects(db.recordEffect({ ...unscoped, requestKey: 'bad-attempt-scope', attemptId: 'attempt' }), /scope/);
+});
+
+test('A09/A10/R25: failure after the last resource event rolls back the whole claim batch', async t => {
+  const { db, path, options } = await fixture(t);
+  const before = snapshot(db);
+  const internals = db as unknown as { insertEvent: (input: EventInput) => StoredEvent };
+  const original = internals.insertEvent;
+  let count = 0;
+  internals.insertEvent = function (input) {
+    const event = original.call(db, input);
+    if (++count === 3) throw new Error('injected last-resource failure');
+    return event;
+  };
+  try { await assert.rejects(db.registerClaims(['z', 'a', 'm'].map(claimInput), actor), /last-resource failure/); }
+  finally { internals.insertEvent = original; }
+  assert.equal(count, 3);
+  using reopened = await Database.open(path, options);
+  assert.deepEqual(snapshot(reopened), before);
 });
 
 test('A09/A10/R25: every new transaction rolls back state and event on injected failure before and after insertion', async t => {
