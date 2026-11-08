@@ -163,12 +163,20 @@ function nonblank(value: string): void {
   if (typeof value !== 'string' || !value.trim()) throw new TypeError('Expected nonblank text');
 }
 
-function eventContent(event: EventInput): string {
+function eventContent(event: EventInput, stored = false): string {
+  const keys = ['sourceKey', 'kind', 'payloadVersion', 'correlationId', 'actor', 'occurredAt', 'payload',
+    'notification', 'objectiveId', 'taskId', 'attemptId', 'requestId',
+    ...(stored ? ['seq', 'id', 'recordedAt'] : [])];
+  if (Object.keys(event).some(key => !keys.includes(key))) throw new TypeError('Unknown event field');
+  if (event.notification !== undefined && typeof event.notification !== 'boolean') throw new TypeError('Invalid notification flag');
+  for (const id of [event.objectiveId, event.taskId, event.attemptId, event.requestId]) {
+    if (id !== undefined) nonblank(id);
+  }
   nonblank(event.sourceKey);
   nonblank(event.kind);
   nonblank(event.correlationId);
   if (!Number.isSafeInteger(event.payloadVersion) || event.payloadVersion < 1) throw new TypeError('Invalid event payload version');
-  if (!Number.isFinite(Date.parse(event.occurredAt))) throw new TypeError('Invalid event occurrence time');
+  if (typeof event.occurredAt !== 'string' || !Number.isFinite(Date.parse(event.occurredAt))) throw new TypeError('Invalid event occurrence time');
   return json({ sourceKey: event.sourceKey, kind: event.kind, payloadVersion: event.payloadVersion,
     correlationId: event.correlationId, actor: object(event.actor), occurredAt: event.occurredAt,
     payload: object(event.payload), notification: event.notification ?? false,
@@ -223,10 +231,10 @@ export class Database {
 
   private configure(): void {
     this.db.exec('PRAGMA busy_timeout = 0; PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON');
-    if (!this.readOnly) {
-      const mode = this.db.prepare('PRAGMA journal_mode = WAL').get()!.journal_mode;
-      if (mode !== 'wal') throw new StorageError('path', 'Filesystem cannot provide SQLite WAL');
-    }
+    const mode = this.db.prepare(this.readOnly ? 'PRAGMA journal_mode' : 'PRAGMA journal_mode = WAL').get()!.journal_mode;
+    if (mode !== 'wal') throw new StorageError('path', this.readOnly
+      ? 'Database is not in WAL mode; a writable opener must configure it first'
+      : 'Filesystem cannot provide SQLite WAL');
   }
 
   /** Status/plans default to read-only and never create a database or probe file. */
@@ -320,7 +328,7 @@ export class Database {
     const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(event.sourceKey);
     if (previous) {
       const stored = this.decodeEvent(previous);
-      if (eventContent(stored) !== content) throw new StorageError('conflict', `Event source key has different content: ${event.sourceKey}`);
+      if (eventContent(stored, true) !== content) throw new StorageError('conflict', `Event source key has different content: ${event.sourceKey}`);
       return stored;
     }
     const id = randomUUID();
@@ -354,7 +362,7 @@ export class Database {
       ...(row.task_id === null ? {} : { taskId: String(row.task_id) }),
       ...(row.attempt_id === null ? {} : { attemptId: String(row.attempt_id) }),
       ...(row.request_id === null ? {} : { requestId: String(row.request_id) }) };
-    eventContent(event);
+    eventContent(event, true);
     return event;
   }
 

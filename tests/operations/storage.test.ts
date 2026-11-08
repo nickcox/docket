@@ -162,21 +162,72 @@ test('R25: logical duplicate evidence ignores JSON key order but refuses differe
 
 test('R24/R25: BEGIN IMMEDIATE waits asynchronously, retries after release, and is bounded under contention', async t => {
   const f = await fixture(t);
-  using db = await Database.initialise(f.path, f.initial, { ...f.options, retryMs: 80 });
+  using db = await Database.initialise(f.path, f.initial, { ...f.options, retryMs: 1000 });
+  using bounded = await Database.open(f.path, { ...f.options, readOnly: false, retryMs: 80 });
   using locker = new DatabaseSync(f.path, { timeout: 0 });
   locker.exec('BEGIN IMMEDIATE');
   const pending = db.appendEvents([event('after-lock')]);
   let settled = false;
-  void pending.then(() => { settled = true; });
+  void pending.then(() => { settled = true; }, () => { settled = true; });
   await nextTurn();
   assert.equal(settled, false, 'event loop runs while the writer awaits its lock');
   locker.exec('ROLLBACK');
   await pending;
   locker.exec('BEGIN IMMEDIATE');
-  await assert.rejects(db.appendEvents([event('timed-out')]), errorCode('busy'));
+  await assert.rejects(bounded.appendEvents([event('timed-out')]), errorCode('busy'));
   locker.exec('ROLLBACK');
   assert.equal(db.events().some(e => e.sourceKey === 'timed-out'), false);
   await db.appendEvents([event('after-timeout')]);
+});
+
+test('R25: the internal callback already holds an immediate write lock and refuses asynchronous returns', async t => {
+  const f = await fixture(t);
+  using db = await Database.initialise(f.path, f.initial, f.options);
+  using contender = new DatabaseSync(f.path, { timeout: 0 });
+  const internal = db as unknown as { write: <T>(change: () => T) => Promise<T> };
+  await internal.write(() => {
+    assert.throws(() => contender.exec('BEGIN IMMEDIATE'), /locked/);
+  });
+  await assert.rejects(internal.write(() => Promise.resolve('not synchronous')), /must be synchronous/);
+  await assert.rejects(internal.write(() => ({ then: () => undefined })), /must be synchronous/);
+  await db.appendEvents([event('after-bad-callback')]);
+  contender.exec('BEGIN IMMEDIATE; ROLLBACK');
+});
+
+test('R25: malformed event input is refused without any evidence changes', async t => {
+  const f = await fixture(t);
+  using db = await Database.initialise(f.path, f.initial, f.options);
+  for (const bad of [
+    { ...event('invalid'), extra: true },
+    { ...event('invalid'), id: 'caller-chosen-id' },
+    { ...event('invalid'), notification: 'true' },
+    { ...event('invalid'), payload: [] },
+    { ...event('invalid'), payloadVersion: 0 },
+    { ...event('invalid'), taskId: '' },
+    { ...event('invalid'), occurredAt: 'invalid' },
+    { ...event('invalid'), payload: { cost: Infinity } },
+  ]) {
+    await assert.rejects(db.appendEvents([bad as EventInput]), TypeError);
+  }
+  assert.equal(db.events().length, 2);
+});
+
+test('R24/R26: changing to WAL is retried asynchronously on writable open, never on read-only open', async t => {
+  const f = await fixture(t);
+  const created = await Database.initialise(f.path, f.initial, f.options);
+  created.close();
+  using blocker = new DatabaseSync(f.path, { timeout: 0 });
+  blocker.exec('PRAGMA journal_mode = DELETE');
+  const before = await readFile(f.path);
+  await assert.rejects(Database.open(f.path, f.options), /not in WAL mode/);
+  assert.deepEqual(await readFile(f.path), before);
+  blocker.exec('BEGIN IMMEDIATE');
+  const pending = Database.open(f.path, { ...f.options, readOnly: false });
+  // Hold the lock through the entire bounded retry, then verify a fresh open can succeed.
+  await assert.rejects(pending, errorCode('busy'));
+  blocker.exec('ROLLBACK');
+  using opened = await Database.open(f.path, { ...f.options, readOnly: false });
+  assert.equal(opened.settings().journalMode, 'wal');
 });
 
 test('R26: every write rechecks the family/version after acquiring its lock', async t => {
