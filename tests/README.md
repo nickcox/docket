@@ -13,4 +13,4 @@ Follow [R37's testing layers](../docs/specification/delivery.md#testing), using 
 
 Name each test's requirement or scenario. Keep real repositories and processes at their relevant boundaries, and coordinate races with barriers or condition waits rather than sleeps. Paid model experiments and repeated OS stress rounds are outside the default suite.
 
-The pure-rules example checks the repository check policy (R29) without external owners. The other folders are reserved for later implementation tests.
+Pure-rule tests cover the repository check policy (R29), catalogue definitions (R28) and CLI framing/error decisions (R27) without external owners. CLI-process tests exercise the real entry point, JSON input and unexpected runtime failures. The operation and adapter folders are reserved for later implementation tests.
