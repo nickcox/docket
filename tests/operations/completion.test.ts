@@ -103,6 +103,18 @@ test('R10: acceptance reuses an explicit successful retry after the automatic ch
   assert.equal(f.db.task('task').state, 'done');
 });
 
+test('R10: a person can override checks waiting for a slot without leaving an authorised check behind', async t => {
+  const f = await fixture(t, true), other = await f.attempt('other');
+  const checks = parseCheckPolicy(start, policyContent, contextChecks);
+  await f.db.beginChecks({ attemptId: other.id, commit: head, checks, profile, caller: person });
+  const waiting = await f.db.beginChecks({ attemptId: f.a.id, commit: head, checks, profile, caller: person });
+  assert.equal(waiting.request.state, 'pending');
+  await acceptCandidate(f.db, { ...f.accept, overrideReason: 'Person has independently verified the output' }, f.services);
+  assert.equal(f.db.request(waiting.request.id).state, 'withdrawn');
+  assert.deepEqual(f.calls, ['integrate']);
+  assert.equal(f.db.task('task').state, 'done');
+});
+
 test('R10/R11: a check override never waives repository or allocation identity', async t => {
   const f = await fixture(t);
   f.services.repository.identity = async path => confirmed(path === f.a.allocation.path ? '/different-repository' : '/repo');

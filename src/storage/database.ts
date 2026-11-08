@@ -1341,6 +1341,15 @@ export class Database {
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) {
         throw new StorageError('conflict', 'Attempt has an unresolved effect');
       }
+      if (value.overrideReason) {
+        const waiting = this.db.prepare("SELECT id FROM requests WHERE attempt_id = ? AND operation = 'checks.run' AND state = 'pending' AND json_extract(input, '$.commit') = ?")
+          .all(value.attemptId, value.commit);
+        for (const request of waiting) {
+          const result = { reason: value.overrideReason, candidate, called: false };
+          this.db.prepare("UPDATE requests SET state = 'withdrawn', result = ?, revision = revision + 1 WHERE id = ? AND state = 'pending'").run(json(result), String(request.id));
+          this.storageEvent('checks.overridden', value.caller, result, String(request.id));
+        }
+      }
       this.completionEvent(key, 'candidate.accepted', value.attemptId, value.caller,
         { candidate, plan: policy, decisionRevision: Number(task.decision_revision),
           checksRequestId: check?.id ?? null, overrideReason: value.overrideReason ?? null }, requestId);
