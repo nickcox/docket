@@ -85,7 +85,9 @@ export function successEnvelope(operation: string, requestId: string | null, dat
     requestId,
     outcome: "succeeded",
     code: operation === 'context.init' ? 'context_initialised' : operation === 'catalog.show' ? 'catalog_shown'
-      : Array.isArray(data.steps) && data.steps.length === 0 ? 'already_complete' : operation.replaceAll('.', '_'),
+      : Array.isArray(data.steps) && data.steps.length === 0 ? 'already_complete'
+        : operation === 'attempt.dispatch' && (data.attempt as Record<string, unknown> | undefined)?.outcome === 'held' ? 'attempt_held'
+          : operation.replaceAll('.', '_'),
     data,
     diagnostics: [],
     nextAction: null,

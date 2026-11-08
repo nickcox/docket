@@ -40,9 +40,9 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   const profile = preview.attempt.specification.profile as JsonObject;
   const capabilities = runtime.launcher.capabilities(profile);
   if (capabilities.preparation === 'unsupported' || !capabilities.admission) throw new CommandFailure('policy_refused');
-  const leases = known(await runtime.workspace.list());
-  const allocations = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!)).filter(a => a.leaseState !== 'returned');
-  if (leases.some(lease => !allocations.some(a => a.allocation?.leaseId === lease.leaseId))) throw new CommandFailure('owner_unresolved');
+  // Recorded acquisition uncertainty is checked by the same reservation builder.
+  // Treehouse status initialises owner metadata on an empty pool, so it is not a
+  // read-only prerequisite. Acquisition itself verifies the live pool identity.
   const steps = ['attempt.reserve', 'workspace.acquire', 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
     'worker.activate', 'worker.wait', 'worker.fence', 'attempt.complete', 'checks.run'].map(operation => step(operation, task.id,
       operation === 'attempt.reserve' ? ['ready', 'capacity', 'resolved_owners'] : ['current_authority'], operation === 'checks.run'));

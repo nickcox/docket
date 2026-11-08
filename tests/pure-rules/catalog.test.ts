@@ -30,7 +30,7 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
     assert.ok(operation.description.trim());
     assert.ok(operation.roles.includes('person'));
     if (['context.init', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
-    assert.deepEqual(operation.bindingDerivedFields, []);
+    assert.deepEqual(operation.bindingDerivedFields, operation.name === 'task.add' ? ['objectiveId'] : []);
     assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show'].includes(operation.name));
     assert.equal(operation.plans, ['attempt.dispatch', 'attempt.accept', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);

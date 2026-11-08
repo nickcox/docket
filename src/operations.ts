@@ -174,10 +174,16 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           const inspected = known(await runtime.completion.workspace.inspect(allocation));
           if (inspected.state === 'absent') ownerHappened = true;
           if (inspected.state === 'mismatch') throw new CommandFailure('owner_unresolved');
-        } else if (request.target?.kind === 'workspace') {
-          const leases = known(await runtime.workspace.list());
-          const holder = (request.input.workspace as JsonObject | undefined)?.holder;
-          if (holder && leases.some(lease => lease.holder === canonicalJson(holder))) ownerHappened = true;
+        } else if (request.target?.kind === 'workspace' && request.attemptId) {
+          const allocation = db.attempt(request.attemptId).allocation;
+          // With no recorded allocation the owner cannot identify an exact lease.
+          // Do not initialise Treehouse metadata just to query an empty pool, or
+          // infer absence. The person's exact effect-scoped evidence is required.
+          if (allocation) {
+            const inspected = known(await runtime.completion.workspace.inspect(allocation));
+            if (inspected.state === 'matching') ownerHappened = true;
+            if (inspected.state === 'mismatch') throw new CommandFailure('owner_unresolved');
+          }
         } else if (request.target?.kind === 'worker') {
           const reference = db.requests().find(r => r.attemptId === request.attemptId && r.operation === 'worker.prepare')?.result?.reference ?? request.target.reference;
           const observation = await runtime.launcher.inspect(reference as import('./storage/launch.ts').WorkerReference);

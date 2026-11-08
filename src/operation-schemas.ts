@@ -35,7 +35,7 @@ function outputSchema(name: string): JsonSchema {
 }
 function operation(name: string, description: string, properties: Record<string, JsonSchema>, mutates = true,
   roles: readonly Role[] = ['person', 'supervisor']): OperationDefinition {
-  return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: [], mutates,
+  return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: name === 'task.add' ? ['objectiveId'] : [], mutates,
     plans: Object.hasOwn(properties, 'dryRun'), outputSchema: outputSchema(name),
     tool: { name: `dk_${name.replaceAll('.', '_')}`, description } };
 }

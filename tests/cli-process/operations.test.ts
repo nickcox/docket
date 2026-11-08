@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,22 @@ import test from 'node:test';
 import { configuration } from '../fixtures/configuration.ts';
 import { Database, applicationId } from '../../src/storage/database.ts';
 import { userInfo } from 'node:os';
+import { findOperation } from '../../src/catalog.ts';
+import { validateSchema } from '../../src/operation-schemas.ts';
+async function snapshot(root: string): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  const visit = async (path: string) => {
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const file = join(path, entry.name);
+      // SQLite may create transient WAL coordination files even on a read-only
+      // connection. They contain no new domain writes and are not artefacts.
+      if (/\.db-(wal|shm)$/u.test(entry.name)) continue;
+      if (entry.isDirectory()) { files[file] = 'directory'; await visit(file); }
+      else if (entry.isFile()) files[file] = (await readFile(file)).toString('base64');
+    }
+  };
+  await visit(root); return files;
+}
 const entry = fileURLToPath(new URL('../../bin/docket.ts', import.meta.url));
 const peer = fileURLToPath(new URL('../fixtures/pi-peer.ts', import.meta.url));
 async function fixture(t: test.TestContext, mode = 'code-result') {
@@ -36,6 +52,7 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
     assert.ifError(result.error); assert.equal(result.signal, null);
     assert.equal(result.stdout.split('\n').length, 2, result.stdout);
     const envelope = JSON.parse(result.stdout);
+    if (envelope.outcome === 'succeeded') assert.equal(validateSchema(findOperation(operation)!.outputSchema, envelope.data), null, operation);
     return { ...result, envelope, data: envelope.data };
   };
   assert.equal(invoke('context.init', {}).status, 0);
@@ -48,10 +65,10 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   const add = f.invoke('task.add', { id: 'feature', definition, objectiveId: null }, 'add');
   assert.equal(add.status, 0, JSON.stringify(add.envelope));
   assert.equal(f.invoke('task.add', { id: 'feature', definition, objectiveId: null }, 'add').status, 0);
-  const before = await readFile(f.config.databasePath);
+  const before = await snapshot(f.home);
   const plan = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: true });
   assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
-  assert.deepEqual(await readFile(f.config.databasePath), before);
+  assert.deepEqual(await snapshot(f.home), before);
   const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
   assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope) + dispatched.stderr);
   assert.deepEqual(dispatched.data.steps, plan.data.steps);
@@ -60,10 +77,10 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(attempt.outcome, 'completed'); assert.equal(attempt.executionOpen, false);
   assert.equal(f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch').data.attempt.id, attempt.id);
   const acceptArgs = { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: true };
-  const bytes = await readFile(f.config.databasePath);
+  const bytes = await snapshot(f.home);
   const acceptancePlan = f.invoke('attempt.accept', acceptArgs);
   assert.equal(acceptancePlan.status, 0, JSON.stringify(acceptancePlan.envelope));
-  assert.deepEqual(await readFile(f.config.databasePath), bytes);
+  assert.deepEqual(await snapshot(f.home), bytes);
   const accepted = f.invoke('attempt.accept', { ...acceptArgs, dryRun: false }, 'accept');
   assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
   assert.deepEqual(accepted.data.steps, acceptancePlan.data.steps);
@@ -147,6 +164,8 @@ test('R28/R27: strict task inputs, mutations, revisions, replay and paginated re
   assert.equal(f.invoke('task.reorder', { orderedTaskIds: ['second', 'first'] }).status, 0);
   assert.equal(f.invoke('task.done', { taskId: 'first', note: 'Person judgement' }).status, 0);
   assert.equal(f.invoke('task.reopen', { taskId: 'first', note: null }).status, 0);
+  assert.equal(f.invoke('task.add', { id: 'review', definition: { ...definition, kind: 'review' }, objectiveId: null }).status, 2);
+  assert.equal(f.invoke('task.update', { taskId: 'first', expectedRevision: 1, definition: { ...definition, kind: 'review' } }).status, 1);
   assert.equal(f.invoke('task.update', { taskId: 'first', expectedRevision: 99, definition }).envelope.code, 'task_changed');
   assert.equal(f.invoke('task.update', { taskId: 'first', expectedRevision: 1, definition: { ...definition, title: 'New title' } }).status, 0);
   const page = f.invoke('task.list', { state: null, readyOnly: false, page: { after: null, limit: 1 } });
