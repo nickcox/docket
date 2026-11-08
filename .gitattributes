@@ -1,0 +1,2 @@
+# The skills are read by agent hosts on every platform, so keep the line endings they are published with.
+skills/** text eol=lf

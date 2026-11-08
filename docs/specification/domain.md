@@ -1,0 +1,162 @@
+# Domain and operations
+
+Status: draft, part of the [Docket specification](README.md).
+
+## Identity and scope
+
+**R01.** One database holds one context, and a context has one canonical backing repository on one machine. A context has a name chosen by a person (its context ID), a database UUID and a repository identity. People and hosts refer to a context by its name; the database UUID is internal. Docket validates canonical paths. If the repository, its remote or the workspace pool changes, that is an identity discrepancy, not an empty list of workspaces. Moving a context to another path or machine is deferred.
+
+By default, a context's database, worker files and workspace pool live together in its state directory, `~/.docket/<context ID>/` (see [Configuration](contracts.md#configuration)), and they must be outside every recyclable workspace. A per-user registry maps each context name to its configuration file, so that commands can name a context instead of a path.
+
+A task ID matches `[A-Za-z0-9._-]+` and is unique for the life of the database. A person or supervisor may choose it. If they don't, Docket generates a readable ID from the title, adding a numeric suffix when the ID is taken. An attempt has a generated UUID and a number, unique within its task, which is used up permanently once its reservation commits. The number is for display. Every exported identity includes the database ID, context ID, task ID and attempt ID. The lease ID, the internal worker session UUID and the worker reference returned by its launcher are separate identifiers.
+
+Output refs and paths in the state directory include the database UUID and the attempt UUID, so a reset never reuses an older output namespace. Paths in the state directory are stored relative to it. A worker reference names its launcher and the host's own identifiers; a path or process ID alone is never a reference.
+
+## Tasks
+
+**R02.** A task's state is queued, in_flight or done. A hold is separate from the state and has a reason: one nonblank line of at most 200 characters. A task is ready when it is queued, not held, and every task blocking it is done. Task IDs are never deleted or reused. Positions are positive and unique, a new task goes at the end, and reordering is one transaction.
+
+Adding a blocker that doesn't exist, making a task block itself, or creating a cycle is refused, and nothing changes. Reopening a blocker affects readiness from then on; dependants that have already started or finished keep their state. Only the start operation sets in_flight. A person marking a task done is recorded as their judgement, and does not create accepted output.
+
+**R03.** Each change that alters the title, instructions, ordered criteria, kind, chosen profile or objective increments the task's definitionRevision once. A change that alters nothing does not. Each hold, release or explicit state decision that takes effect increments its decisionRevision. Starting an attempt records that revision, and the automatic task transition at completion is applied only if no later person decision has replaced it.
+
+Readiness and the definition revision are checked when the attempt is reserved, and again immediately before it starts. If the definition changed while the workspace was being acquired, the reservation closes as held without launching, keeps the unused allocation, and respects any newer person decision. Once an attempt has started, its input is fixed, and later changes to dependencies or the definition affect only later attempts.
+
+Automatic task completion also requires the task's current definition revision to match the attempt's specification. If it differs, and no newer person decision applies, Docket records the worker's outcome and holds the task as task_definition_changed. Evidence for an old definition never satisfies a newer one.
+
+## Reservation and allocation
+
+**R04.** Dispatch selects the named ready task, or the first eligible task by position. In one write transaction it checks the caller and scope, the task's current readiness and revisions, the task's lifetime attempt limit, the context's capacity, any uncertainty about owners, and the objective's budget. It then reserves a stable request key, creates the attempt and its specification, and records the decision. The default limits are maxAttempts 1 and maxAttemptsPerTask 3, and review attempts count towards both.
+
+A repeated request is compared with the original's identity and fingerprint before readiness, limits or selection are checked. A matching repeat returns the original attempt and its current progress, with no new effect, even after its diagnostics have been cleaned up. A repeat under the same key with a different operation, caller binding, named task or automatic selection, profile, source attempt or note is refused with request_input_mismatch. Resolved commits belong to the immutable specification, and a repeat never resolves them again.
+
+Capacity counts each attempt from its reservation until a stopped, failed or completed outcome is recorded. Output held for acceptance does not use capacity. An allocated lease still prevents its task being dispatched again in the ordinary way. Unknown workers or allocations block admission as described in R08. If a competing reservation wins, automatic selection can try the next task; a repeated request never changes the task it chose.
+
+**R05.** The specification records the task's definition and revision, its criteria, its objective at the time, the delivery contract, the base and target branches, the output ref, the resolved profile and its launcher settings, the required check set, and where each setting came from. It never stores credentials or the raw environment.
+
+Acquiring a workspace happens outside the database transaction. Once the workspace provider confirms it, Docket records the allocation once: the lease, its path and pool, the repository, the output ref, and the commit the attempt actually starts from.
+
+No worker starts until the allocation matches the stored specification. Starting the task and recording its start event happen in one transaction. An acquisition with an uncertain outcome is kept for inspection, with whatever path, holder and request evidence exists, even if no lease ID was returned. Docket never acquires a second workspace for the same reservation.
+
+## Worker lifecycle
+
+**R06.** Launch admission is one irreversible decision, made conditionally in a write transaction: a pending launch becomes either permitted or fenced. A worker's reference is recorded before the worker can receive its first task prompt, and only one activation is permitted. Recovery can close a pending launch by fencing it, and a creator that was paused must check again and refuse to activate.
+
+Creating or preparing a worker and activating it are separate adapter actions. If creating a worker could already run a prompt, the adapter must give equivalent protection before admission. Returning a thread ID after the worker has already started does not meet this requirement.
+
+**R07.** Four facts are independent: the turn ended, the result was validated, the worker is terminal for this attempt, and every process it started has stopped. Completion requires a known terminal worker and a validated, matching result, or an authorised caller explicitly selecting committed output. A result is never accepted just because a file exists or a thread is idle.
+
+For Pi, terminal means the direct child process was observed to exit, or a person confirmed that it stopped, naming the scope, during recovery. For bb, terminal also requires that every later turn for this attempt is durably refused. Neither proves that every process the worker started has stopped, so a person's separate confirmation is still required before a workspace is recycled.
+
+**R08.** An owner read returns known with a value, absent, or unknown with a reason. A read that fails, is cut short or is malformed is unknown. A worker with no terminal evidence may still be running. While its owner's heartbeat is fresh, other ready tasks can still start, within capacity. A missing, stale, unreadable or future-dated heartbeat blocks every new activation and reservation in the context. Heartbeats are refreshed every 5 seconds, and a heartbeat is fresh when its age is at least 0 and less than 30,000 milliseconds.
+
+A claim is never taken over because time has passed. A new host can inspect the references it tracks without adopting or restarting their workers. A person resolves uncertain ownership only after establishing that the owner has stopped, and records the exact scope. Diagnostic activity is never evidence that a worker is alive.
+
+An attempt's execution phase is reserved, allocated, running, awaiting_checks, settled or needs_resolution. Admission closes separately, through launchState. The work's outcome is completed, held, failed, interrupted or over_budget, and acceptance, integration and the lease are separate facts again. Phases are for display and progress only: each operation decides its prerequisites from current evidence. A worker that is terminal, but whose result or checks are still being processed, stays execution-open until that processing records an outcome.
+
+## Requests and effects
+
+**R09.** Each logical command has a stable request key. Each remote effect has its own request ID, linked to its command, with immutable inputs and a typed target. Effects include acquiring a workspace, preparing, activating and controlling a worker through its launcher, delivering answers, running checks, rebasing, integrating and deleting. Requests are not a task scheduler: they hold only work a command has explicitly authorised.
+
+| State | Meaning and allowed transition |
+| --- | --- |
+| pending | The recorded owner can claim it, or the caller can withdraw it before it is claimed |
+| claimed | The owner committed its intent before calling; no other executor may call it |
+| succeeded | The owner confirmed the result, which is recorded once |
+| rejected | There is definite proof that no effect occurred; the diagnostic result is kept |
+| withdrawn | The caller withdrew it before any claim; it is never executed |
+| uncertain | The claim or call was interrupted, or its outcome cannot be proven; inspect it, never repeat it |
+
+Immediately before calling, an executor checks its authority, its claim and generation, and the relevant owner facts again. A crash after a claim is treated as uncertain, even if no call was made. A failure that definitely happened before the call started can be recorded as rejected. Reads that are safe to repeat need no effect request, and queries may be retried. A reversible decision that only changes the database is an atomic write, not a separate remote effect.
+
+Reconciliation records that an effect happened or did not happen, with evidence from its owner, or with a person's exact scoped confirmation where the owner cannot tell. Missing evidence never shows that an effect did not happen. An effect confirmed as not having happened stays in the history, and a new, explicitly authorised effect may follow it. Launch permission is never reopened, so activating a worker again needs a new attempt. An integration or return that succeeded but was interrupted before being recorded can be confirmed from its owner without being repeated.
+
+A dry run does not claim effects, register processes, record diagnostics as events, refresh heartbeats, migrate the database or create directories. It can read owners, and an unknown read makes the plan refuse.
+
+## Completion, acceptance and return
+
+**R10.** Completing a worker records the terminal observation and the immutable validated result, and then the check results and the outcome. A code result waiting for acceptance holds its task. A report that is a deliverable in its own right can complete its task under its stored contract once it is retained. Completing a review task records a verdict; it never accepts or integrates the reviewed work.
+
+Accepting output selects an exact candidate, uses the recorded results of the mandatory checks or runs them, checks the review when the caller is a supervisor, records the scoped acceptance, applies the integration policy, and then marks the task done, respecting any newer person decision. Repeating an interrupted acceptance reads what is left to do and never performs a completed effect twice. Accepting does not return the lease. Only a person can return or discard.
+
+A person can explicitly accept despite missing or failed checks or review, giving a nonblank reason, which is recorded against the exact candidate. By default, acceptance requires the evidence, and a supervisor cannot override it. No override waives the requirements for identity, authority, retention, terminal state or process confirmation.
+
+Under the manual policy, accepted output is recorded as a deliverable without claiming that it was integrated. Dependent tasks start from the configured base branch, not from that retained branch. Under local-merge, Docket fast-forwards the configured target to the accepted commit, or records that the target already contains it. A policy is data of a fixed kind, never an executable script. Restrictions from the global and context policies add up. The repository's policy is read from the trusted target or base branch, so a worker's branch cannot relax it. If the policy or the target's protection cannot be read, integration is refused, and a protected target refuses local-merge.
+
+**R11.** A code candidate is either the exact validated commit the worker reported, or a retained branch commit that someone selected explicitly. Ordinary code delivery must move strictly beyond the attempt's starting commit. A result reports every criterion once, by its position (counting from 1) and exact text, including held and failed results. A worker's report is data, not independent verification.
+
+Validation records the result's content, the SHA-256 digest of its source file, the relative path, the validation version and the time, once. If the file later changes or goes missing, that is a discrepancy, and the record is never replaced. Validation checks the task, attempt, lease, session and database identities and the required evidence and deliverables. Artefacts must be regular files retained outside recyclable roots. Links and path traversal are rejected, and digests are recorded.
+
+Returning a lease checks again that the worker is stopped and terminal, that the allocation and pool match, that no effect is unresolved, that the person has confirmed no processes remain, that the task's outcome is recorded, and that all required output is retained. The confirmation names the exact lease or return request. Discarding also requires an explicit discard confirmation, holds an unfinished task, and keeps a newer done decision. A model cannot supply these confirmations to gain a person's authority.
+
+The repository adapter checks again for uncommitted or untracked work immediately before a return. Clean-up deletes an output ref only if it still points at the recorded commit, and the output was either explicitly discarded or integrated into the recorded target. Output accepted under the manual policy but not integrated is kept. A failed clean-up never reverses a confirmed return.
+
+**R14.** Rebasing is explicit. It requires evidence that the worker has stopped, a clean workspace, the exact recorded candidate, a known common ancestor, and no merge commits among the attempt's changes. It replays only the attempt's own changes, including changes from a retained source attempt that the target doesn't already contain. It records the original, upstream, target and rebased commits. A conflict aborts the rebase without moving the output ref, and an abort with an uncertain outcome needs resolving. Docket never resolves conflicts.
+
+A ref moves only if it still points at the expected commit. If the target moves again, acceptance checks again and refuses, or a person or supervisor asks for another rebase. A rebased candidate needs new checks and a new independent review of its exact commit. Rebasing does not accept output.
+
+## Continuation and review
+
+**R12.** Continuing creates a new attempt for the same, explicitly named task, starting from the source attempt's exact recorded and retained candidate. It requires the source to be terminal and settled, no worker for the task that may still be running, a ready task, known retention, and enough budget and capacity. Only the source attempt's lease is exempt from the usual rule that a retained lease blocks a new attempt. The source worker is never resumed or prompted again.
+
+The new attempt receives a bounded, immutable handover: the source's identity and commit, its outcome, the criteria, the check results, review findings, open and answered questions, and the requester's note. It has its own branch, lease and session, and uncommitted files are not carried over. Git refs that pin the starting commit are created only if they don't already exist, and are removed after allocation only if they still point at the expected commit. An uncertain clean-up is reported, and a ref that has moved is not deleted.
+
+**R13.** Creating a review makes a separate task with an immutable target: the source attempt, commit, branch and repository, and a copy of the criteria. Only this operation creates a review task; the ordinary task.add accepts the code and report kinds. A review task's copied criteria and target instructions cannot be changed with task.update, and reviewing a new target needs a new review. The reviewer has its own attempt and session, starts exactly at the target commit, receives the recorded check results, and is told to run focused tests rather than the full suite again. Creating a review never reopens the source's launch.
+
+A completed, retained review result contains exactly one reviewed-output reference, which must match the target, and reports every criterion. If every criterion is met, the verdict is passed; if any is not met, it is failed; an invalid, missing or interrupted result gives no verdict. The verdict and the review task's outcome are recorded together, and a repeat does not duplicate findings. The latest completed review of the same candidate and criteria replaces earlier verdicts. If the source's candidate changes, an old verdict is never attached to the new commit, but earlier findings stay available.
+
+## Checks
+
+**R15.** The trusted target branch's `.docket/checks.json` defines fast and full checks. The context configuration can add required checks but never remove them, and a duplicate name is refused. A command is an argument array with a positive, bounded timeout and a declared non-secret execution profile, run without a shell or standard input. If the file is absent, the context's checks apply. An empty set of required checks is allowed, but it is explicit and visible, and it never removes the supervisor's review requirement.
+
+The check and policy definitions are copied into the specification at reservation. Before acceptance, Docket resolves the current trusted policy again and requires both the recorded and the currently mandatory definitions. Identical definitions count once. Two definitions with the same name but different content are told apart by their digests, and the attempt needs both unless a person explicitly overrides one. A pass for one definition never stands in for another, and a change to a definition, the copied criteria or the effective policy content prevents an older pass being reused.
+
+Check evidence is keyed by the SHA-256 digest of canonical JSON covering the repository identity, the candidate commit, the digest of the copied criteria, the check definitions and their digest, the digest of the trusted policy content, and the execution profile's identity, including its declared tool and dependency versions. The source commit is kept as provenance. If the target advances but the policy content is unchanged, the evidence still holds. Credentials and the raw environment are never part of the key. Weakening a required policy takes effect only for new attempts, or through a person's separately recorded override.
+
+**R16.** Docket runs the full checks itself. Workers run fast checks while they work, but do not ask Docket to run the full checks. Once a worker is terminal and its result has been validated, Docket runs the fast checks and then the full checks, one after another, in the attempt's own workspace at the exact candidate commit. It does the same for a rebased candidate. Commands run with their declared execution profile, with every `DOCKET_` variable removed, and their diagnostics are bounded and redacted.
+
+Before, between and after the commands, Docket checks that the workspace is at the candidate commit and has no tracked or untracked changes. A command that changes the workspace cannot produce a pass, though ignored generated files are allowed by the declared profile. A process the worker left running could still change files during a check. These checks reduce that risk but cannot rule it out, which is one reason a person's process confirmation is still required before the lease is returned. Check claims limit how many full-check runs happen at once across processes (maxConcurrentFullChecks, default 1), and a run waiting for a slot is shown as waiting.
+
+The review, acceptance and objective completion reuse a successful result when its evidence key matches. A failed check holds the attempt as checks_failed, with bounded output. A check that did not run is not a pass. A failed result is not run again automatically for the same key. A person or supervisor can ask for a new run with a new request; repeating an existing request does not run the checks again. If a check process is killed during a run, the run stays uncertain, and its slot is not reused until that is resolved.
+
+## Authority and objectives
+
+**R17.** The host supplies the caller through a trusted binding: a person, a supervisor (with its objective and session), a worker (with its attempt) or a host service. On the ordinary command line, the person's identity comes from the operating system user. An operation's JSON input never contains a caller, a configuration path override, a permission, or anything that impersonates an approval. Host metadata and message text are not trusted, and a message from another thread does not come from a person.
+
+This is an authority boundary within an application whose users are trusted. It does not protect against arbitrary shell or database access. A restricted session offers only approved tools. Status, the briefing and objective show give each supervisor session's kind, restricted or unrestricted. Docket cannot tell whether a person is watching an unrestricted session, so it does not claim to enforce that: in an unrestricted session, the objective's limits guide the agent but are not enforced.
+
+**R18.** An objective's permissions are manageTasks, dispatch, continueAttempts, steerWorkers, stopWorkers, answerQuestions, acceptOutput, integrate, rebase, completeTasks and completeObjective, and each is true by default. The list is fixed in code, because each permission corresponds to a check inside an operation, so adding one always needs new code. A permission record with an unknown field is refused. A missing field takes the default set by the version that introduced that permission, so objectives stored before a permission existed remain valid.
+
+A supervisor acts only on current members of its objective, and cannot move a task out of the objective or unlink it. Adding or changing the members of a closed objective requires reopening it first.
+
+Only the objective's creator can change its criteria, permissions, budget or deadline, confirm unknown spending, or abandon it. No supervisor can return leases, discard work, resolve an uncertain return, grant itself authority or present a person's approval. A permission never overrides a safety refusal. For a supervisor to mark code work done, a matching candidate must already have been accepted, with its mandatory check and review evidence; completeTasks cannot bypass acceptance. Permissions and membership are checked again inside each transaction that changes something and before each effect. Revoking a permission stops new actions being admitted, but usage already incurred and terminal facts are still recorded.
+
+**R19.** An objective is open, completed or abandoned. Completion is explicit: exactly one nonblank statement for each current criterion, each with at least one valid reference to accepted output or a recorded review of a task currently linked to the objective. A reference must match the database, attempt and candidate identities, the commit when there is one, the artefact digests and the review's identity. A report-only task can support completion through its retained artefacts, without inventing a Git commit. In version 1, creating a review needs a Git candidate, and independent review of artefacts alone is deferred. A failed review can support an explanatory statement, but cannot authorise accepting its source.
+
+Completing an objective does not stop workers, accept output or return leases, and not every task needs to be done. Reopening clears the current closure and statements, and keeps the history. Only one objective's supervisor can be active in a context at a time, though several open objectives can be prepared. Supervising several objectives autonomously at once is deferred.
+
+## Usage and budgets
+
+**R20.** Each worker and supervisor session is registered before it starts, and is bound permanently to the objective it started under. Moving a task later does not move usage already incurred. A usage report carries the session's identity, the report's sequence number, cumulative input, output and total tokens, cost with its currency, and, for workers, elapsed time. Any value can be unknown or unsupported, and an observed zero stays distinct from an unavailable value.
+
+Each session's highest reported values are counted once. Repeated, out-of-order or lower reports never lower them or count twice. Costs are added only within one declared currency, and version 1 accepts at most one configured currency per objective. Worker time adds up the elapsed times of workers running at the same time, and leaves out the supervisor's conversation time. A preparation that failed, with proof the worker never started, costs zero worker usage; uncertainty never becomes zero.
+
+The budgets maxCost, maxTokens and maxWorkerTimeMs are each nonnegative or null, and a deadline is an explicit ISO time with an offset, or null. Admission is refused at or over a limit, and after the deadline. Before reservation, a finite limit on a metric the chosen launcher cannot report is refused. If a finished session's usage is unknown for a metric with a limit, new admission is blocked until the value is observed, or the creator confirms those exact session and metric gaps. An unknown metric without a limit stays visible but blocks nothing, so a subscription workflow limited by tokens or time can still run.
+
+Each active owner checks elapsed time and the deadline on every control interval, independently of usage reports, and asks its worker to stop when a limit is exceeded. Budgets limit observed usage. They are not reservations with the provider, and do not promise against overspending. A profile's per-attempt limits can never raise the objective's limits. After an objective closes, usage from its registered sessions is still recorded. A failure to read usage never authorises a replacement worker.
+
+## Questions and supervisor continuity
+
+**R21.** Every question uses one representation, recording its immutable text, its choices, whether the asker is waiting, the asker, the intended recipient and the scope. Each worker question file is consumed once per attempt. An answer is recorded once, in a transaction, and a different answer to the same question is refused. Only a person can answer a question addressed to a person. An authorised supervisor, or a person, can answer a worker's question.
+
+An answer and its delivery requests are recorded in the same transaction. Pi's file and message delivery and bb's message delivery each have their own request state, and recording an answer does not prove it was delivered. No answer restarts a terminal worker. Questions outlive the worker that asked them, and the handover to a later attempt includes current answers and unanswered questions. Answers are guidance, never new authority.
+
+**R22.** Each domain fact produces an ordered notification event with a unique source key, in the same transaction as the fact. A host event received twice does not record the fact twice. Batches of notifications are delivered at least once, and stable delivery requests make any uncertainty visible. A host confirms that it admitted a batch to its conversation, separately from the supervisor confirming, after processing it, that it was handled. The handled position only moves forward over a contiguous handled batch, and never skips a missing event.
+
+After a restart, Docket reads the recorded pending and handled state rather than resending prompts. Interrupted reasoning may need a new supervisor session or an explicit continuation, but a worker is never activated again as a result. A provider error that ends a session is shown, and waits for a person or the supervisor's host to continue it. Custom scheduling of provider retries is deferred.
+
+**R23.** The briefing gives the objective's criteria, authority and budget; each task's criteria, once; each attempt's summary and current candidate; checks, reviews and what acceptance is waiting for; questions; notes; pending events; owner diagnostics; and a count of person actions with the three most recent. The full specification, result and check output are available through attempt.show. The briefing for the canonical fixture of three tasks and thirteen attempts must be at most 15,000 characters.
+
+In Pi, the model's context keeps only the latest briefing result, without breaking tool-call pairs. bb must provide an equivalent bounded refresh, or show another way to avoid adding the full briefing repeatedly. The host's interface may keep the full visible history.
+
+A person's logical action is recorded once, with the objective's membership at that moment. Before the first supervisor session registers, it is classified as setup; after the objective closes, as clean-up; otherwise, as an intervention. Returning a lease alone never counts as an intervention, and answering a question addressed to a person always does. A command that also accepts or integrates output keeps that decision's classification. Moving a task or reopening an objective later never reclassifies history.

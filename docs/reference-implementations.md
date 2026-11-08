@@ -1,0 +1,23 @@
+# Reference implementations
+
+These Switchboard files solved problems that Docket also has. A task may name one of these entries; then, and only then, read the files it lists. Each link is pinned to Switchboard commit `4077c10`, so it does not change.
+
+Take the approach and the edge cases, not the structure. Check what you take against the specification, and record in your result which entry you used.
+
+| Entry | Files | Useful for |
+| --- | --- | --- |
+| SQLite | [database.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/database.ts), [database.test.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/tests/database.test.ts), [SQLite trial](https://github.com/nickcox/switchboard/tree/4077c10009c0ea895e990753d831a20e2fefaf15/investigations/sqlite-trial) | Opening and durability settings, `BEGIN IMMEDIATE`, retrying a busy database without blocking, transient Windows open failures, cross-process lock and crash behaviour on each platform. Ignore its migrations. |
+| Processes | [command.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/infra/command.ts), [executables.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/infra/executables.ts), [storage.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/infra/storage.ts) | Running commands without a shell, bounded diagnostics, finding executables, resolving paths so a link cannot hide a location. |
+| Pi | [rpc-client.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/runtime/pi/rpc-client.ts), [jsonl.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/runtime/pi/jsonl.ts), [worker.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/runtime/pi/worker.ts) | Pi's RPC protocol, its JSON lines framing, prompt acknowledgement and observing the direct child process. |
+| Pi supervisor | [extension.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/hosts/pi/extension.ts), [start.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/hosts/pi/start.ts) | Starting a restricted Pi session, delivering events in the background, keeping only the latest briefing in the model's context. |
+| Treehouse and Git | [treehouse.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/workspaces/treehouse.ts), [retention.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/workspaces/retention.ts), [integration.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/workspaces/integration.ts), [output-branch.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/workspaces/output-branch.ts), [starting-point.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/workspaces/starting-point.ts) | Treehouse's lease commands and output, checking that work is retained, fast-forward integration, and moving or deleting refs only from an expected commit. |
+| Worker questions | [questions.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/runtime/questions.ts) | Reading question files once, with size limits, and writing answers beside them. |
+| Keeping awake | [keep-awake.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/runtime/keep-awake.ts) | Preventing idle sleep on macOS and Windows while a worker runs. |
+| Decisions | [assess.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/dispatch/assess.ts), [safety.ts](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/src/dispatch/safety.ts) | Keeping state assessment pure, and deciding each operation from assessed facts. The facts themselves differ in Docket. |
+
+## Background documents
+
+| Document | Useful for |
+| --- | --- |
+| [Process-ownership survey](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/docs/phases/02-reconciliation-and-recovery/process-ownership-survey.md) | Why no cheap macOS mechanism proves that every process a worker started has stopped. |
+| [ACP runtime survey](https://github.com/nickcox/switchboard/blob/4077c10009c0ea895e990753d831a20e2fefaf15/docs/phases/03-supervisor/acp-runtime-survey.md) | ACP adapters for Claude and Codex, and how they handle steering and settings, for a later ACP launcher. |
