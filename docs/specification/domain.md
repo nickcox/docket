@@ -40,13 +40,13 @@ No worker starts until the allocation matches the stored specification. Starting
 
 ## Worker lifecycle
 
-**R06.** Launch admission is one irreversible decision, made conditionally in a write transaction: a pending launch becomes either permitted or fenced. A worker's reference is recorded before the worker can receive its first task prompt, and only one activation is permitted. Recovery can close a pending launch by fencing it, and a creator that was paused must check again and refuse to activate.
+**R06.** Launch admission is one irreversible decision, made conditionally in a write transaction: a pending launch becomes either permitted or fenced. A worker's reference is recorded before the worker can receive its first task prompt, and only one activation through Docket is permitted. Recovery can close a pending launch by fencing it, and a creator that was paused must check again and refuse to activate.
 
 Creating or preparing a worker and activating it are separate adapter actions. If creating a worker could already run a prompt, the adapter must give equivalent protection before admission. Returning a thread ID after the worker has already started does not meet this requirement.
 
 **R07.** Four facts are independent: the turn ended, the result was validated, the worker is terminal for this attempt, and every process it started has stopped. Completion requires a known terminal worker and a validated, matching result, or an authorised caller explicitly selecting committed output. A result is never accepted just because a file exists or a thread is idle.
 
-For Pi, terminal means the direct child process was observed to exit, or a person confirmed that it stopped, naming the scope, during recovery. For bb, terminal also requires that every later turn for this attempt is durably refused. Neither proves that every process the worker started has stopped, so a person's separate confirmation is still required before a workspace is recycled.
+For Pi, terminal means the direct child process was observed to exit, or a person confirmed that it stopped, naming the scope, during recovery. For bb, terminal also requires that every later turn submitted through the supported enabled-plugin path is durably refused. Deliberate bb Send now is outside that path, as R33 describes. Neither proves that every process the worker started has stopped, so a person's separate confirmation is still required before a workspace is recycled.
 
 **R08.** An owner read returns known with a value, absent, or unknown with a reason. A read that fails, is cut short or is malformed is unknown. A worker with no terminal evidence may still be running. While its owner's heartbeat is fresh, other ready tasks can still start, within capacity. A missing, stale, unreadable or future-dated heartbeat blocks every new activation and reservation in the context. Heartbeats are refreshed every 5 seconds, and a heartbeat is fresh when its age is at least 0 and less than 30,000 milliseconds.
 
