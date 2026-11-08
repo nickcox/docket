@@ -10,7 +10,7 @@ export type Allocation = {
   leaseId: string; holder: string; path: string; pool: string; repository: string;
   branch: string; startingCommit: string;
 };
-export type LeaseObservation = { leaseId: string; holder: string; path: string; branch: string };
+export type LeaseObservation = { leaseId: string; holder: string; path: string; branch: string | null };
 export type LeaseInspection = { state: "matching"; allocation: Allocation } | { state: "absent" } | { state: "mismatch"; reason: string };
 export type AcquireRequest = { databaseId: string; attemptId: string; holder: string; branch: string; startingCommit: string };
 export type WorkspaceOptions = {
@@ -78,9 +78,9 @@ export class TreehouseWorkspace {
         if (paths.has(row.path)) throw new Error("Duplicate Treehouse path");
         paths.add(row.path);
         if (row.lease_id === "") { if (row.lease_holder !== "") throw new Error("Holder without lease"); continue; }
-        if (!nonempty(row.lease_holder) || !nonempty(row.branch) || ids.has(row.lease_id)) throw new Error("Incomplete or duplicate lease");
+        if (!nonempty(row.lease_holder) || (!nonempty(row.branch) && !(row.branch === '' && row.detached === true)) || ids.has(row.lease_id)) throw new Error("Incomplete or duplicate lease");
         ids.add(row.lease_id);
-        leases.push({ leaseId: row.lease_id, holder: row.lease_holder, path: row.path, branch: row.branch });
+        leases.push({ leaseId: row.lease_id, holder: row.lease_holder, path: row.path, branch: row.detached === true && row.branch === '' ? null : row.branch });
       }
       return confirmed(leases);
     } catch (error) { return uncertain("Malformed Treehouse listing", { read, error: String(error) }); }
@@ -113,7 +113,7 @@ export class TreehouseWorkspace {
     if (after.status !== "confirmed" || after.value.pool !== identity.value.pool) return uncertain("Pool changed during listing", after);
     return confirmed(found);
   }
-  async inspect(expected: Allocation): Promise<Result<LeaseInspection>> {
+  async inspect(expected: Allocation, detachedCommit?: string): Promise<Result<LeaseInspection>> {
     if (!allocation(expected)) return rejected("A full allocation identity is required", expected);
     const identity = await this.identity();
     if (identity.status !== "confirmed") return identity;
@@ -123,7 +123,7 @@ export class TreehouseWorkspace {
     if (rows.status !== "confirmed") return rows;
     const row = rows.value.find(row => row.leaseId === expected.leaseId);
     if (!row) return confirmed(rows.value.some(row => row.path === expected.path) ? { state: "mismatch", reason: "Path has a different lease" } : { state: "absent" });
-    if (row.path !== expected.path || row.holder !== expected.holder || row.branch !== expected.branch) return confirmed({ state: "mismatch", reason: "Live lease identity differs" });
+    if (row.path !== expected.path || row.holder !== expected.holder || row.branch !== (detachedCommit ? null : expected.branch)) return confirmed({ state: "mismatch", reason: "Live lease identity differs" });
     try {
       const saved: unknown = JSON.parse(await readFile(this.receipt(expected.leaseId), "utf8"));
       if (!allocation(saved)) return uncertain("Malformed acquisition receipt", expected);
@@ -136,7 +136,8 @@ export class TreehouseWorkspace {
     if (repo.value !== expected.repository) return confirmed({ state: "mismatch", reason: "Workspace belongs to a different repository" });
     const workspace = await this.options.repository.inspectWorkspace(expected.path);
     if (workspace.status !== "confirmed") return workspace;
-    if (workspace.value.branch !== `refs/heads/${expected.branch}`) return confirmed({ state: "mismatch", reason: "Checked-out branch differs" });
+    if (detachedCommit && (!isCommit(detachedCommit) || workspace.value.head !== detachedCommit)) return confirmed({ state: 'mismatch', reason: 'Detached commit differs' });
+    if (workspace.value.branch !== (detachedCommit ? null : `refs/heads/${expected.branch}`)) return confirmed({ state: "mismatch", reason: "Checked-out branch differs" });
     const after = await this.identity();
     if (after.status !== "confirmed" || after.value.pool !== expected.pool) return uncertain("Pool changed during inspection", after);
     return confirmed({ state: "matching", allocation: expected });

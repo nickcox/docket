@@ -190,6 +190,25 @@ test('R27/R30: moved targets name exact commits and rebase action; target restri
   }
   assert.equal(f.git('rev-parse', attempt.specification.outputRef), attempt.candidate.commit);
   assert.equal(f.git('rev-parse', 'main'), targetCommit);
+  await writeFile(join(f.home, '.config', 'docket', 'finalisation.json'), JSON.stringify({ version: 1, forbid: [], protectedTargets: [] }));
+  const beforeRebase = await snapshot(f.home);
+  const rebasePlan = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: true });
+  assert.equal(rebasePlan.status, 0, JSON.stringify(rebasePlan.envelope));
+  assert.deepEqual(await snapshot(f.home), beforeRebase);
+  const rebased = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: false }, 'rebase');
+  assert.equal(rebased.status, 0, JSON.stringify(rebased.envelope) + rebased.stderr);
+  assert.deepEqual(rebased.data.steps, rebasePlan.data.steps);
+  assert.notEqual(rebased.data.attempt.candidate.id, attempt.candidate.id);
+  const commit = rebased.data.attempt.candidate.commit;
+  assert.equal(f.git('rev-parse', attempt.specification.outputRef), commit);
+  assert.equal(f.git('rev-parse', `refs/docket/original/${attempt.specification.databaseId}/${attempt.id}`), attempt.candidate.commit);
+  assert.equal(f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: false }, 'rebase').data.attempt.candidate.commit, commit);
+  const accepted = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false }, 'accept-rebased');
+  assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
+  assert.equal(f.git('rev-parse', 'main'), commit);
+  const returned = f.invoke('attempt.return', { attemptId: attempt.id, noProcesses: true, dryRun: false }, 'return-rebased');
+  assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
+  assert.equal(returned.data.attempt.leaseState, 'returned');
 });
 
 test('R27/A52: failed checks appear in compact attention status with a reason and next action', async t => {

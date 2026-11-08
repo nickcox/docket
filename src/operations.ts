@@ -13,6 +13,7 @@ import type { Runtime } from './runtime.ts';
 import { dispatch } from './dispatch.ts';
 import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, OwnerReadError } from './completion.ts';
 import { CommandFailure } from './response.ts';
+import { rebaseAttempt, planAttemptRebase } from './rebase.ts';
 import { known } from './operation-utils.ts';
 import { step } from './plans.ts';
 import { unknownProfile, UnknownProfileError } from './profiles.ts';
@@ -153,6 +154,13 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'task.reopen': return { task: await db.reopenTask(id, caller, command) };
       case 'attempt.show': return attemptView(db, String(args.attemptId));
       case 'attempt.dispatch': return await dispatch(db, args as unknown as Parameters<typeof dispatch>[1], caller, requestKey, await services(), progress);
+      case 'attempt.rebase': {
+        const completion = (await services()).completion;
+        const input = { requestKey, attemptId: String(args.attemptId), caller };
+        const plan = await planAttemptRebase(db, input, completion);
+        if (args.dryRun) return plan;
+        return { attempt: await rebaseAttempt(db, input, completion), ...plan };
+      }
       case 'attempt.accept': {
         const runtime = await services(), attemptId = String(args.attemptId);
         const attempt = db.attempt(attemptId);
@@ -206,7 +214,15 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         if (request.operation === 'completion.integrate') {
           const ref = known(await runtime.repository.inspectRef(String(request.input.target)));
           if (ref.state === 'present') ownerHappened = known(await runtime.repository.compare(String(request.input.commit), ref.commit)) ? true : null;
-        } else if (request.operation === 'completion.cleanup') {
+        } else if (['completion.pin', 'completion.move'].includes(request.operation)) {
+          const ref = known(await runtime.repository.inspectRef(String(request.input.ref)));
+          if (ref.state === 'present' && ref.commit === request.input.commit) ownerHappened = true;
+        } else if (request.operation === 'completion.rebase' || request.operation === 'completion.attach') {
+          const workspace = known(await runtime.repository.inspectWorkspace(String(request.input.workspace)));
+          if (request.operation === 'completion.attach' && workspace.clean && workspace.branch === request.input.ref
+            && workspace.head === request.input.commit) ownerHappened = true;
+          // A detached HEAD alone cannot prove which interrupted rebase produced it.
+        } else if (request.operation === 'completion.cleanup' || request.operation === 'completion.cleanup-pin') {
           const ref = known(await runtime.repository.inspectRef(String(request.input.ref)));
           if (ref.state === 'absent') ownerHappened = true;
         } else if (request.operation === 'completion.return' && request.attemptId) {

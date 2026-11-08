@@ -23,10 +23,10 @@ export function completionWorkspace(workspace: TreehouseWorkspace): ReturnWorksp
     return confirmed(lease);
   }
   return {
-    inspect: async expected => {
+    inspect: async (expected, detachedCommit) => {
       const found = await find(expected);
       if (found.status !== 'confirmed') return found;
-      const inspected = await workspace.inspect(found.value);
+      const inspected = await workspace.inspect(found.value, detachedCommit);
       if (inspected.status !== 'confirmed') return inspected;
       return confirmed({ state: inspected.value.state });
     },

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { writeFile, unlink } from 'node:fs/promises';
 import { acceptCandidate, returnAttempt, selectCandidate, planCandidateAcceptance, planAttemptReturn } from '../../src/completion.ts';
+import { rebaseAttempt, planAttemptRebase } from '../../src/rebase.ts';
+import { originalCandidateRef } from '../../src/storage/rebase.ts';
 import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
@@ -28,6 +30,9 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
   const services: CompletionServices = {
     profile,
     repository: {
+      createPinnedRef: async () => { throw new Error('Rebase not configured'); },
+      conditionalMoveRef: async () => { throw new Error('Rebase not configured'); },
+      prepareRebase: async () => { throw new Error('Rebase not configured'); },
       command: async () => { throw new Error('No actual Git in operation tests'); },
       identity: async () => confirmed('/repo'),
       readCheckPolicy: async () => parseCheckPolicy(start, policyContent, contextChecks),
@@ -480,4 +485,158 @@ test('R11: explicit retained branch selection creates a fresh exact candidate an
   assert.equal(selected.commit, commit);
   await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /candidate/);
   await assert.rejects(selectCandidate(f.db, { attemptId: f.a.id, commit: head, caller: person }, f.services), /exact candidate/);
+});
+
+async function rebaseFixture(t: Parameters<typeof fixture>[0]) {
+  const f = await fixture(t, true);
+  let state = { branch: f.a.binding.outputRef as string | null, head, clean: true, uncommitted: [] as string[], untracked: [] as string[] };
+  let merge = false, conflict = false, abortUnknown = false;
+  const target = 'c'.repeat(40), rebased = 'd'.repeat(40), second = 'e'.repeat(40);
+  f.refs.set('refs/heads/main', target);
+  const repository = f.services.repository;
+  repository.inspectWorkspace = async () => confirmed(state);
+  repository.compare = async (ancestor, descendant) => confirmed(ancestor === descendant || ancestor === start || (ancestor === target && descendant === rebased));
+  repository.command = async args => {
+    if (args[0] === 'switch') { f.calls.push('attach'); state.branch = f.a.binding.outputRef; }
+    return { complete: true, code: 0, stdout: args[0] === 'merge-base' ? start + '\n' : args[0] === 'rev-list' && merge ? head + '\n' : '', stderr: '' };
+  };
+  repository.createPinnedRef = async (ref, commit) => { f.calls.push('pin'); if (f.refs.has(ref)) return rejected('Exists'); f.refs.set(ref, commit); return confirmed({ ref, commit }); };
+  repository.prepareRebase = async (_workspace, original, upstream, onto) => {
+    f.calls.push('rebase'); assert.equal(upstream, start); assert.equal(onto, f.refs.get('refs/heads/main'));
+    if (abortUnknown) return uncertain('Abort unknown');
+    if (conflict) return rejected('rebase_conflict');
+    state = { ...state, branch: null, head: original === head ? rebased : second };
+    return confirmed({ commit: state.head });
+  };
+  repository.conditionalMoveRef = async (ref, expected, commit) => {
+    f.calls.push('move'); assert.equal(state.branch, null);
+    if (f.refs.get(ref) !== expected) return rejected('Moved');
+    f.refs.set(ref, commit); return confirmed({ ref, commit });
+  };
+  repository.verifyRetention = async request => {
+    for (const reference of request.references) {
+      const retained = f.refs.get(reference.ref);
+      if (!retained || !knownState(await repository.compare(reference.commit, retained))) return rejected('Output is not retained');
+    }
+    return confirmed({ retained: true });
+  };
+  return { ...f, target, rebased, second, input: { requestKey: 'rebase', attemptId: f.a.id, caller: person },
+    changeState: (patch: Partial<typeof state>) => { state = { ...state, ...patch }; },
+    merges: () => { merge = true; }, conflict: () => { conflict = true; }, abortUnknown: () => { abortUnknown = true; } };
+}
+
+test('A25/R14/R09/R30: rebase retains original, records new candidate, replays once and accepts with fresh checks', async t => {
+  const f = await rebaseFixture(t);
+  await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), (e: any) => e.code === 'not_fast_forward');
+  const before = [f.db.events(), f.db.requests(), f.db.claims()];
+  const plan = await planAttemptRebase(f.db, f.input, f.services);
+  assert.deepEqual(plan.steps.map(s => s.operation), ['rebase.pin', 'rebase.rebase', 'rebase.move', 'rebase.attach', 'candidate.record']);
+  assert.deepEqual([f.db.events(), f.db.requests(), f.db.claims()], before);
+  await rebaseAttempt(f.db, f.input, f.services);
+  const candidate = f.db.attempt(f.a.id).candidate!;
+  assert.notEqual(candidate.id, f.accept.candidateId); assert.equal(candidate.commit, f.rebased);
+  assert.deepEqual(f.calls, ['pin', 'rebase', 'move', 'attach']);
+  await rebaseAttempt(f.db, f.input, f.services);
+  assert.deepEqual((await planAttemptRebase(f.db, f.input, f.services)).steps, []);
+  assert.deepEqual(f.calls, ['pin', 'rebase', 'move', 'attach']);
+  const event = f.db.events().find(e => e.kind === 'output.rebased')!;
+  assert.deepEqual([event.payload.original, event.payload.upstream, event.payload.target, event.payload.rebased], [head, start, f.target, f.rebased]);
+  assert.equal(f.refs.get(originalCandidateRef(f.db.attempt(f.a.id).specification)), head);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /candidate/);
+  await acceptCandidate(f.db, { ...f.accept, candidateId: String(candidate.id), commit: String(candidate.commit) }, f.services);
+  assert.ok(f.calls.includes('fast') && f.calls.includes('full'));
+  await returnAttempt(f.db, f.returns, f.services);
+  assert.equal(f.refs.has(originalCandidateRef(f.db.attempt(f.a.id).specification)), false);
+  assert.equal(f.refs.has(f.a.binding.outputRef), false);
+});
+
+test('A25: dirty, moved, merge and accepted candidates refuse before any rebase effect', async t => {
+  for (const scenario of ['dirty', 'moved', 'merge', 'accepted']) {
+    const f = await rebaseFixture(t);
+    if (scenario === 'dirty') f.changeState({ clean: false });
+    if (scenario === 'moved') f.refs.set(f.a.binding.outputRef, f.rebased);
+    if (scenario === 'merge') f.merges();
+    if (scenario === 'accepted') {
+      f.refs.set('refs/heads/main', start);
+      await acceptCandidate(f.db, { ...f.accept, overrideReason: 'Person checked' }, f.services);
+      f.calls.length = 0;
+    }
+    const refs = [...f.refs];
+    await assert.rejects(rebaseAttempt(f.db, f.input, f.services));
+    assert.deepEqual(f.calls, []); assert.deepEqual([...f.refs], refs);
+  }
+});
+
+test('A25/R09: conflict is a stable refusal; an unconfirmed abort stays uncertain and is not repeated', async t => {
+  for (const unknown of [false, true]) {
+    const f = await rebaseFixture(t);
+    if (unknown) f.abortUnknown(); else f.conflict();
+    await assert.rejects(rebaseAttempt(f.db, f.input, f.services), unknown ? /did not succeed/ : (e: any) => e.code === 'rebase_conflict');
+    await assert.rejects(rebaseAttempt(f.db, f.input, f.services));
+    assert.equal(f.calls.filter(c => c === 'rebase').length, 1);
+    assert.equal(f.refs.get(f.a.binding.outputRef), head);
+    const state = knownState(await f.services.repository.inspectWorkspace(f.a.allocation.path));
+    assert.equal(state.branch, f.a.binding.outputRef); assert.equal(state.head, head);
+    assert.equal(f.db.requests().find(r => r.operation === 'completion.rebase')!.state, unknown ? 'uncertain' : 'rejected');
+  }
+});
+function knownState<T>(result: import('../../src/adapters/command.ts').Result<T>): T {
+  assert.equal(result.status, 'confirmed'); return (result as { value: T }).value;
+}
+
+test('R14/R11: target moving again permits another rebase; discard keeps a moved pin and reports it', async t => {
+  const f = await rebaseFixture(t);
+  await rebaseAttempt(f.db, f.input, f.services);
+  const first = f.db.attempt(f.a.id).candidate!;
+  f.refs.set('refs/heads/main', 'f'.repeat(40));
+  await assert.rejects(planCandidateAcceptance(f.db, { ...f.accept, candidateId: String(first.id), commit: String(first.commit) }, f.services), (e: any) => e.code === 'not_fast_forward');
+  await rebaseAttempt(f.db, { ...f.input, requestKey: 'second' }, f.services);
+  assert.equal(f.db.attempt(f.a.id).candidate!.commit, f.second);
+  const pin = originalCandidateRef(f.db.attempt(f.a.id).specification);
+  f.refs.set(pin, f.target);
+  // A moved pin may still retain the original as an ancestor, but cleanup must not delete it.
+  const compare = f.services.repository.compare;
+  f.services.repository.compare = async (ancestor, descendant) => ancestor === head && descendant === f.target
+    ? confirmed(true) : compare(ancestor, descendant);
+  await returnAttempt(f.db, { ...f.returns, discard: { leaseId: f.a.allocation.leaseId, confirmed: true, reason: 'Discard rebased work' } }, f.services);
+  assert.equal(f.refs.get(pin), f.target);
+  assert.equal(f.db.requests().find(r => r.operation === 'completion.cleanup-pin')!.state, 'rejected');
+});
+
+test('R09: interrupted rebase resumes durable steps and never replays a successful detached rebase', async t => {
+  for (const stage of ['pin', 'rebase', 'move', 'attach']) {
+    const f = await rebaseFixture(t);
+    const original = f.db.recordEffectOutcome.bind(f.db);
+    let interrupted = false;
+    f.db.recordEffectOutcome = async (...args) => {
+      const request = await original(...args);
+      if (!interrupted && request.operation === `completion.${stage}`) { interrupted = true; throw new Error('Lost durable response'); }
+      return request;
+    };
+    await assert.rejects(rebaseAttempt(f.db, f.input, f.services), /Lost durable response/);
+    const reopened = await Database.open(f.path, f.options); t.after(() => reopened.close());
+    await planAttemptRebase(reopened, f.input, f.services);
+    await rebaseAttempt(reopened, f.input, f.services);
+    assert.equal(reopened.attempt(f.a.id).candidate!.commit, f.rebased);
+    assert.equal(f.calls.filter(call => call === 'rebase').length, 1);
+  }
+});
+
+test('R09: lost conditional move response reconciles from the output owner, without repeating rebase or move', async t => {
+  const f = await rebaseFixture(t), move = f.services.repository.conditionalMoveRef;
+  f.services.repository.conditionalMoveRef = async (...args) => { await move(...args); throw new Error('Lost move response'); };
+  await assert.rejects(rebaseAttempt(f.db, f.input, f.services), /did not succeed/);
+  await planAttemptRebase(f.db, f.input, f.services);
+  await rebaseAttempt(f.db, f.input, f.services);
+  assert.equal(f.db.attempt(f.a.id).candidate!.commit, f.rebased);
+  assert.equal(f.calls.filter(call => call === 'rebase').length, 1);
+  assert.equal(f.calls.filter(call => call === 'move').length, 1);
+});
+
+test('R11/R14: discarding a rebased candidate deletes the exact original pin after return', async t => {
+  const f = await rebaseFixture(t);
+  await rebaseAttempt(f.db, f.input, f.services);
+  await returnAttempt(f.db, { ...f.returns, discard: { leaseId: f.a.allocation.leaseId, confirmed: true, reason: 'No longer needed' } }, f.services);
+  assert.equal(f.refs.has(originalCandidateRef(f.db.attempt(f.a.id).specification)), false);
+  assert.equal(f.calls.indexOf('return') < f.calls.indexOf('cleanup'), true);
 });

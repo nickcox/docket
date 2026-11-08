@@ -289,8 +289,12 @@ test("R32 detached rebase preserves original and accepted refs on success and co
   await writeFile(join(f.path, "file"), "conflict\n"); await f.git("add", "."); await f.git("commit", "-qm", "conflict");
   const conflicting = await f.git("rev-parse", "HEAD");
   await f.git("switch", "-q", "output");
-  assert.equal((await f.repo.prepareRebase(f.path, f.head, f.base, conflicting)).status, "uncertain");
+  const conflict = await f.repo.prepareRebase(f.path, f.head, f.base, conflicting);
+  assert.equal(conflict.status, 'rejected');
+  if (conflict.status === 'rejected') assert.equal(conflict.reason, 'rebase_conflict');
   assert.equal(await f.git("rev-parse", "output"), f.head);
   assert.equal(await f.git("rev-parse", "main"), conflicting);
-  assert.equal(await f.git("symbolic-ref", "-q", "HEAD").catch(() => "detached"), "detached");
+  assert.equal(await f.git('symbolic-ref', '-q', 'HEAD'), 'refs/heads/output');
+  assert.equal(value(await f.repo.inspectWorkspace(f.path)).clean, true);
+  assert.equal(value(await f.repo.inspectWorkspace(f.path)).head, f.head);
 });

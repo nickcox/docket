@@ -17,19 +17,21 @@ import type { Result } from './adapters/command.ts';
 import { readFinalisationPolicy } from './adapters/finalisation.ts';
 import { step } from './plans.ts';
 import { CommandFailure } from './response.ts';
+import { originalCandidateRef } from './storage/rebase.ts';
+import type { CompletionEffect } from './storage/rebase.ts';
 
 export interface ReturnWorkspace {
-  inspect(allocation: Allocation): Promise<Result<{ state: 'matching' | 'absent' | 'mismatch' }>>;
+  inspect(allocation: Allocation, detachedCommit?: string): Promise<Result<{ state: 'matching' | 'absent' | 'mismatch' }>>;
   returnLease(allocation: Allocation, request: { authorised: true; requestId: string; retention: RetentionRequest }): Promise<Result<{ returned: true }>>;
 }
 export interface CompletionServices extends CheckServices {
-  repository: CheckServices['repository'] & Pick<GitRepository, 'inspectRef' | 'compare' | 'verifyRetention' | 'conditionalFastForward' | 'conditionalDeleteRef' | 'command'>;
+  repository: CheckServices['repository'] & Pick<GitRepository, 'inspectRef' | 'compare' | 'verifyRetention' | 'conditionalFastForward' | 'conditionalDeleteRef' | 'command' | 'createPinnedRef' | 'conditionalMoveRef' | 'prepareRebase'>;
   workspace: ReturnWorkspace;
   readPolicy?: typeof readFinalisationPolicy;
 }
 const refuse = (message: string): never => { throw new StorageError('conflict', message); };
 export class OwnerReadError extends Error {}
-function known<T>(result: Result<T>): T {
+export function known<T>(result: Result<T>): T {
   if (result.status === 'uncertain') throw new OwnerReadError(result.reason);
   if (result.status !== 'confirmed') refuse(result.reason);
   return (result as { status: 'confirmed'; value: T }).value;
@@ -39,7 +41,7 @@ function exactCandidate(db: Database, input: AcceptInput): JsonObject {
   if (!candidate || candidate.id !== input.candidateId || candidate.commit !== input.commit) refuse('Exact candidate changed');
   return candidate!;
 }
-async function retainedOutput(db: Database, attemptId: string, services: CompletionServices): Promise<RetentionRequest> {
+export async function retainedOutput(db: Database, attemptId: string, services: CompletionServices, candidateCommit?: string): Promise<RetentionRequest> {
   const attempt = db.attempt(attemptId), binding = db.workerResultBinding(attemptId);
   const repository = known(await services.repository.identity());
   const recordedPath = (attempt.specification.repository as JsonObject).path;
@@ -52,8 +54,15 @@ async function retainedOutput(db: Database, attemptId: string, services: Complet
   if (recorded!.digest !== current.digest || canonicalJson(recorded!.artefacts) !== canonicalJson(current.artefacts)) refuse('Validated output changed');
   const references = (current.content.workReferences as JsonObject[]).filter(item => item.kind === 'git')
     .map(item => ({ ref: String(item.branch), commit: String(item.commit) }));
-  if (attempt.candidate && !references.some(item => item.commit === attempt.candidate!.commit)) {
-    references.push({ ref: String(attempt.candidate.outputRef), commit: String(attempt.candidate.commit) });
+  for (const reference of references) {
+    const output = known(await services.repository.inspectRef(reference.ref));
+    if (output.state === 'present' && known(await services.repository.compare(reference.commit, output.commit))) continue;
+    const pinnedRef = originalCandidateRef(attempt.specification);
+    const pinned = known(await services.repository.inspectRef(pinnedRef));
+    if (pinned.state === 'present' && known(await services.repository.compare(reference.commit, pinned.commit))) reference.ref = pinnedRef;
+  }
+  if (attempt.candidate && !references.some(item => item.commit === (candidateCommit ?? attempt.candidate!.commit))) {
+    references.push({ ref: String(attempt.candidate.outputRef), commit: candidateCommit ?? String(attempt.candidate.commit) });
   }
   const retention: RetentionRequest = { references,
     artefacts: [binding.resultPath, ...current.artefacts.map(item => join(dirname(binding.resultPath), String(item.relativePath)))],
@@ -105,7 +114,7 @@ export async function selectCandidate(db: Database, input: { attemptId: string; 
 }
 
 /** Every mutation has durable intent. A lost response is reconciled by owner reads, never another call. */
-async function effect(db: Database, authorisation: StoredEvent, operation: 'integrate' | 'return' | 'cleanup', input: JsonObject,
+export async function effect(db: Database, authorisation: StoredEvent, operation: CompletionEffect, input: JsonObject,
   reconcile: () => Promise<JsonObject | null>, call: () => Promise<Result<unknown>>, preflight: () => Promise<void> = async () => {}): Promise<StoredRequest> {
   const admission = await db.beginCompletionEffect(authorisation, operation, input);
   let request = admission.request;
@@ -288,21 +297,25 @@ async function cleanupOutput(db: Database, authorisation: StoredEvent, services:
   const plan = accepted?.payload.plan as FinalisationPlan | undefined;
   const integrated = plan?.kind === 'local-merge' && db.requests().some(request => request.requestKey === `integrate:${attemptId}:${String(candidate.id)}` && request.state === 'succeeded');
   if (!authorisation.payload.discard && !integrated) return;
-  const ref = String(candidate.outputRef), commit = String(candidate.commit);
-  try {
-    await effect(db, authorisation, 'cleanup', { ref, commit }, async () =>
-      known(await services.repository.inspectRef(ref)).state === 'absent' ? { ref, deleted: true } : null,
-    async () => {
-      const state = known(await services.repository.inspectRef(ref));
-      if (state.state === 'absent') return { status: 'confirmed', value: { alreadyAbsent: true } };
-      if (state.commit !== commit) return rejected('Output ref moved; it is preserved');
-      if (integrated && !authorisation.payload.discard) {
-        const target = known(await services.repository.inspectRef(plan!.target));
-        if (target.state !== 'present' || !known(await services.repository.compare(commit, target.commit))) return rejected('Recorded target no longer retains output');
-      }
-      return services.repository.conditionalDeleteRef(ref, commit);
-    });
-  } catch {
-    // A cleanup refusal or uncertainty is visible in its request, never a reversal of the confirmed return.
+  const pins = db.events().filter(e => e.attemptId === attemptId && e.kind === 'output.rebased');
+  const references = [{ operation: 'cleanup' as const, ref: String(candidate.outputRef), commit: String(candidate.commit) },
+    ...(pins.length ? [{ operation: 'cleanup-pin' as const, ref: String(pins[0]!.payload.pinnedRef), commit: String(pins[0]!.payload.pinnedCommit) }] : [])];
+  for (const { operation, ref, commit } of references) {
+    try {
+      await effect(db, authorisation, operation, { ref, commit }, async () =>
+        known(await services.repository.inspectRef(ref)).state === 'absent' ? { ref, deleted: true } : null,
+      async () => {
+        const state = known(await services.repository.inspectRef(ref));
+        if (state.state === 'absent') return { status: 'confirmed', value: { alreadyAbsent: true } };
+        if (state.commit !== commit) return rejected('Output ref moved; it is preserved');
+        if (integrated && !authorisation.payload.discard) {
+          const target = known(await services.repository.inspectRef(plan!.target));
+          if (target.state !== 'present' || !known(await services.repository.compare(String(candidate.commit), target.commit))) return rejected('Recorded target no longer retains output');
+        }
+        return services.repository.conditionalDeleteRef(ref, commit);
+      });
+    } catch {
+      // A cleanup refusal or uncertainty is visible in its request, never a reversal of the confirmed return.
+    }
   }
 }

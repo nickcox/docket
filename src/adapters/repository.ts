@@ -261,7 +261,16 @@ export class GitRepository {
     const prepared = await this.inspectWorkspace(workspace);
     if (prepared.status !== "confirmed" || prepared.value.branch !== null || prepared.value.head !== original || !prepared.value.clean) return uncertain("Rebase workspace is not clean and detached at the original commit", prepared);
     const result = await this.command(["-c", "rebase.updateRefs=false", "-c", "rebase.autoStash=false", "-c", "rerere.enabled=false", "rebase", "--no-verify", "--no-fork-point", "--onto", onto, upstream], workspace);
-    if (!result.complete || result.code !== 0) return uncertain("Detached rebase stopped; inspect workspace", result);
+    if (!result.complete) return uncertain("Detached rebase stopped; inspect workspace", result);
+    if (result.code !== 0) {
+      const aborted = await this.command(['rebase', '--abort'], workspace);
+      if (!aborted.complete || aborted.code !== 0) return uncertain('Rebase abort could not be confirmed', aborted);
+      const restored = await this.command(['switch', '--quiet', state.value.branch?.replace(/^refs\/heads\//, '') ?? '--detach', ...(state.value.branch ? [] : [original])], workspace);
+      const after = await this.inspectWorkspace(workspace);
+      if (!restored.complete || restored.code !== 0 || after.status !== 'confirmed' || !after.value.clean
+        || after.value.head !== original || after.value.branch !== state.value.branch) return uncertain('Rebase abort restoration could not be confirmed', after);
+      return rejected('rebase_conflict');
+    }
     const after = await this.inspectWorkspace(workspace);
     if (after.status !== "confirmed" || after.value.branch !== null || !after.value.clean) return uncertain("Detached rebase could not be verified", after);
     return confirmed({ commit: after.value.head });
