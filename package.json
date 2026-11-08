@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "docket": "bin/docket.ts"
+  },
   "engines": {
     "node": "26.7.0"
   },
