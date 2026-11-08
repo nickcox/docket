@@ -71,12 +71,14 @@ function rows(path: string, attemptId: string) {
 function state(db: Database, path: string, attemptId: string) {
   return { attempt: rows(path, attemptId), claims: db.claims(), requests: db.requests(), events: db.events(), tasks: db.tasks() };
 }
-function inject(db: Database, kind: string) {
+function inject(db: Database, kind: string, afterEvent = false) {
   const target = db as unknown as { insertEvent: (event: EventInput) => unknown };
   const original = target.insertEvent;
   target.insertEvent = function (event) {
-    if (event.kind === kind) throw new Error('injected transaction failure');
-    return original.call(this, event);
+    if (event.kind === kind && !afterEvent) throw new Error('injected transaction failure');
+    const result = original.call(this, event);
+    if (event.kind === kind && afterEvent) throw new Error('injected transaction failure');
+    return result;
   };
   return () => { target.insertEvent = original; };
 }
@@ -122,6 +124,12 @@ test('R06/R09/A10: preparation, binding and activation use shared requests and c
   const { attemptId, requestId, claimId, reference, launcher, prepare } = await prepared();
   assert.equal(launcher.prompts.length, 0);
   assert.equal(prepare.state, 'succeeded'); assert.equal(prepare.parentId, requestId); assert.equal(prepare.claimId, claimId);
+  const spec = db.attempt(attemptId).specification;
+  for (const key of ['databaseId', 'contextId', 'taskId', 'attemptId']) assert.equal(prepare.input[key], spec[key]);
+  assert.deepEqual(prepare.input.allocation, db.attempt(attemptId).allocation);
+  assert.deepEqual(prepare.input.owner, { claimId, generation: host.generation });
+  assert.match(String(prepare.input.sessionId), /^[a-f0-9-]{36}$/);
+  assert.match(String(prepare.input.profileDigest), /^[a-f0-9]{64}$/);
   assert.equal(db.claim(claimId).resourceKey, `worker:${attemptId}`);
   assert.deepEqual(await db.bindWorkerReference(attemptId, claimId, reference, host), reference);
   await assert.rejects(db.bindWorkerReference(attemptId, claimId, { ...reference, threadId: 'other' }, host), conflict);
@@ -140,6 +148,28 @@ test('R06/R09/A10: preparation, binding and activation use shared requests and c
   assert.ok(db.requests().every(request => request.category !== 'effect' || (request.parentId && request.claimId)));
 });
 
+test('R31: fake launcher contract separates preparation, activation, observation and terminal fencing', async t => {
+  const { prepared } = await fixture(t), { reference, launcher } = await prepared();
+  const before = await launcher.inspect(reference);
+  assert.equal(before.status, 'known');
+  if (before.status !== 'known') return;
+  assert.equal(before.worker, 'prepared'); assert.equal(before.terminal, false);
+  assert.equal(before.capabilities.preparation, 'non_acting');
+  assert.equal((await launcher.stop(reference, 'stop')).status, 'confirmed');
+  const stopped = await launcher.inspect(reference);
+  assert.equal(stopped.status === 'known' && stopped.terminal, false);
+  assert.equal((await launcher.fence(reference, 'fence')).status, 'confirmed');
+  const fenced = await launcher.inspect(reference);
+  assert.equal(fenced.status === 'known' && fenced.terminal, true);
+  assert.ok(fenced.status === 'known' && fenced.sequence > before.sequence);
+  assert.equal((await launcher.activate(reference, {}, 'later', host.generation)).status, 'rejected');
+  assert.equal((await launcher.deliver(reference, 'No restart', 'after_turn', 'deliver')).status, 'rejected');
+  assert.equal((await launcher.usage(reference)).status, 'unsupported');
+  assert.equal((await launcher.result(reference)).status, 'rejected');
+  assert.deepEqual(await launcher.inspect({ launcher: 'bb', threadId: 'absent' }), { status: 'absent' });
+  assert.equal(launcher.prompts.length, 0);
+});
+
 test('R31: the shared lifecycle accepts a non-bb host reference and refuses a mismatched launcher', async t => {
   const { db, started, prepared } = await fixture(t);
   const first = await started('wrong');
@@ -155,6 +185,8 @@ test('R06/R08/A13: recovery fencing survives owner heartbeat refresh and the pau
   const { attemptId, claimId, reference, launcher } = await prepared();
   using peer = await Database.open(path, options);
   await peer.fencePendingLaunch(attemptId, person);
+  using sql = new DatabaseSync(path);
+  sql.prepare('UPDATE claims SET heartbeat_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', claimId);
   await db.heartbeatWorkerOwner(attemptId, claimId, host);
   await assert.rejects(db.decideWorkerLaunch(attemptId, claimId, 'permit', host), conflict);
   await assert.rejects(db.decideWorkerLaunch(attemptId, claimId, 'fence', host), conflict);
@@ -200,13 +232,24 @@ test('R33: bb admission races claim exactly once and cannot admit another thread
   assert.deepEqual(result.map(result => result.kind).sort(), ['admitted', 'already_admitted']);
 });
 
+test('R33: bb thread admission uses the full committed reference, including host resource identifiers', async t => {
+  const { db, started } = await fixture(t), value = await started();
+  await db.beginWorkerPreparation(value.attemptId, value.claimId, host);
+  const reference = { launcher: 'bb', threadId: 'thread', environmentId: 'environment' };
+  await db.bindWorkerReference(value.attemptId, value.claimId, reference, host);
+  const decision = await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
+  assert.deepEqual(await db.admitInitialBbPrompt(value.attemptId, 'thread', host), { kind: 'admitted', effectId: decision.effectId });
+  assert.deepEqual(db.request(decision.effectId!).target!.reference, reference);
+});
+
 test('A14/R09: uncertain prepare before or after creation is retained and never repeated', async t => {
   for (const stage of ['before', 'after', 'uncertain', 'rejected'] as const) {
     const { db, started } = await fixture(t), { attemptId } = await started(), launcher = new FakeLauncher();
     if (stage === 'before') launcher.beforePrepare = async () => { throw new Error('lost before create'); };
+    else if (stage === 'rejected') launcher.beforePrepare = async () => rejected('Definite rejection', { owner: true });
     else launcher.afterPrepare = async reference => {
       if (stage === 'after') throw new Error('lost reply');
-      return stage === 'rejected' ? rejected('Definite rejection', { owner: true }) : uncertain('Lost reply', reference);
+      return uncertain('Lost reply', reference);
     };
     if (stage === 'before' || stage === 'after') await assert.rejects(prepareWorker(db, attemptId, host, launcher));
     else await prepareWorker(db, attemptId, host, launcher);
@@ -235,22 +278,23 @@ test('A14/R09: lost activation responses before and after prompting never send t
     const { db, prepared } = await fixture(t), value = await prepared();
     await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
     if (stage === 'before') value.launcher.beforeActivate = async () => { throw new Error('lost before send'); };
+    else if (stage === 'rejected') value.launcher.beforeActivate = async () => rejected('Not admitted', { owner: true });
     else value.launcher.afterActivate = async () => {
       if (stage === 'after') throw new Error('lost after send');
-      return stage === 'uncertain' ? uncertain('No acknowledgement') : rejected('Not admitted', { owner: true });
+      return uncertain('No acknowledgement');
     };
     if (stage === 'before' || stage === 'after') await assert.rejects(activateWorker(db, value.attemptId, value.reference, host, value.launcher));
     else await activateWorker(db, value.attemptId, value.reference, host, value.launcher);
     assert.equal(await activateWorker(db, value.attemptId, value.reference, host, value.launcher), null);
     assert.equal(value.launcher.calls.filter(call => call.operation === 'activate').length, 1);
-    assert.equal(value.launcher.prompts.length, stage === 'before' ? 0 : 1);
+    assert.equal(value.launcher.prompts.length, stage === 'before' || stage === 'rejected' ? 0 : 1);
     const effect = db.requests().find(request => request.operation === 'worker.activate')!;
     assert.equal(effect.state, stage === 'rejected' ? 'rejected' : 'uncertain');
   }
 });
 
 test('A13: permission and recovery fence in independent processes have one irreversible winner', { timeout: 15000 }, async t => {
-  for (const fenceFirst of [true, false]) {
+  for (const order of ['fence_first', 'permit_first', 'race']) {
     const { db, root, path, prepared } = await fixture(t), value = await prepared();
     const child = spawn(process.execPath, ['tests/helpers/launch-child.ts', path, root, value.attemptId, value.claimId],
       { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
@@ -260,10 +304,11 @@ test('A13: permission and recovery fence in independent processes have one irrev
     assert.deepEqual(ready[0], { ready: true });
     const exited = once(child, 'exit');
     const result = once(child, 'message');
-    if (fenceFirst) await db.fencePendingLaunch(value.attemptId, person);
+    if (order === 'fence_first') await db.fencePendingLaunch(value.attemptId, person);
     child.send({ resume: true });
-    let fenceWon = fenceFirst;
-    if (!fenceFirst) {
+    if (order === 'permit_first') await result;
+    let fenceWon = order === 'fence_first';
+    if (order !== 'fence_first') {
       try { await db.fencePendingLaunch(value.attemptId, person); fenceWon = true; }
       catch (error) { assert.ok(conflict(error)); }
     }
@@ -276,8 +321,97 @@ test('A13: permission and recovery fence in independent processes have one irrev
   }
 });
 
-for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepare', 'bind', 'permit', 'fence', 'recovery_fence', 'activation', 'outcome'] as const) {
-  test(`A09/R25: ${operation} and its events roll back together on an injected failure`, async t => {
+test('A10/R06: permission requires a committed matching reference and one reference cannot bind two attempts', async t => {
+  const { db, started } = await fixture(t), first = await started('first'), second = await started('second');
+  await assert.rejects(db.decideWorkerLaunch(first.attemptId, first.claimId, 'permit', host), conflict);
+  const reference = { launcher: 'bb', threadId: 'shared' };
+  await assert.rejects(db.bindWorkerReference(first.attemptId, first.claimId, reference, host), conflict);
+  await db.beginWorkerPreparation(first.attemptId, first.claimId, host);
+  await db.beginWorkerPreparation(second.attemptId, second.claimId, host);
+  await db.bindWorkerReference(first.attemptId, first.claimId, reference, host);
+  await assert.rejects(db.bindWorkerReference(second.attemptId, second.claimId, reference, host), conflict);
+});
+
+test('A14/R06: a recovery fence while prepare is paused prevents binding and every prompt', async t => {
+  const { db, path, options, started } = await fixture(t), value = await started(), launcher = new FakeLauncher();
+  let release!: () => void, reached!: () => void;
+  const paused = new Promise<void>(resolve => { reached = resolve; });
+  const resume = new Promise<void>(resolve => { release = resolve; });
+  launcher.afterPrepare = async reference => { reached(); await resume; return { status: 'confirmed', value: reference }; };
+  const preparing = prepareWorker(db, value.attemptId, host, launcher);
+  const failure = assert.rejects(preparing, conflict);
+  await paused;
+  using peer = await Database.open(path, options);
+  assert.equal(rows(path, value.attemptId).runtime_ref, null);
+  assert.equal(launcher.prompts.length, 0);
+  await peer.fencePendingLaunch(value.attemptId, person);
+  release(); await failure;
+  assert.equal((await prepareWorker(db, value.attemptId, host, launcher)).state, 'uncertain');
+  assert.equal(rows(path, value.attemptId).runtime_ref, null);
+  assert.equal(launcher.calls.length, 1); assert.equal(launcher.prompts.length, 0);
+});
+
+test('A14/R09: failed binding and failed activation confirmation preserve uncertainty without repeating either effect', async t => {
+  const { db, started } = await fixture(t), value = await started('binding'), launcher = new FakeLauncher();
+  let restore = inject(db, 'attempt.worker_bound');
+  await assert.rejects(prepareWorker(db, value.attemptId, host, launcher), /injected/); restore();
+  assert.equal((await prepareWorker(db, value.attemptId, host, launcher)).state, 'uncertain');
+  assert.equal(launcher.calls.length, 1); assert.equal(launcher.prompts.length, 0);
+  // An uncertain external effect blocks new admission in this context.
+  assert.equal(db.requests().find(request => request.operation === 'worker.prepare')!.state, 'uncertain');
+  const other = await fixture(t), active = await other.prepared();
+  await other.db.decideWorkerLaunch(active.attemptId, active.claimId, 'permit', host);
+  restore = inject(other.db, 'request.succeeded');
+  await assert.rejects(activateWorker(other.db, active.attemptId, active.reference, host, active.launcher), /injected/); restore();
+  assert.equal(await activateWorker(other.db, active.attemptId, active.reference, host, active.launcher), null);
+  assert.equal(active.launcher.prompts.length, 1);
+  assert.equal(other.db.requests().find(request => request.operation === 'worker.activate')!.state, 'uncertain');
+});
+
+test('R08/R09/A14: the executor rechecks freshness after claiming and immediately before both launcher calls', async t => {
+  for (const operation of ['prepare', 'activate']) {
+    const { db, path, started, prepared } = await fixture(t);
+    const value = operation === 'prepare' ? { ...await started(), launcher: new FakeLauncher(), reference: { launcher: 'bb', threadId: 'unused' } } : await prepared();
+    if (operation === 'activate') await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
+    const original = db.checkWorkerEffect.bind(db);
+    db.checkWorkerEffect = (id, identity) => {
+      using sql = new DatabaseSync(path);
+      sql.prepare('UPDATE claims SET heartbeat_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', identity.claimId);
+      return original(id, identity);
+    };
+    const call = operation === 'prepare' ? prepareWorker(db, value.attemptId, host, value.launcher)
+      : activateWorker(db, value.attemptId, value.reference, host, value.launcher);
+    await assert.rejects(call, conflict);
+    assert.equal(value.launcher.calls.filter(call => call.operation === operation).length, 0);
+    assert.equal(value.launcher.prompts.length, 0);
+    assert.equal(db.requests().find(request => request.operation === `worker.${operation}`)!.state, 'uncertain');
+  }
+});
+
+test('R09/R06: a different request key cannot authorise a second prepare or activation', async t => {
+  const { db, prepared } = await fixture(t), value = await prepared();
+  const decision = await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
+  const effect = db.request(decision.effectId!);
+  await assert.rejects(db.recordEffect({ requestKey: 'another-activation', operation: effect.operation, parentId: effect.parentId!,
+    attemptId: value.attemptId, executor: { claimId: value.claimId, generation: host.generation }, caller: effect.caller,
+    fingerprint: effect.fingerprint, input: effect.input, target: effect.target! }), conflict);
+});
+
+test('R31: unsupported preparation or admission refuses before claiming an effect or calling the launcher', async t => {
+  const { db, started, prepared } = await fixture(t), value = await started('unsupported'), launcher = new FakeLauncher();
+  const capabilities = launcher.capabilities({});
+  launcher.capabilities = () => ({ ...capabilities, preparation: 'unsupported' });
+  await assert.rejects(prepareWorker(db, value.attemptId, host, launcher), conflict);
+  assert.equal(db.requests().filter(request => request.operation === 'worker.prepare').length, 0);
+  const next = await prepared('supported');
+  const decision = await db.decideWorkerLaunch(next.attemptId, next.claimId, 'permit', host);
+  next.launcher.capabilities = () => ({ ...capabilities, admission: false });
+  await assert.rejects(activateWorker(db, next.attemptId, next.reference, host, next.launcher), conflict);
+  assert.equal(db.request(decision.effectId!).state, 'pending'); assert.equal(next.launcher.prompts.length, 0);
+});
+
+for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepare', 'bind', 'permit', 'fence', 'recovery_fence', 'activation', 'outcome'] as const) for (const afterEvent of [false, true]) {
+  test(`A09/R25: ${operation} rolls back on failure ${afterEvent ? 'after' : 'before'} its event`, async t => {
     const f = await fixture(t);
     const value = await f.allocated();
     let claimId = '', effectId = '', reference: WorkerReference = { launcher: 'bb', threadId: 'transaction' };
@@ -293,7 +427,7 @@ for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepar
     const kind = { start: 'attempt.started', start_refused: 'attempt.start_refused', owner: 'attempt.owner_registered', heartbeat: 'claim.refreshed',
       prepare: 'request.claimed', bind: 'attempt.worker_bound', permit: 'attempt.launch_permitted', fence: 'attempt.launch_fenced',
       recovery_fence: 'attempt.launch_fenced', activation: 'attempt.prompt_admitted', outcome: 'request.succeeded' }[operation];
-    const before = state(f.db, f.path, value.attemptId), restore = inject(f.db, kind);
+    const before = state(f.db, f.path, value.attemptId), restore = inject(f.db, kind, afterEvent);
     const call = () => {
       switch (operation) {
         case 'start': case 'start_refused': return f.db.startAttempt(value.attemptId, person);

@@ -10,9 +10,9 @@ export class FakeLauncher implements Launcher {
   readonly calls: { operation: string; effectId: string }[] = [];
   readonly prompts: { reference: WorkerReference; input: JsonObject; generation: string }[] = [];
   readonly workers = new Map<string, { binding: WorkerBinding; active: boolean; terminal: boolean; sequence: number }>();
-  beforePrepare?: () => Promise<void>;
+  beforePrepare?: () => Promise<Result<WorkerReference> | void>;
   afterPrepare?: (reference: WorkerReference) => Promise<Result<WorkerReference>>;
-  beforeActivate?: () => Promise<void>;
+  beforeActivate?: () => Promise<Result<JsonObject> | void>;
   afterActivate?: () => Promise<Result<JsonObject>>;
   capabilities(_profile: JsonObject): LauncherCapabilities {
     return { preparation: 'non_acting', admission: true, activeSteering: false, afterTurnMessage: false,
@@ -20,14 +20,19 @@ export class FakeLauncher implements Launcher {
   }
   async prepare(binding: WorkerBinding, effectId: string): Promise<Result<WorkerReference>> {
     this.calls.push({ operation: 'prepare', effectId });
-    await this.beforePrepare?.();
-    const reference = { launcher: String((binding.specification.profile as JsonObject).launcher), threadId: randomUUID() };
+    const early = await this.beforePrepare?.();
+    if (early) return early;
+    const launcher = String((binding.specification.profile as JsonObject).launcher);
+    const reference: WorkerReference = launcher === 'pi'
+      ? { launcher, processId: '123', sessionId: binding.sessionId }
+      : { launcher, threadId: randomUUID() };
     this.workers.set(JSON.stringify(reference), { binding, active: false, terminal: false, sequence: 0 });
     return this.afterPrepare ? this.afterPrepare(reference) : confirmed(reference);
   }
   async activate(reference: WorkerReference, storedInput: JsonObject, effectId: string, claimGeneration: string): Promise<Result<JsonObject>> {
     this.calls.push({ operation: 'activate', effectId });
-    await this.beforeActivate?.();
+    const early = await this.beforeActivate?.();
+    if (early) return early;
     const worker = this.workers.get(JSON.stringify(reference));
     if (!worker || worker.active || worker.terminal || worker.binding.owner.generation !== claimGeneration) return rejected('Worker cannot activate');
     worker.active = true;
@@ -37,8 +42,9 @@ export class FakeLauncher implements Launcher {
   }
   async inspect(reference: WorkerReference): Promise<WorkerObservation> {
     const worker = this.workers.get(JSON.stringify(reference));
-    return worker ? { status: 'known', sourceId: String(reference.threadId), sequence: worker.sequence,
-      worker: worker.active ? 'active' : 'prepared', turn: worker.active ? 'running' : 'idle', terminal: worker.terminal } : { status: 'absent' };
+    return worker ? { status: 'known', sourceId: String(reference.threadId ?? reference.sessionId), sequence: worker.sequence,
+      worker: worker.active ? 'active' : 'prepared', turn: worker.active ? 'running' : 'idle', terminal: worker.terminal,
+      capabilities: this.capabilities(worker.binding.specification.profile as JsonObject) } : { status: 'absent' };
   }
   async deliver(_reference: WorkerReference, _message: string, _mode: MessageMode, _effectId: string): Promise<Result<JsonObject>> {
     return rejected('Unsupported', { unsupported: true });

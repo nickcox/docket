@@ -748,6 +748,7 @@ export class Database {
   /** Recheck reserved inputs and readiness under the same lock as the start event. */
   async startAttempt(attemptId: string, caller: TaskActor): Promise<Attempt> {
     text(attemptId); taskActor(caller);
+    const actor = object(caller);
     return this.write(() => {
       const attempt = this.attemptRow(attemptId), taskId = String(attempt.task_id);
       if (attempt.phase !== 'allocated' || attempt.launch_state !== 'pending' || attempt.lease_state !== 'held'
@@ -772,13 +773,13 @@ export class Database {
             .run(reason, taskId, Number(task.decision_revision)));
         }
         this.insertEvent({ sourceKey: `attempt.start_refused:${attemptId}`, kind: 'attempt.start_refused', payloadVersion: 1,
-          correlationId: attemptId, actor: caller, occurredAt: new Date().toISOString(), attemptId, taskId, payload: { reason } });
+          correlationId: attemptId, actor, occurredAt: new Date().toISOString(), attemptId, taskId, payload: { reason } });
       } else {
         this.changed(this.db.prepare(`UPDATE attempts SET phase = 'running', started_decision_revision = ?, revision = revision + 1
           WHERE id = ? AND phase = 'allocated' AND launch_state = 'pending'`).run(Number(task.decision_revision), attemptId));
         this.changed(this.db.prepare("UPDATE tasks SET state = 'in_flight' WHERE id = ? AND state = 'queued'").run(taskId));
         this.insertEvent({ sourceKey: `attempt.started:${attemptId}`, kind: 'attempt.started', payloadVersion: 1,
-          correlationId: attemptId, actor: caller, occurredAt: new Date().toISOString(), attemptId, taskId,
+          correlationId: attemptId, actor, occurredAt: new Date().toISOString(), attemptId, taskId,
           payload: { decisionRevision: Number(task.decision_revision) } });
       }
       return this.decodeAttempt(this.attemptRow(attemptId));
@@ -801,9 +802,10 @@ export class Database {
   /** Existing intent is inspection evidence, never permission to prepare twice. */
   async beginWorkerPreparation(attemptId: string, claimId: string, host: WorkerHost): Promise<{ effect: StoredRequest; claimed: boolean }> {
     text(attemptId); text(claimId); workerHost(host);
+    const owner = object(host) as WorkerHost;
     return this.write(() => {
       const attempt = this.attemptRow(attemptId);
-      this.workerClaim(attemptId, claimId, host);
+      this.workerClaim(attemptId, claimId, owner);
       const existing = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.prepare'").get(attemptId);
       if (existing) return { effect: this.decodeRequest(existing), claimed: false };
       if (attempt.phase !== 'running' || attempt.launch_state !== 'pending' || attempt.runtime_ref !== null) {
@@ -813,9 +815,9 @@ export class Database {
       const input = { databaseId: spec.databaseId!, contextId: spec.contextId!, taskId: spec.taskId!, attemptId,
         specification: spec, allocation: JSON.parse(String(attempt.allocation)), sessionId: randomUUID(),
         profileDigest: createHash('sha256').update(json(spec.profile)).digest('hex'),
-        owner: { claimId, generation: host.generation } };
-      const effect = this.workerEffect(attemptId, claimId, host.generation, 'worker.prepare', input, { launcher: object(spec.profile).launcher! });
-      return { effect: this.claimEffectInTransaction(effect.id, { claimId, generation: host.generation }), claimed: true };
+        owner: { claimId, generation: owner.generation } };
+      const effect = this.workerEffect(attemptId, claimId, owner.generation, 'worker.prepare', input, { launcher: object(spec.profile).launcher! });
+      return { effect: this.claimEffectInTransaction(effect.id, { claimId, generation: owner.generation }), claimed: true };
     });
   }
 
@@ -824,9 +826,6 @@ export class Database {
     if (claim.attemptId !== attemptId || claim.resourceKey !== `worker:${attemptId}`
       || claim.role !== 'worker_owner' || json(claim.ownerRef) !== json(host)) {
       throw new StorageError('conflict', 'Worker owner claim does not match the attempt and host');
-    }
-    if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') {
-      throw new StorageError('conflict', 'Worker owner claim is not fresh');
     }
   }
 
@@ -935,24 +934,31 @@ export class Database {
 
   /** A hook claims the activation effect before returning proceed; a lost reply stays uncertain. */
   async admitInitialBbPrompt(attemptId: string, threadId: string, host: WorkerHost): Promise<InitialPromptAdmission> {
-    nonblank(threadId);
-    return this.claimWorkerActivation(attemptId, { launcher: 'bb', threadId }, host);
+    nonblank(attemptId); nonblank(threadId); workerHost(host);
+    const reference = this.snapshot(() => {
+      const attempt = this.attemptRow(attemptId);
+      if (attempt.runtime_ref === null) return { launcher: 'bb', threadId };
+      const bound = object(JSON.parse(String(attempt.runtime_ref))) as WorkerReference;
+      if (bound.launcher !== 'bb' || bound.threadId !== threadId) throw new StorageError('conflict', 'Prompt thread does not match the bound worker');
+      return bound;
+    });
+    return this.claimWorkerActivation(attemptId, reference, host);
   }
 
   async claimWorkerActivation(attemptId: string, reference: WorkerReference, host: WorkerHost): Promise<InitialPromptAdmission> {
     nonblank(attemptId); workerReference(reference); workerHost(host);
-    const caller = object(host) as WorkerHost;
+    const caller = object(host) as WorkerHost, bound = object(reference);
     return this.write(() => {
       const attempt = this.attemptRow(attemptId);
       if (attempt.launch_state === 'fenced') return { kind: 'fenced' };
       if (attempt.launch_state === 'pending') return { kind: 'pending' };
-      if (json(JSON.parse(String(attempt.runtime_ref))) !== json(reference)) throw new StorageError('conflict', 'Activation reference does not match the bound worker');
+      if (json(JSON.parse(String(attempt.runtime_ref))) !== json(bound)) throw new StorageError('conflict', 'Activation reference does not match the bound worker');
       this.workerClaim(attemptId, String(attempt.owner_claim_id), caller);
       const effect = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.activate'").get(attemptId);
       if (!effect) throw new StorageError('conflict', 'Activation effect is missing');
       if (effect.state !== 'pending') return { kind: 'already_admitted' };
       this.claimEffectInTransaction(String(effect.id), { claimId: String(attempt.owner_claim_id), generation: caller.generation });
-      this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.prompt_admitted', { effectId: String(effect.id), reference });
+      this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.prompt_admitted', { effectId: String(effect.id), reference: bound });
       return { kind: 'admitted', effectId: String(effect.id) };
     });
   }
@@ -961,11 +967,12 @@ export class Database {
   async fencePendingLaunch(attemptId: string, caller: TaskActor): Promise<void> {
     text(attemptId); taskActor(caller);
     if (caller.kind !== 'person') throw new StorageError('conflict', 'Recovery fencing requires a person');
+    const actor = object(caller);
     await this.write(() => {
       const attempt = this.attemptRow(attemptId);
       this.changed(this.db.prepare("UPDATE attempts SET launch_state = 'fenced', revision = revision + 1 WHERE id = ? AND launch_state = 'pending'").run(attemptId));
       this.insertEvent({ sourceKey: `attempt.launch_fenced:${attemptId}`, kind: 'attempt.launch_fenced', payloadVersion: 1,
-        correlationId: attemptId, actor: caller, occurredAt: new Date().toISOString(), attemptId,
+        correlationId: attemptId, actor, occurredAt: new Date().toISOString(), attemptId,
         taskId: String(attempt.task_id), payload: { recovery: true } });
     });
   }
@@ -1064,9 +1071,13 @@ export class Database {
 
   /** All resource admissions are checked under the same write lock. No expiry takeover exists. */
   async registerClaims(inputs: readonly ClaimInput[], actor: JsonObject): Promise<Claim[]> {
-    return this.write(() => this.registerClaimsInTransaction(inputs, actor));
+    if (!Array.isArray(inputs) || inputs.length === 0) throw new TypeError('Expected one or more claims');
+    inputs.forEach(claimInput);
+    const values = JSON.parse(json(inputs)) as ClaimInput[], owner = object(actor);
+    return this.write(() => this.registerClaimsInTransaction(values, owner));
   }
 
+  /** Shared transaction bodies keep compound operations on the same claim/request rules. */
   private registerClaimsInTransaction(inputs: readonly ClaimInput[], actor: JsonObject): Claim[] {
     if (!Array.isArray(inputs) || inputs.length === 0) throw new TypeError('Expected one or more claims');
     const values = inputs.map(input => {
@@ -1102,19 +1113,21 @@ export class Database {
   }
 
   async refreshClaim(identity: ClaimIdentity, heartbeatAt: string, actor: JsonObject): Promise<Claim> {
-    return this.write(() => this.refreshClaimInTransaction(identity, heartbeatAt, actor));
+    claimIdentity(identity); timestamp(heartbeatAt);
+    const expected = { ...identity }, owner = object(actor);
+    return this.write(() => this.refreshClaimInTransaction(expected, heartbeatAt, owner));
   }
 
   private refreshClaimInTransaction(identity: ClaimIdentity, heartbeatAt: string, actor: JsonObject): Claim {
     claimIdentity(identity); timestamp(heartbeatAt);
     const expected = { ...identity }, owner = object(actor);
     const before = this.activeClaim(expected);
-      this.changed(this.db.prepare(`UPDATE claims SET heartbeat_at = ?, revision = revision + 1
-        WHERE id = ? AND generation = ? AND revision = ? AND released_at IS NULL`)
-        .run(heartbeatAt, expected.claimId, expected.generation, before.revision));
-      const claim = this.decodeClaim(this.claimRow(expected.claimId));
-      this.storageEvent('claim.refreshed', owner, { claim: object(claim) });
-      return claim;
+    this.changed(this.db.prepare(`UPDATE claims SET heartbeat_at = ?, revision = revision + 1
+      WHERE id = ? AND generation = ? AND revision = ? AND released_at IS NULL`)
+      .run(heartbeatAt, expected.claimId, expected.generation, before.revision));
+    const claim = this.decodeClaim(this.claimRow(expected.claimId));
+    this.storageEvent('claim.refreshed', owner, { claim: object(claim) });
+    return claim;
   }
 
   async releaseClaim(identity: ClaimIdentity, evidence: JsonObject, actor: JsonObject): Promise<Claim> {
@@ -1197,38 +1210,56 @@ export class Database {
   }
 
   async recordEffect(input: EffectInput): Promise<StoredRequest> {
-    return this.write(() => this.recordEffectInTransaction(input));
+    effectInput(input);
+    const value = JSON.parse(json(input)) as EffectInput;
+    return this.write(() => this.recordEffectInTransaction(value));
   }
 
   private recordEffectInTransaction(input: EffectInput): StoredRequest {
     effectInput(input);
     const value = JSON.parse(json(input)) as EffectInput;
     value.caller = object(input.caller); value.input = object(input.input); value.target.reference = object(input.target.reference);
-      const previous = this.duplicateRequest(value, 'effect');
-      if (previous) {
-        const claim = this.decodeClaim(this.claimRow(previous.claimId!));
-        if (previous.parentId !== value.parentId || json(previous.input) !== json(value.input) ||
-          json(previous.target) !== json(value.target) || previous.claimId !== value.executor.claimId ||
-          claim.generation !== value.executor.generation || previous.attemptId !== (value.attemptId ?? null) ||
-          previous.objectiveId !== (value.objectiveId ?? null)) {
-          throw new StorageError('request_input_mismatch', 'Effect inputs are immutable');
-        }
-        return previous;
+    const previous = this.duplicateRequest(value, 'effect');
+    if (previous) {
+      const claim = this.decodeClaim(this.claimRow(previous.claimId!));
+      if (previous.parentId !== value.parentId || json(previous.input) !== json(value.input) ||
+        json(previous.target) !== json(value.target) || previous.claimId !== value.executor.claimId ||
+        claim.generation !== value.executor.generation || previous.attemptId !== (value.attemptId ?? null) ||
+        previous.objectiveId !== (value.objectiveId ?? null)) {
+        throw new StorageError('request_input_mismatch', 'Effect inputs are immutable');
       }
-      const parent = this.decodeRequest(this.requestRow(value.parentId));
-      if (parent.category !== 'command' || json(parent.caller) !== json(value.caller)) throw new StorageError('conflict', 'Effect must belong to its authorising command and caller');
-      const claim = this.activeClaim(value.executor);
-      this.validateScope(value.attemptId, value.objectiveId);
-      if ((claim.attemptId !== undefined && claim.attemptId !== value.attemptId) ||
-        (claim.objectiveId !== undefined && claim.objectiveId !== value.objectiveId)) throw new StorageError('conflict', 'Effect scope differs from its executor claim');
-      const id = randomUUID();
-      this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, parent_id, attempt_id, objective_id,
-        caller, fingerprint, input, target, claim_id, created_at) VALUES (?, ?, 'effect', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, value.requestKey, value.operation, value.parentId, value.attemptId ?? null, value.objectiveId ?? null,
-          json(value.caller), value.fingerprint, json(value.input), json(value.target), claim.id, new Date().toISOString());
-      const request = this.decodeRequest(this.requestRow(id));
-      this.storageEvent('request.recorded', value.caller, { request: object(request) }, id);
-      return request;
+      return previous;
+    }
+    const parent = this.decodeRequest(this.requestRow(value.parentId));
+    if (parent.category !== 'command' || json(parent.caller) !== json(value.caller)) throw new StorageError('conflict', 'Effect must belong to its authorising command and caller');
+    const claim = this.activeClaim(value.executor);
+    if (value.operation === 'worker.prepare' || value.operation === 'worker.activate') {
+      if (!value.attemptId || value.requestKey !== `${value.operation}:${value.attemptId}`
+        || parent.operation !== 'attempt.dispatch' || parent.attemptId !== value.attemptId || value.target.kind !== 'worker') {
+        throw new StorageError('conflict', 'Worker effects must use the attempt dispatch and its unique effect key');
+      }
+      const attempt = this.attemptRow(value.attemptId);
+      if (claim.resourceKey !== `worker:${value.attemptId}` || claim.role !== 'worker_owner'
+        || attempt.phase !== 'running' || attempt.launch_state !== 'pending') {
+        throw new StorageError('conflict', 'Attempt is not awaiting its worker effect');
+      }
+      if (value.operation === 'worker.activate' && (attempt.owner_claim_id !== claim.id || attempt.runtime_ref === null
+        || json(value.target.reference) !== json(JSON.parse(String(attempt.runtime_ref)))
+        || json(value.input) !== json({ specification: JSON.parse(String(attempt.specification)) }))) {
+        throw new StorageError('conflict', 'Activation must match the bound worker and stored input');
+      }
+    }
+    this.validateScope(value.attemptId, value.objectiveId);
+    if ((claim.attemptId !== undefined && claim.attemptId !== value.attemptId) ||
+      (claim.objectiveId !== undefined && claim.objectiveId !== value.objectiveId)) throw new StorageError('conflict', 'Effect scope differs from its executor claim');
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, parent_id, attempt_id, objective_id,
+      caller, fingerprint, input, target, claim_id, created_at) VALUES (?, ?, 'effect', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, value.requestKey, value.operation, value.parentId, value.attemptId ?? null, value.objectiveId ?? null,
+        json(value.caller), value.fingerprint, json(value.input), json(value.target), claim.id, new Date().toISOString());
+    const request = this.decodeRequest(this.requestRow(id));
+    this.storageEvent('request.recorded', value.caller, { request: object(request) }, id);
+    return request;
   }
 
   private effect(id: string, state: EffectState): StoredRequest {
@@ -1243,22 +1274,24 @@ export class Database {
   }
 
   async claimEffect(id: string, identity: ClaimIdentity): Promise<StoredRequest> {
-    return this.write(() => this.claimEffectInTransaction(id, identity));
+    text(id); claimIdentity(identity);
+    const expected = { ...identity };
+    return this.write(() => this.claimEffectInTransaction(id, expected));
   }
 
   private claimEffectInTransaction(id: string, identity: ClaimIdentity): StoredRequest {
     text(id); claimIdentity(identity);
     const expected = { ...identity };
-      const before = this.effect(id, 'pending');
-      const claim = this.effectExecutor(before, expected);
-      if (before.operation === 'worker.activate' || before.operation === 'worker.prepare') this.checkWorkerEffectInTransaction(before, expected);
-      if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Executor heartbeat is not fresh');
-      this.changed(this.db.prepare(`UPDATE requests SET state = 'claimed', claimed_at = ?, revision = revision + 1
-        WHERE id = ? AND state = 'pending' AND revision = ? AND claim_id = ?`)
-        .run(new Date().toISOString(), id, before.revision, expected.claimId));
-      const request = this.decodeRequest(this.requestRow(id));
-      this.storageEvent('request.claimed', claim.ownerRef, { request: object(request), generation: expected.generation }, id);
-      return request;
+    const before = this.effect(id, 'pending');
+    const claim = this.effectExecutor(before, expected);
+    if (before.operation === 'worker.activate' || before.operation === 'worker.prepare') this.checkWorkerEffectInTransaction(before, expected);
+    if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Executor heartbeat is not fresh');
+    this.changed(this.db.prepare(`UPDATE requests SET state = 'claimed', claimed_at = ?, revision = revision + 1
+      WHERE id = ? AND state = 'pending' AND revision = ? AND claim_id = ?`)
+      .run(new Date().toISOString(), id, before.revision, expected.claimId));
+    const request = this.decodeRequest(this.requestRow(id));
+    this.storageEvent('request.claimed', claim.ownerRef, { request: object(request), generation: expected.generation }, id);
+    return request;
   }
 
   /** Only the command's caller may close a pending effect, before an executor claims it. */
@@ -1279,7 +1312,9 @@ export class Database {
   }
 
   async recordEffectOutcome(id: string, identity: ClaimIdentity, state: EffectOutcome, result: JsonObject): Promise<StoredRequest> {
-    return this.write(() => this.recordEffectOutcomeInTransaction(id, identity, state, result));
+    text(id); claimIdentity(identity);
+    const expected = { ...identity }, outcome = object(result);
+    return this.write(() => this.recordEffectOutcomeInTransaction(id, expected, state, outcome));
   }
 
   private recordEffectOutcomeInTransaction(id: string, identity: ClaimIdentity, state: EffectOutcome, result: JsonObject): StoredRequest {
@@ -1287,14 +1322,14 @@ export class Database {
     if (!['succeeded', 'rejected', 'uncertain'].includes(state)) throw new TypeError('Invalid effect outcome');
     const expected = { ...identity }, outcome = object(result);
     if (Object.keys(outcome).length === 0) throw new TypeError('Effect outcome requires evidence');
-      const before = this.effect(id, 'claimed');
-      const claim = this.effectExecutor(before, expected);
-      this.changed(this.db.prepare(`UPDATE requests SET state = ?, result = ?, revision = revision + 1
-        WHERE id = ? AND state = 'claimed' AND revision = ? AND claim_id = ?`)
-        .run(state, json(outcome), id, before.revision, expected.claimId));
-      const request = this.decodeRequest(this.requestRow(id));
-      this.storageEvent(`request.${state}`, claim.ownerRef, { request: object(request), generation: expected.generation }, id);
-      return request;
+    const before = this.effect(id, 'claimed');
+    const claim = this.effectExecutor(before, expected);
+    this.changed(this.db.prepare(`UPDATE requests SET state = ?, result = ?, revision = revision + 1
+      WHERE id = ? AND state = 'claimed' AND revision = ? AND claim_id = ?`)
+      .run(state, json(outcome), id, before.revision, expected.claimId));
+    const request = this.decodeRequest(this.requestRow(id));
+    this.storageEvent(`request.${state}`, claim.ownerRef, { request: object(request), generation: expected.generation }, id);
+    return request;
   }
 
   /** A consistent context-wide read. Time can block admission, never grant ownership. */

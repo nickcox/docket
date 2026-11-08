@@ -12,11 +12,6 @@ export interface WorkerReference extends JsonObject {
   launcher: string;
 }
 
-export interface BbWorkerReference extends WorkerReference {
-  launcher: 'bb';
-  threadId: string;
-}
-
 export function workerReference(value: unknown): asserts value is WorkerReference {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid worker reference');
   const reference = value as Record<string, unknown>;
@@ -42,12 +37,5 @@ export function workerHost(value: unknown): asserts value is WorkerHost {
     || typeof value.id !== 'string' || !value.id.trim()
     || typeof value.generation !== 'string' || !value.generation.trim()) {
     throw new TypeError('Invalid worker host binding');
-  }
-}
-
-export function bbWorkerReference(value: unknown): asserts value is BbWorkerReference {
-  if (!fields(value, ['launcher', 'threadId']) || value.launcher !== 'bb'
-    || typeof value.threadId !== 'string' || !value.threadId.trim()) {
-    throw new TypeError('Invalid bb worker reference');
   }
 }

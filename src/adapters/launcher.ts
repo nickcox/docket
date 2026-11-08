@@ -26,7 +26,7 @@ export interface LauncherCapabilities {
   observationSources: readonly string[];
 }
 export type WorkerObservation =
-  | { status: 'known'; sourceId: string; sequence: number; worker: 'prepared' | 'active' | 'stopped'; turn: 'idle' | 'running' | 'ended'; terminal: boolean }
+  | { status: 'known'; sourceId: string; sequence: number; worker: 'prepared' | 'active' | 'stopped'; turn: 'idle' | 'running' | 'ended'; terminal: boolean; capabilities: LauncherCapabilities }
   | { status: 'absent' }
   | { status: 'unknown'; reason: string };
 export type Usage = { status: 'reported'; sourceId: string; sequence: number; metrics: Record<string, number> }
