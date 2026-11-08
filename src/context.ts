@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { canonicalPath, ConfigurationError, inside, parseConfiguration, strictJson } from './configuration.ts';
 import type { ResolvedConfiguration } from './configuration.ts';
 import { Database, StorageError } from './storage/database.ts';
+import type { TaskActor } from './storage/tasks.ts';
 
 export class ContextError extends Error {
   readonly code: 'context_registered' | 'context_mismatch' | 'config_changed' | 'storage_busy' | 'not_initialised';
@@ -67,7 +68,7 @@ export async function resolveContext(selector: ContextSelector, options: Context
 }
 
 /** The registry lock serialises initialisers across names, including path collision checks. */
-export async function initialiseContext(selector: ContextSelector, options: ContextOptions = {}): Promise<Record<string, unknown>> {
+export async function initialiseContext(selector: ContextSelector, options: ContextOptions & { caller: TaskActor }): Promise<Record<string, unknown>> {
   const configuration = await resolveContext(selector, options);
   const { resolved: config, digest, revision, file } = configuration;
   const path = registryPath(options);
@@ -122,7 +123,7 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
     await mkdir(config.workspace.poolRoot, { recursive: true, mode: 0o700 });
     using database = await Database.initialise(config.databasePath, {
       contextId: config.contextId, stateDirectory: config.stateDirectory,
-      repository: { path: config.repository }, createdBy: { kind: 'person' },
+      repository: { path: config.repository }, createdBy: options.caller,
       configuration: { revision: 1, digest, resolved: config, provenance: { file } },
     }, { location: { retainedRoot: dirname(config.databasePath), recyclableRoots: options.recyclableRoots ?? [] } });
     const genesis = database.events()[0]!;

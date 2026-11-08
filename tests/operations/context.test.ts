@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { ConfigurationError, parseConfiguration } from '../../src/configuration.ts';
 import { ContextError, initialiseContext, openContext, resolveContext } from '../../src/context.ts';
 import { Database, StorageError } from '../../src/storage/database.ts';
 import { configuration } from '../fixtures/configuration.ts';
+import { findOperation } from '../../src/catalog.ts';
+import { executeCoreOperation } from '../../src/operations.ts';
 
 async function fixture(t: test.TestContext, contextId = 'example') {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-context-')));
@@ -14,7 +16,7 @@ async function fixture(t: test.TestContext, contextId = 'example') {
   const file = join(home, 'docket.json');
   const config = configuration(home, contextId);
   await writeFile(file, JSON.stringify(config));
-  return { home, file, config, options: { home, recyclableRoots: [] as string[] }, registry: join(home, '.config', 'docket', 'contexts.json') };
+  return { home, file, config, options: { home, recyclableRoots: [] as string[], caller: { kind: 'person' as const, id: 'operator' } }, registry: join(home, '.config', 'docket', 'contexts.json') };
 }
 
 function contextError(code: ContextError['code']) { return (error: unknown) => error instanceof ContextError && error.code === code; }
@@ -42,6 +44,20 @@ test('A01/R39/R29: init creates default paths, a unique database identity and ge
   assert.deepEqual(database.tasks(), []);
   assert.deepEqual(database.claims(), []);
 });
+
+for (const suppliedCaller of [false, true]) {
+  test(`A01/R39: context.init records ${suppliedCaller ? 'the supplied caller' : 'the OS person caller'} as the genesis creator`, async t => {
+    const f = await fixture(t);
+    const { caller, ...options } = f.options;
+    const expected = suppliedCaller ? caller : { kind: 'person', id: String(userInfo().uid) };
+    await executeCoreOperation(findOperation('context.init')!, {}, () => {}, { config: f.file }, undefined,
+      suppliedCaller ? f.options : options);
+    const context = await openContext({ config: f.file }, f.options);
+    using database = context.database;
+    const genesis = database.events().find(event => event.kind === 'database.initialised')!;
+    assert.deepEqual(genesis.payload.createdBy, expected);
+  });
+}
 
 test('A01/R39: explicit state/database/pool paths are honoured and existing registry entries are preserved', async t => {
   const f = await fixture(t, 'first');

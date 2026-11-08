@@ -68,9 +68,9 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
 
 export async function executeCoreOperation(operation: OperationDefinition, args: Record<string, unknown>, progress: (message: string) => void,
   selector: ContextSelector, requestKey: string = randomUUID(), options: OperationOptions = {}): Promise<Record<string, unknown>> {
-  if (operation.name === 'context.init') return initialiseContext(selector, options);
   const caller = options.caller ?? { kind: 'person', id: String(userInfo().uid) };
   if (!operation.roles.includes(caller.kind)) throw new CommandFailure('person_required');
+  if (operation.name === 'context.init') return initialiseContext(selector, { ...options, caller });
   const context = await openContext(selector, { ...options, readOnly: !operation.mutates || args.dryRun === true });
   const db = context.database;
   const input = JSON.parse(JSON.stringify(args)) as JsonObject;
