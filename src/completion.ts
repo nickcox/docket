@@ -181,7 +181,9 @@ export async function returnAttempt(db: Database, input: ReturnInput, services: 
     const previous = db.requests().find(request => request.requestKey === `return:${input.attemptId}`);
     let retention: RetentionRequest | undefined;
     if (!previous || previous.state === 'pending') {
-      retention = await retainedOutput(db, input.attemptId, services);
+      retention = authorisation.payload.abandonedWithoutOutcome
+        ? { references: [], artefacts: [], recyclableRoots: [allocation.pool] }
+        : await retainedOutput(db, input.attemptId, services);
       if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
       const workspace = known(await services.repository.inspectWorkspace(allocation.path));
       if (!workspace.clean) refuse('Workspace has uncommitted or untracked work');

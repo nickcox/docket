@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { writeFile } from 'node:fs/promises';
+import { writeFile, unlink } from 'node:fs/promises';
 import { acceptCandidate, returnAttempt, selectCandidate } from '../../src/completion.ts';
 import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
 import { Database } from '../../src/storage/database.ts';
-import { checkFixture, contextChecks, head, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
+import { checkFixture, contextChecks, head, host, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
 
 async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
   const f = await checkFixture(t);
@@ -62,6 +62,30 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
     dirty: () => { clean = false; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
     loseRetention: () => { retained = false; } };
 }
+
+test('R11: person discards terminal missing/invalid results without retention and frees execution capacity', async t => {
+  for (const invalid of [false, true]) {
+    const f = await fixture(t);
+    const a = await f.attempt(`missing-${invalid}`, ['Criterion'], undefined, head, start, policyContent, 'prepared');
+    const activation = f.db.requests().find(r => r.attemptId === a.id && r.operation === 'worker.activate')!;
+    await f.db.closePendingEffect(activation.id, 'withdrawn', { reason: 'No activation in fixture' }, person);
+    if (invalid) await writeFile(a.binding.resultPath, 'invalid');
+    else await unlink(a.binding.resultPath);
+    const input = { requestKey: `discard-${invalid}`, attemptId: a.id, caller: person,
+      noProcesses: { leaseId: a.allocation.leaseId },
+      discard: { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Result unavailable' } };
+    await assert.rejects(returnAttempt(f.db, input, f.services), /terminal/);
+    await f.db.recordWorkerObservation(a.observation('terminal', 2), host);
+    f.services.repository.verifyRetention = async () => { throw new Error('Must not require retained output'); };
+    await returnAttempt(f.db, input, f.services);
+    await returnAttempt(f.db, input, f.services);
+    assert.equal(f.db.attempt(a.id).outcome, 'failed');
+    assert.equal(f.db.attempt(a.id).executionOpen, false);
+    assert.equal(f.db.attempt(a.id).leaseState, 'returned');
+    assert.equal(f.db.task(a.binding.identity.taskId as string).holdReason, 'discarded');
+    assert.equal(f.db.events().filter(e => e.sourceKey === `attempt.discard_failed:${a.id}`).length, 1);
+  }
+});
 
 test('R10: acceptance runs fast/full checks once, records the exact candidate and keeps manual output and lease', async t => {
   const f = await fixture(t);

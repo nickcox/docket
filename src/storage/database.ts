@@ -1383,7 +1383,15 @@ export class Database {
     const value = structuredClone(input);
     if (value.discard !== undefined) nonblank(value.discard.reason);
     return this.write(() => {
-      const attempt = this.completionGuard(value.attemptId), allocation = object(JSON.parse(String(attempt.allocation)));
+      const raw = this.attemptRow(value.attemptId);
+      const abandonedWithoutOutcome = value.discard !== undefined && raw.outcome === null;
+      const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
+        AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(value.attemptId);
+      if (abandonedWithoutOutcome && (!terminal || raw.allocation === null)) {
+        throw new StorageError('conflict', 'Discard requires a stopped terminal worker and allocation');
+      }
+      const attempt = abandonedWithoutOutcome ? raw : this.completionGuard(value.attemptId);
+      const allocation = object(JSON.parse(String(attempt.allocation)));
       const command = this.decodeRequest(this.requestRow(requestId));
       if (command.operation !== (value.discard ? 'attempt.discard' : 'attempt.return') || json(command.caller) !== json(value.caller)
         || json(command.input) !== json(value)) throw new StorageError('conflict', 'Return must match its person command');
@@ -1400,8 +1408,15 @@ export class Database {
       }
       if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
+      if (abandonedWithoutOutcome) {
+        this.db.prepare(`UPDATE attempts SET outcome = 'failed', execution_open = 0, phase = 'settled',
+          settled_at = ?, revision = revision + 1 WHERE id = ? AND outcome IS NULL`)
+          .run(new Date().toISOString(), value.attemptId);
+        this.completionEvent(`attempt.discard_failed:${value.attemptId}`, 'attempt.completed', value.attemptId,
+          value.caller, { outcome: 'failed', reason: value.discard!.reason, discardedWithoutResult: true }, requestId);
+      }
       this.completionEvent(key, 'return.authorised', value.attemptId, value.caller,
-        { allocation, discard: Boolean(value.discard), discardReason: value.discard?.reason ?? null, noProcesses: value.noProcesses, decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
+        { allocation, discard: Boolean(value.discard), abandonedWithoutOutcome, discardReason: value.discard?.reason ?? null, noProcesses: value.noProcesses, decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
       return this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key)!);
     });
   }
