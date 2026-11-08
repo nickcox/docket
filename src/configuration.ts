@@ -54,12 +54,48 @@ export async function canonicalPath(value: unknown, field: string): Promise<stri
       if (ancestor !== value && !info.isDirectory()) refuse(field, 'Parent must be a directory');
       return value;
     } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+      if (error instanceof ConfigurationError) throw error;
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) refuse(field, 'Cannot validate path');
       const parent = dirname(ancestor);
       if (parent === ancestor) refuse(field, 'No existing parent');
       ancestor = parent;
     }
   }
+}
+
+/** JSON.parse accepts duplicate members; configuration must not hide fields by overwriting them. */
+export function strictJson(source: string): unknown {
+  let parsed: unknown;
+  try { parsed = JSON.parse(source); } catch { refuse('$', 'Invalid JSON'); }
+  const tokens = source.match(/"(?:\\.|[^"\\])*"|[{}\[\],:]|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/gu)!;
+  let index = 0;
+  function visit(field: string, depth: number): void {
+    if (depth > 64) refuse(field, 'JSON nesting exceeds 64 levels');
+    const token = tokens[index++];
+    if (token === '{') {
+      const keys = new Set<string>();
+      while (tokens[index] !== '}') {
+        const key = JSON.parse(tokens[index++]!) as string;
+        if (keys.has(key)) refuse(`${field}.${key}`, 'Duplicate field');
+        keys.add(key);
+        index++; // colon
+        visit(`${field}.${key}`, depth + 1);
+        if (tokens[index] !== ',') break;
+        index++;
+      }
+      index++; // closing brace
+    } else if (token === '[') {
+      let position = 0;
+      while (tokens[index] !== ']') {
+        visit(`${field}[${position++}]`, depth + 1);
+        if (tokens[index] !== ',') break;
+        index++;
+      }
+      index++; // closing bracket
+    }
+  }
+  visit('$', 0);
+  return parsed;
 }
 
 export interface Configuration extends JsonObject {
@@ -90,9 +126,7 @@ export function configurationPaths(contextId: string, home: string, stateDirecto
 
 /** No environment expansion, implicit credentials or policy defaults enter the digest. */
 export async function parseConfiguration(textValue: string, recyclableRoots: readonly string[] = []): Promise<ResolvedConfiguration> {
-  let parsed: unknown;
-  try { parsed = JSON.parse(textValue); } catch { refuse('$', 'Invalid JSON'); }
-  const config = object(parsed, '$', ['version', 'contextId', 'databasePath', 'stateDirectory', 'repository', 'baseBranch', 'workspace', 'limits', 'profiles', 'defaultProfile', 'profileByKind', 'finalisation', 'checks', 'supervisor', 'keepAwake']);
+  const config = object(strictJson(textValue), '$', ['version', 'contextId', 'databasePath', 'stateDirectory', 'repository', 'baseBranch', 'workspace', 'limits', 'profiles', 'defaultProfile', 'profileByKind', 'finalisation', 'checks', 'supervisor', 'keepAwake']);
   if (config.version !== 1) refuse('$.version', 'Expected configuration format 1');
   text(config.contextId, '$.contextId');
   configurationPaths(config.contextId, '/');
@@ -101,9 +135,10 @@ export async function parseConfiguration(textValue: string, recyclableRoots: rea
   const workspace = object(config.workspace, '$.workspace', ['adapter', 'poolRoot']);
   choice(workspace.adapter, '$.workspace.adapter', ['treehouse']);
   await canonicalPath(workspace.poolRoot, '$.workspace.poolRoot');
-  if (!inside(String(config.databasePath), String(config.stateDirectory))) refuse('$.databasePath', 'Database must be inside stateDirectory');
+  if (config.databasePath === config.stateDirectory || !inside(String(config.databasePath), String(config.stateDirectory))) refuse('$.databasePath', 'Database must be below stateDirectory');
   if (inside(String(config.stateDirectory), String(workspace.poolRoot))) refuse('$.stateDirectory', 'State directory must be outside the workspace pool');
   if (inside(String(config.databasePath), String(workspace.poolRoot))) refuse('$.databasePath', 'Database must be outside the workspace pool');
+  if (inside(String(workspace.poolRoot), String(config.databasePath))) refuse('$.workspace.poolRoot', 'Pool must not be below a database file');
   for (const root of recyclableRoots) {
     await canonicalPath(root, '$policy.recyclableRoots');
     for (const [field, value] of [['$.stateDirectory', config.stateDirectory], ['$.databasePath', config.databasePath], ['$.workspace.poolRoot', workspace.poolRoot]]) {

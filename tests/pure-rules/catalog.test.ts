@@ -21,29 +21,33 @@ function checkInputSchema(schema: JsonSchema): void {
   }
 }
 
-test("R28/A52: one version-1 catalogue exposes only catalog.show and its complete definition", () => {
+test("R28/A52: one version-1 catalogue exposes context.init and catalog.show with complete definitions", () => {
   assert.equal(catalogue.catalogueVersion, 1);
-  assert.deepEqual(catalogue.operations.map((operation) => operation.name), ["catalog.show"]);
+  assert.deepEqual(catalogue.operations.map((operation) => operation.name), ["context.init", "catalog.show"]);
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
-    assert.deepEqual(operation.roles, ["person", "supervisor", "worker", "host"]);
+    assert.deepEqual(operation.roles, operation.name === 'context.init' ? ['person'] : ["person", "supervisor", "worker", "host"]);
     assert.deepEqual(operation.bindingDerivedFields, []);
-    assert.equal(operation.mutates, false);
+    assert.equal(operation.mutates, operation.name === 'context.init');
     assert.equal(operation.plans, false);
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);
     checkInputSchema(operation.inputSchema);
     assert.equal(operation.outputSchema.type, "object");
     assert.equal(operation.outputSchema.additionalProperties, false);
-    assert.deepEqual(operation.outputSchema.required, ["catalogueVersion", "operations"]);
     assert.equal(findOperation(operation.name), operation);
-    assert.equal(executeOperation(operation), catalogue, "execution emits the core definitions, not a copy");
+    if (operation.name === 'catalog.show') {
+      assert.deepEqual(operation.outputSchema.required, ["catalogueVersion", "operations"]);
+      assert.equal(executeOperation(operation), catalogue, "execution emits the core definitions, not a copy");
+    } else {
+      assert.throws(() => executeOperation(operation), /Invalid arguments/u, 'initialisation requires a trusted CLI selector');
+    }
   }
   assert.equal(findOperation("task.add"), undefined);
 });
 
 test("R28/A52: the no-argument input schema is a described strict empty object", () => {
-  assert.deepEqual(catalogue.operations[0]!.inputSchema, {
+  assert.deepEqual(findOperation('catalog.show')!.inputSchema, {
     $schema: "https://json-schema.org/draft/2020-12/schema",
     type: "object",
     description: "Empty arguments. No context or caller fields are accepted.",

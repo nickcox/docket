@@ -2,7 +2,7 @@
 
 Docket is a command-line tool that keeps the record of agent work in a project: its tasks, the attempts agents make at them, the evidence for each result, and the approvals needed before work is accepted or a workspace is returned. A host such as [bb](https://getbb.app) runs the agents and shows the work; Docket decides what is allowed and records what happened.
 
-**Status:** the version-1 CLI envelope, `catalog.show`, SQLite schema, database opener, in-process task operations and internal bb first-prompt launch storage are implemented. Attempt reservation, allocation and public launch operations are not yet available. The [specification](docs/specification/README.md) is a draft for review and defines what Docket must do. The bb launcher has not passed qualification.
+**Status:** the version-1 CLI envelope, `catalog.show`, strict configuration format 1, `context.init`, SQLite schema, database opener, in-process task operations and internal bb first-prompt launch storage are implemented. Attempt reservation, allocation and public launch operations are not yet available. The [specification](docs/specification/README.md) is a draft for review and defines what Docket must do. The bb launcher has not passed qualification.
 
 Docket succeeds [Switchboard](https://github.com/nickcox/switchboard). It is built from its specification, not from Switchboard's code.
 
@@ -24,6 +24,16 @@ printf '{\n}\n' | node bin/docket.ts catalog show --stdin --json
 Do not combine `--input` and `--stdin`. `--request-id <key>` optionally correlates the read; otherwise `requestId` is null. The response's `data` contains `catalogueVersion: 1` and the operation definitions, including descriptions, schemas, roles and tool presentation.
 
 Every invocation prints one version-1 JSON envelope on stdout, even without `--json` or when arguments are invalid. An unrecognised operation is reported with `operation: null`, rather than echoing untrusted arguments. Progress and diagnostic text use stderr. Exit codes are 0 for success or accepted work, 1 for domain refusal, 2 for invalid arguments/input or an unknown operation, and 3 for unexpected failure. The response limit is 256 KiB; JSON input is also limited to 256 KiB.
+
+## Initialise a context
+
+Prepare a complete [format-1 configuration](docs/specification/contracts.md#configuration) with absolute canonical paths, then run:
+
+```sh
+node bin/docket.ts context init --config /absolute/path/to/docket.json --json
+```
+
+Initialisation creates the database and empty workspace pool, records the configuration and registers the context name. It refuses registered names and nonempty databases. It does not start workers or activate a host. See [context configuration and recovery](docs/context-configuration.md) for defaults, admission checks, storage-policy preconditions and interrupted initialisation.
 
 Run `npm run check` and `npm test` for the type check and full test suite.
 

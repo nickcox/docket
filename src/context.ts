@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { canonicalPath, ConfigurationError, inside, parseConfiguration } from './configuration.ts';
+import { canonicalPath, ConfigurationError, inside, parseConfiguration, strictJson } from './configuration.ts';
 import type { ResolvedConfiguration } from './configuration.ts';
 import { Database, StorageError } from './storage/database.ts';
 
@@ -30,7 +30,7 @@ function missing(error: unknown): boolean { return error instanceof Error && 'co
 async function registry(path: string): Promise<Record<string, string>> {
   await canonicalPath(path, '$registry');
   let value: unknown;
-  try { value = JSON.parse(await readFile(path, 'utf8')); }
+  try { value = strictJson(new TextDecoder('utf-8', { fatal: true }).decode(await readFile(path))); }
   catch (error) {
     if (missing(error)) return {};
     throw new ConfigurationError('$registry', 'Cannot read a valid context registry');
@@ -52,11 +52,15 @@ export async function resolveContext(selector: ContextSelector, options: Context
     file = entries[selector.context]!;
   } else throw new ConfigurationError('$selector', 'Select exactly one of --config and --context');
   await canonicalPath(file, '$config');
-  const info = await lstat(file);
-  if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$config', 'Configuration must be a regular, unlinked file');
   let source: string;
-  try { source = await readFile(file, 'utf8'); }
-  catch { throw new ConfigurationError('$config', 'Cannot read configuration'); }
+  try {
+    const info = await lstat(file);
+    if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$config', 'Configuration must be a regular, unlinked file');
+    source = new TextDecoder('utf-8', { fatal: true }).decode(await readFile(file));
+  } catch (error) {
+    if (error instanceof ConfigurationError) throw error;
+    throw new ConfigurationError('$config', 'Cannot read configuration');
+  }
   const configuration = await parseConfiguration(source, options.recyclableRoots);
   if (selector.context !== undefined && configuration.resolved.contextId !== selector.context) throw new ContextError('context_mismatch', 'Registry name and configuration contextId differ');
   return { ...configuration, file };
@@ -78,13 +82,15 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
   }
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
+    await lock.writeFile(`${JSON.stringify({ pid: process.pid, contextId: config.contextId, configurationFile: file })}\n`);
+    await lock.sync();
     const entries = await registry(path);
     if (Object.hasOwn(entries, config.contextId)) throw new ContextError('context_registered', 'Context name is already registered');
     for (const existingFile of Object.values(entries)) {
       const existing = (await resolveContext({ config: existingFile }, options)).resolved;
-      if (inside(config.stateDirectory, existing.stateDirectory) || inside(existing.stateDirectory, config.stateDirectory)
-        || config.databasePath === existing.databasePath || inside(config.workspace.poolRoot, existing.workspace.poolRoot)
-        || inside(existing.workspace.poolRoot, config.workspace.poolRoot)) {
+      const currentRoots = [config.stateDirectory, config.workspace.poolRoot];
+      const existingRoots = [existing.stateDirectory, existing.workspace.poolRoot];
+      if (currentRoots.some(current => existingRoots.some(root => inside(current, root) || inside(root, current)))) {
         throw new ContextError('context_mismatch', 'Context storage collides with a registered context');
       }
     }
@@ -93,6 +99,14 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
       const info = await lstat(config.databasePath);
       if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$.databasePath', 'Expected an unlinked regular file');
       if (info.size !== 0) throw new StorageError('not_empty', 'Initialisation requires an empty database path');
+    } catch (error) { if (!missing(error)) throw error; }
+    for (const [field, directory] of [['$.stateDirectory', config.stateDirectory], ['$.workspace.poolRoot', config.workspace.poolRoot]]) {
+      try {
+        if (!(await lstat(directory!)).isDirectory()) throw new ConfigurationError(field!, 'Expected a directory');
+      } catch (error) { if (!missing(error)) throw error; }
+    }
+    try {
+      if ((await readdir(config.workspace.poolRoot)).length !== 0) throw new ContextError('context_mismatch', 'A new context requires an empty workspace pool; preserve and inspect existing allocations');
     } catch (error) { if (!missing(error)) throw error; }
     // Prepare and flush the replacement before committing the database. Neither
     // SQLite nor rename can provide an atomic transaction across both files.
@@ -117,14 +131,17 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
     return { contextId: config.contextId, databaseId: genesis.payload.databaseId, configurationFile: file,
       stateDirectory: config.stateDirectory, databasePath: config.databasePath, poolRoot: config.workspace.poolRoot, digest, revision };
   } finally {
-    try { await unlink(temporary); } catch (error) { if (!missing(error)) throw error; }
-    await lock.close();
-    await unlink(lockPath);
+    try {
+      try { await unlink(temporary); } catch (error) { if (!missing(error)) throw error; }
+    } finally {
+      try { await lock.close(); } finally { await unlink(lockPath); }
+    }
   }
 }
 
 /** All later operations admit the selected file before reading or mutating context state. */
 export async function openContext(selector: ContextSelector, options: ContextOptions & { expectedRevision?: number; readOnly?: boolean } = {}) {
+  if (options.expectedRevision !== undefined && (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 1)) throw new ConfigurationError('$binding.expectedRevision', 'Expected a positive configuration revision');
   const configuration = await resolveContext(selector, options);
   const { resolved: config } = configuration;
   const database = await Database.open(config.databasePath, { readOnly: options.readOnly ?? true,
@@ -132,10 +149,6 @@ export async function openContext(selector: ContextSelector, options: ContextOpt
   try {
     const events = database.events();
     const genesis = events.find(event => event.kind === 'database.initialised');
-    if (!genesis || genesis.payload.contextId !== config.contextId || genesis.payload.stateDirectory !== config.stateDirectory
-      || (genesis.payload.repository as Record<string, unknown>)?.path !== config.repository) {
-      throw new ContextError('context_mismatch', 'Configuration does not match the database context identity');
-    }
     const recorded = events.findLast(event => event.kind === 'context.configured');
     const currentRevision = options.expectedRevision ?? configuration.revision;
     if (!recorded || recorded.payloadVersion !== 1 || recorded.payload.digest !== configuration.digest || recorded.payload.revision !== currentRevision) {
@@ -144,6 +157,10 @@ export async function openContext(selector: ContextSelector, options: ContextOpt
         recordedRevision: recorded?.payload.revision ?? null, currentRevision,
       });
     }
-    return { database, configuration, databaseId: genesis.payload.databaseId };
+    if (!genesis || genesis.payload.contextId !== config.contextId || genesis.payload.stateDirectory !== config.stateDirectory
+      || (genesis.payload.repository as Record<string, unknown>)?.path !== config.repository) {
+      throw new ContextError('context_mismatch', 'Configuration does not match the database context identity');
+    }
+    return { database, configuration: { ...configuration, revision: currentRevision }, databaseId: genesis.payload.databaseId };
   } catch (error) { database.close(); throw error; }
 }
