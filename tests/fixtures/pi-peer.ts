@@ -57,7 +57,11 @@ function receive(line: string) {
     }
     if (mode === 'result') {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
-      writeFileSync(protocol.resultPath, JSON.stringify({ version: 1, identity: protocol.identity, outcome: 'completed', summary: 'Synthetic result' }));
+      writeFileSync(protocol.resultPath, JSON.stringify({ version: 1, identity: protocol.identity,
+        startingCommit: protocol.startingCommit, outputRef: protocol.outputRef, outcome: 'completed', summary: 'Synthetic result', reason: null,
+        criteriaReport: protocol.criteria.map((criterion: string, index: number) => ({ position: index + 1, criterion, status: 'met', evidence: 'Synthetic check' })),
+        evidence: [{ name: 'tests', summary: 'Synthetic tests pass' }],
+        workReferences: [{ kind: 'git', name: 'code', branch: protocol.outputRef, commit: 'b'.repeat(40) }] }));
     }
   }
 }

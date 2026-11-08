@@ -10,21 +10,29 @@ import type { WorkerBinding } from '../../src/adapters/launcher.ts';
 import type { WorkerReference } from '../../src/storage/launch.ts';
 import type { JsonObject } from '../../src/storage/database.ts';
 
-async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '') {
+async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '', sdk = false) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-pi-'));
   const cwd = join(root, 'lease'); await mkdir(cwd);
   const record = join(root, 'peer.jsonl');
+  const auth = join(root, 'host-auth.json'), models = join(root, 'host-models.json');
+  if (sdk) {
+    await writeFile(auth, JSON.stringify({ synthetic: 'credential' }));
+    await writeFile(models, JSON.stringify({ providers: {} }));
+    await symlink(auth, join(root, 'auth-link.json'));
+  }
   let permitted = false;
   let admissionHook: (() => Promise<void>) | undefined;
   const profile = { launcher: 'pi', provider: 'synthetic-provider', model: 'exact-model', reasoning: 'high', executionProfile: 'isolated' };
   const binding: WorkerBinding = { databaseId: randomUUID(), contextId: 'test', taskId: 'task', attemptId: randomUUID(),
-    sessionId: randomUUID(), profileDigest: 'digest', owner: { claimId: randomUUID(), generation: 'generation' },
-    specification: { version: 1, profile, task: { instructions: 'Write the assigned task\nwith Unicode \u2028 intact.' }, criteria: ['Do it'],
+    resultPath: join(root, 'attempt', 'result.json'), sessionId: randomUUID(), profileDigest: 'digest', owner: { claimId: randomUUID(), generation: 'generation' },
+    specification: { version: 1, resultPath: join(root, 'attempt', 'result.json'), profile, task: { instructions: 'Write the assigned task\nwith Unicode \u2028 intact.' }, criteria: ['Do it'],
       delivery: { kind: 'code', requiredEvidence: ['tests'], requiredDeliverables: [] } },
     allocation: { leaseId: 'lease', holder: {}, path: cwd, pool: root, repository: {}, outputRef: 'refs/heads/output', startingCommit: 'a'.repeat(40) } };
   const launcher = new PiLauncher({ stateDirectory: join(root, 'state'), requestMs: 2000, stopMs: 1000, maxRecordBytes: 4096,
-    profiles: { isolated: { executable: process.execPath, entrypoint: resolve('tests/fixtures/pi-peer.ts'),
-      credentialVariable: 'PROVIDER_KEY', passEnvironment: ['PEER_RECORD', 'PEER_MODE', 'EXTRA_APPROVED'] } },
+    profiles: { isolated: { executable: process.execPath,
+      ...(sdk ? { sdkModule: resolve('tests/fixtures/pi-sdk-peer.ts'), agentFiles: { auth: join(root, 'auth-link.json'), models } }
+        : { entrypoint: resolve('tests/fixtures/pi-peer.ts'), credentialVariable: 'PROVIDER_KEY' }),
+      passEnvironment: ['PEER_RECORD', 'PEER_MODE', 'EXTRA_APPROVED'] } },
     environment: { PATH: process.env.PATH, HOME: root, TMPDIR: tmpdir(), LANG: 'en_AU.UTF-8', HTTP_PROXY: 'http://proxy.invalid',
       HTTPS_PROXY: 'https://proxy.invalid', NO_PROXY: 'localhost', NODE_USE_ENV_PROXY: '1', PROVIDER_KEY: 'synthetic-secret',
       PEER_RECORD: record, PEER_MODE: mode, EXTRA_APPROVED: 'yes', UNAPPROVED: 'no', DOCKET_DATABASE: 'no', ANOTHER_PROVIDER_KEY: 'no' },
@@ -63,7 +71,11 @@ test('R31/R35/A14: prepare is non-acting; only matching committed admission send
   assert.equal(protocol.instructions, (f.binding.specification.task as JsonObject).instructions);
   assert.deepEqual(protocol.criteria, ['Do it']);
   assert.equal(protocol.outputRef, f.binding.allocation.outputRef);
+  assert.equal(protocol.resultPath, f.binding.resultPath);
+  assert.equal(protocol.questionsDirectory, join(f.root, 'attempt', 'questions'));
+  assert.equal(protocol.artefactsDirectory, join(f.root, 'attempt', 'artefacts'));
   assert.equal((await stat(protocol.questionsDirectory)).isDirectory(), true);
+  assert.equal((await stat(protocol.artefactsDirectory)).isDirectory(), true);
   assert.equal((await f.launcher.prepare(f.binding, 'prepare')).status, 'uncertain');
   assert.equal((await f.records()).filter(r => r.kind === 'spawn').length, 1);
 });
@@ -178,6 +190,40 @@ for (const mode of ['crash', 'malformed', 'oversized', 'malformed-with-result'])
   assert.equal((await f.launcher.result(f.reference)).status, 'rejected');
 });
 
+test('R31/R35: approved OAuth and model files use canonical host paths with no copied token or host resources', async t => {
+  const f = await fixture(t, '', true);
+  assert.equal(f.prepared.status, 'confirmed');
+  const records = await f.records();
+  const credentials = records.find(record => record.kind === 'credentials');
+  assert.equal(credentials.authPath, join(f.root, 'host-auth.json'));
+  assert.equal(credentials.modelsPath, join(f.root, 'host-models.json'));
+  assert.equal(credentials.allowModelNetwork, false);
+  assert.deepEqual(credentials.auth, { synthetic: 'credential' });
+  assert.deepEqual(JSON.parse(await readFile(credentials.authPath, 'utf8')), { refreshed: true });
+  assert.deepEqual(records.find(record => record.kind === 'settings').settings, { retry: { enabled: false } });
+  assert.deepEqual(records.find(record => record.kind === 'resources'), { kind: 'resources',
+    extensions: { extensions: [], errors: [], runtime: {} }, skills: { skills: [], diagnostics: [] },
+    prompts: { prompts: [], diagnostics: [] }, themes: { themes: [], diagnostics: [] },
+    agents: { agentsFiles: [] }, systemPrompt: null, appendSystemPrompt: [] });
+  assert.deepEqual(records.find(record => record.kind === 'sdk_session'), { kind: 'sdk_session',
+    model: { provider: 'synthetic-provider', id: 'exact-model' }, tools: ['read', 'edit', 'write', 'bash'], thinkingLevel: 'high' });
+  const spawn = records.find(record => record.kind === 'spawn');
+  assert.equal(spawn.environment.PROVIDER_KEY, undefined);
+  assert.equal(records.filter(record => record.type === 'prompt').length, 0);
+  f.permit();
+  assert.equal((await f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation')).status, 'confirmed');
+  assert.equal((await f.records()).filter(record => record.type === 'prompt').length, 1);
+});
+
+test('R35: execution profiles reject unapproved agent files and require explicit SDK selection', () => {
+  for (const profile of [
+    { executable: process.execPath, passEnvironment: [], agentFiles: { auth: '/host/auth.json' } },
+    { executable: process.execPath, passEnvironment: [], sdkModule: '/pi/index.js', agentFiles: { settings: '/host/settings.json' } },
+    { executable: process.execPath, passEnvironment: [], sdkModule: '/pi/index.js', agentFiles: { auth: 'relative/auth.json' } },
+    { executable: process.execPath, passEnvironment: [], sdkModule: '/pi/index.js', entrypoint: '/pi/cli.js' },
+  ]) assert.throws(() => new PiLauncher({ stateDirectory: '/state', profiles: { invalid: profile }, admit: async () => true }), /agent file/);
+});
+
 test('R35: model mismatch during preparation retains a reference but sends no prompt', async t => {
   const f = await fixture(t, 'wrong-provider');
   assert.equal(f.prepared.status, 'uncertain'); assert.equal(f.reference.launcher, 'pi');
@@ -250,13 +296,17 @@ test('R35: optional real Pi prepares without a model request and fences by direc
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-real-pi-'));
   const cwd = join(root, 'lease'); await mkdir(cwd);
   const launcher = new PiLauncher({ stateDirectory: join(root, 'state'), requestMs: 15000,
-    profiles: { real: { executable, credentialVariable: process.env.DOCKET_TEST_PI_CREDENTIAL_VARIABLE ?? 'ANTHROPIC_API_KEY', passEnvironment: [] } },
+    profiles: { real: { executable,
+      ...(process.env.DOCKET_TEST_PI_SDK_MODULE ? { sdkModule: process.env.DOCKET_TEST_PI_SDK_MODULE,
+        agentFiles: { ...(process.env.DOCKET_TEST_PI_AUTH_FILE ? { auth: process.env.DOCKET_TEST_PI_AUTH_FILE } : {}),
+          ...(process.env.DOCKET_TEST_PI_MODELS_FILE ? { models: process.env.DOCKET_TEST_PI_MODELS_FILE } : {}) } } : {}),
+      ...(process.env.DOCKET_TEST_PI_CREDENTIAL_VARIABLE ? { credentialVariable: process.env.DOCKET_TEST_PI_CREDENTIAL_VARIABLE } : {}), passEnvironment: [] } },
     admit: async () => false });
   let reference: WorkerReference | undefined;
   t.after(async () => { if (reference) await launcher.stop(reference, 'cleanup'); await rm(root, { recursive: true, force: true }); });
   const prepared = await launcher.prepare({ databaseId: randomUUID(), contextId: 'probe', taskId: 'probe', attemptId: randomUUID(),
-    sessionId: randomUUID(), profileDigest: 'probe', owner: { claimId: randomUUID(), generation: 'probe' },
-    specification: { profile: { launcher: 'pi', provider, model, reasoning: null, executionProfile: 'real' },
+    resultPath: join(root, 'attempt', 'result.json'), sessionId: randomUUID(), profileDigest: 'probe', owner: { claimId: randomUUID(), generation: 'probe' },
+    specification: { resultPath: join(root, 'attempt', 'result.json'), profile: { launcher: 'pi', provider, model, reasoning: null, executionProfile: 'real' },
       task: { instructions: 'No prompt is authorised in this probe.' }, criteria: [], delivery: {} },
     allocation: { leaseId: 'probe', holder: {}, path: cwd, pool: root, repository: {}, outputRef: 'refs/heads/probe', startingCommit: 'a'.repeat(40) } }, 'prepare');
   if (prepared.status === 'confirmed') reference = prepared.value;
@@ -265,6 +315,7 @@ test('R35: optional real Pi prepares without a model request and fences by direc
   const observed = await launcher.inspect(reference!);
   assert.equal(observed.status, 'known');
   if (observed.status === 'known') { assert.equal(observed.turn, 'idle'); assert.equal(observed.terminal, false); }
+  assert.equal((await launcher.providerReady(reference!)).status, 'confirmed', 'Pi must report the configured provider/model as ready');
   assert.equal((await launcher.fence(reference!, 'fence')).status, 'confirmed');
 });
 

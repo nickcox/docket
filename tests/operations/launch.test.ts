@@ -11,7 +11,7 @@ import type { EventInput, JsonObject } from '../../src/storage/database.ts';
 import type { WorkerHost, WorkerReference } from '../../src/storage/launch.ts';
 import type { Allocation } from '../../src/storage/reservations.ts';
 import { activateWorker, prepareWorker } from '../../src/workers.ts';
-import { rejected, uncertain } from '../../src/adapters/command.ts';
+import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
 import { PiLauncher } from '../../src/adapters/pi.ts';
 
@@ -84,7 +84,7 @@ function inject(db: Database, kind: string, afterEvent = false) {
   return () => { target.insertEvent = original; };
 }
 
-for (const mode of ['', 'lost-ack']) test(`R31/R35/A14/A15: synthetic Pi honours the committed reference and permission (${mode || 'acknowledged'})`, async t => {
+for (const mode of ['', 'lost-ack', 'result']) test(`R31/R35/A14/A15: synthetic Pi honours the committed reference and permission (${mode || 'acknowledged'})`, async t => {
   const { db, root, started } = await fixture(t), value = await started('pi-task', 'other');
   await mkdir(value.allocation.path, { recursive: true });
   const record = join(root, 'pi-peer.jsonl');
@@ -108,9 +108,25 @@ for (const mode of ['', 'lost-ack']) test(`R31/R35/A14/A15: synthetic Pi honours
   await launcher.activate(reference, db.attempt(value.attemptId).specification, 'uncommitted-effect', host.generation);
   assert.equal((await records()).filter(r => r.type === 'prompt').length, 0);
   await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
-  assert.equal((await activateWorker(db, value.attemptId, reference, host, launcher))!.state, mode ? 'uncertain' : 'succeeded');
+  assert.equal((await activateWorker(db, value.attemptId, reference, host, launcher))!.state, mode === 'lost-ack' ? 'uncertain' : 'succeeded');
   assert.equal(await activateWorker(db, value.attemptId, reference, host, launcher), null);
   assert.equal((await records()).filter(r => r.type === 'prompt').length, 1);
+  if (mode === 'result') {
+    await launcher.usage(reference); // Consume the result-written and turn-end frames.
+    const prompt = (await records()).find(r => r.type === 'prompt');
+    const protocol = JSON.parse(prompt.message.split('\n\n')[2]);
+    const binding = db.workerResultBinding(value.attemptId);
+    assert.equal(protocol.resultPath, join(root, 'attempts', value.attemptId, 'result.json'));
+    assert.equal(protocol.resultPath, binding.resultPath);
+    const transport = await launcher.result(reference);
+    assert.equal(transport.status, 'confirmed');
+    if (transport.status === 'confirmed') assert.equal(transport.value.reference.path, binding.resultPath);
+    const result = await db.validateWorkerResult(value.attemptId, host, {
+      compare: async () => confirmed(true), verifyRetention: async () => confirmed({ retained: true as const }),
+    });
+    assert.deepEqual(result.content, JSON.parse(await readFile(protocol.resultPath, 'utf8')));
+    assert.equal(result.content.summary, 'Synthetic result');
+  }
 });
 
 test('R05/A05: start rechecks definition and readiness, retaining allocation and newer person decisions', async t => {

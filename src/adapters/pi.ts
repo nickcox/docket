@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, realpath, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative } from 'node:path';
+import { dirname, isAbsolute, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import type { JsonObject } from '../storage/database.ts';
 import type { WorkerReference } from '../storage/launch.ts';
@@ -12,8 +13,12 @@ import { PiRpc, PiRpcRejection, type RpcRecord } from './pi-rpc.ts';
 export interface PiExecutionProfile {
   executable: string;
   entrypoint?: string;
-  credentialVariable: string;
+  credentialVariable?: string;
   passEnvironment: string[];
+  /** Absolute installed Pi SDK module. With this option executable must be a Node executable. */
+  sdkModule?: string;
+  /** Only these person-approved files are shared, using their canonical host paths. */
+  agentFiles?: { auth?: string; models?: string };
 }
 export interface PiLauncherOptions {
   stateDirectory: string;
@@ -50,10 +55,15 @@ export class PiLauncher implements Launcher {
   constructor(options: PiLauncherOptions) {
     if (!isAbsolute(options.stateDirectory)) throw new TypeError('Pi state directory must be absolute');
     for (const profile of Object.values(options.profiles)) {
-      if (Object.keys(profile).some(key => !['executable', 'entrypoint', 'credentialVariable', 'passEnvironment'].includes(key))
+      if (Object.keys(profile).some(key => !['executable', 'entrypoint', 'credentialVariable', 'passEnvironment', 'sdkModule', 'agentFiles'].includes(key))
         || !isAbsolute(profile.executable) || (profile.entrypoint !== undefined && !isAbsolute(profile.entrypoint))
         || !Array.isArray(profile.passEnvironment)) throw new TypeError('Invalid Pi execution profile');
-      for (const name of [profile.credentialVariable, ...profile.passEnvironment]) {
+      if ((profile.sdkModule !== undefined && (!isAbsolute(profile.sdkModule) || profile.entrypoint !== undefined))
+        || (profile.agentFiles !== undefined && (!profile.sdkModule || !object(profile.agentFiles)
+          || Object.entries(profile.agentFiles).some(([key, path]) => !['auth', 'models'].includes(key) || typeof path !== 'string' || !isAbsolute(path))))) {
+        throw new TypeError('Invalid Pi agent file references');
+      }
+      for (const name of [...(profile.credentialVariable === undefined ? [] : [profile.credentialVariable]), ...profile.passEnvironment]) {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || name.startsWith('DOCKET_')) throw new TypeError('Invalid Pi environment reference');
       }
     }
@@ -97,26 +107,42 @@ export class PiLauncher implements Launcher {
       const home = join(directory, 'home'), sessions = join(directory, 'sessions');
       await mkdir(join(home, '.pi', 'agent'), { recursive: true, mode: 0o700 });
       await mkdir(sessions, { mode: 0o700 });
-      await mkdir(join(directory, 'questions'), { mode: 0o700 });
-      await mkdir(join(directory, 'artefacts'), { mode: 0o700 });
+      if (!isAbsolute(binding.resultPath) || binding.specification.resultPath !== binding.resultPath
+        || !outside(cwd, binding.resultPath)) return rejected('Invalid Pi retained result path');
+      const resultDirectory = dirname(binding.resultPath);
+      await mkdir(resultDirectory, { recursive: true, mode: 0o700 });
+      await mkdir(join(resultDirectory, 'questions'), { recursive: true, mode: 0o700 });
+      await mkdir(join(resultDirectory, 'artefacts'), { recursive: true, mode: 0o700 });
       await writeFile(join(home, '.pi', 'agent', 'settings.json'), JSON.stringify({ retry: { enabled: false } }), { flag: 'wx', mode: 0o600 });
       const environment: NodeJS.ProcessEnv = {};
       const host = this.options.environment!;
       for (const name of ['PATH', 'HOME', 'TMPDIR', 'LANG', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY',
-        execution.credentialVariable, ...execution.passEnvironment]) {
+        ...(execution.credentialVariable === undefined ? [] : [execution.credentialVariable]), ...execution.passEnvironment]) {
         if (!name.startsWith('DOCKET_') && host[name] !== undefined) environment[name] = host[name];
       }
-      environment.HOME = home; // A fresh home excludes user settings, auth, models and system prompts.
-      const args = [...(execution.entrypoint ? [execution.entrypoint] : []), '--mode', 'rpc',
+      environment.HOME = home; // Only explicitly approved agent files are shared by the SDK path.
+      let args = [...(execution.entrypoint ? [execution.entrypoint] : []), '--mode', 'rpc',
         '--session-id', binding.sessionId, '--session-dir', sessions, '--provider', profile.provider, '--model', profile.model,
         ...(profile.reasoning === null ? [] : ['--thinking', String(profile.reasoning)]),
         '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files',
         '--no-approve', '--offline', '--tools', 'read,edit,write,bash'];
+      if (execution.sdkModule) {
+        const agentFiles: Record<string, string> = {};
+        for (const [key, path] of Object.entries(execution.agentFiles ?? {})) {
+          const canonical = await realpath(path);
+          if (!(await lstat(canonical)).isFile()) return rejected('Pi agent reference is not a regular file');
+          agentFiles[key] = canonical;
+        }
+        const configPath = join(directory, 'sdk.json');
+        await writeFile(configPath, JSON.stringify({ sdkModule: execution.sdkModule, agentFiles, cwd, home, sessions,
+          sessionId: binding.sessionId, provider: profile.provider, model: profile.model, reasoning: profile.reasoning }), { flag: 'wx', mode: 0o600 });
+        args = [fileURLToPath(new URL('./pi-worker.ts', import.meta.url)), configPath];
+      }
       const reference: WorkerReference = { launcher: 'pi', ownerId: randomUUID(), sessionId: binding.sessionId,
         attemptId: binding.attemptId, preparationEffectId: effectId };
       const rpc = new PiRpc({ executable: execution.executable, args, cwd, env: environment,
         maxRecordBytes: this.options.maxRecordBytes ?? 4 * 1024 * 1024 }, record => this.observe(worker!, record));
-      worker = { reference, binding, rpc, directory, resultPath: join(directory, 'result.json'),
+      worker = { reference, binding, rpc, directory, resultPath: binding.resultPath,
         sequence: 0, turn: 'idle', attempted: false, prepared: false, fenced: false };
       if (rpc.child.pid !== undefined) reference.processId = String(rpc.child.pid);
       this.workers.set(String(reference.ownerId), worker); this.preparations.set(effectId, worker);
@@ -142,7 +168,7 @@ export class PiLauncher implements Launcher {
       // Recheck after the asynchronous admission read. Consume admission before any write.
       if (worker.attempted || worker.fenced || worker.rpc.failure || worker.rpc.exit) return uncertain('Pi activation no longer available', reference);
       worker.attempted = true;
-      const data = await worker.rpc.request('prompt', { message: piWorkerPrompt(worker.binding, worker.resultPath, join(worker.directory, 'questions')) }, this.requestMs);
+      const data = await worker.rpc.request('prompt', { message: piWorkerPrompt(worker.binding) }, this.requestMs);
       if (!object(data) || data.disposition !== 'started') return uncertain('Pi prompt admission not confirmed', reference);
       return confirmed({ admitted: true });
     } catch { return uncertain('Pi prompt acknowledgement lost or invalid; never retry', reference); }
@@ -191,6 +217,18 @@ export class PiLauncher implements Launcher {
         ? { status: 'unsupported', reason: 'Pi does not support session usage' }
         : { status: 'unknown', reason: 'Pi usage read failed' };
     }
+  }
+  /** Read Pi's credential-backed model availability without sending a prompt or model request. */
+  async providerReady(reference: WorkerReference): Promise<Result<JsonObject>> {
+    const worker = this.lookup(reference);
+    if (!worker || worker.rpc.exit || worker.rpc.failure) return uncertain('Pi owner is unavailable', reference);
+    try {
+      const available = await worker.rpc.request('get_available_models', {}, this.requestMs);
+      const profile = worker.binding.specification.profile as JsonObject;
+      if (!object(available) || !Array.isArray(available.models)) return uncertain('Pi readiness response is invalid', reference);
+      return available.models.some(model => object(model) && model.provider === profile.provider && model.id === profile.model)
+        ? confirmed({ provider: profile.provider!, model: profile.model!, ready: true }) : rejected('Pi provider/model is not ready');
+    } catch { return uncertain('Pi provider readiness is unknown', reference); }
   }
   async result(reference: WorkerReference): Promise<Result<{ transport: string; reference: JsonObject }>> {
     const worker = this.lookup(reference);
@@ -241,16 +279,20 @@ export class PiLauncher implements Launcher {
 }
 
 /** Worker protocol 1 is data inside one prompt, never shell interpolation or a second turn. */
-export function piWorkerPrompt(binding: WorkerBinding, resultPath: string, questionsDirectory: string): string {
+export function piWorkerPrompt(binding: WorkerBinding): string {
+  const resultPath = binding.resultPath;
+  const questionsDirectory = join(dirname(resultPath), 'questions');
+  const artefactsDirectory = join(dirname(resultPath), 'artefacts');
   const specification = binding.specification;
   const task = specification.task as JsonObject;
   const protocol = { version: 1, identity: { databaseId: binding.databaseId, contextId: binding.contextId,
     taskId: binding.taskId, attemptId: binding.attemptId, leaseId: binding.allocation.leaseId, sessionId: binding.sessionId },
     workspace: binding.allocation.path, startingCommit: binding.allocation.startingCommit, outputRef: binding.allocation.outputRef,
     instructions: task.instructions, criteria: specification.criteria, delivery: specification.delivery,
-    reviewTarget: specification.reviewTarget ?? null, resultPath, questionsDirectory };
+    reviewTarget: specification.reviewTarget ?? null, resultPath, questionsDirectory, artefactsDirectory };
   return ['Complete this one assigned task in the exact leased workspace. Do not launch other agents, mutate task records or leases, merge, push or publish.',
     'Use this immutable worker protocol version 1 input:', JSON.stringify(protocol),
-    'Write one JSON result to resultPath using the write tool. Include version:1, the exact identity, outcome completed|held|failed, summary, reason (string or null), criteriaReport, evidence and retained work references.',
-    'Report each criterion exactly once with position (1-based), exact text, status met|not_met and evidence. Commit code to the output ref. A turn ending is not acceptance.'].join('\n\n');
+    'Write one JSON result to resultPath using the write tool, with exactly these fields: version:1, identity (the exact supplied object), startingCommit, outputRef, outcome (completed|held|failed), summary, reason (null for completed, otherwise a nonblank string), criteriaReport, evidence, workReferences. Copy startingCommit and outputRef exactly from the input.',
+    'evidence is an array of {name,summary}. workReferences contains {kind:"git",name,branch,commit} (branch equals outputRef, commit is the exact retained candidate) or {kind:"artefact",name,path,description} (path is relative to the result file directory). Include every required evidence and deliverable name. Store retained artefacts in artefactsDirectory.',
+    'Report each criterion exactly once with fields position (1-based), criterion (exact text), status (met|not_met) and evidence. Commit code to the output ref. A turn ending is not acceptance.'].join('\n\n');
 }

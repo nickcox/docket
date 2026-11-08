@@ -11,6 +11,7 @@ export interface WorkerBinding extends JsonObject {
   specification: JsonObject;
   allocation: Allocation;
   sessionId: string;
+  resultPath: string;
   profileDigest: string;
   owner: { claimId: string; generation: string };
 }
