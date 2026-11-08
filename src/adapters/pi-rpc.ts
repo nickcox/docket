@@ -47,6 +47,7 @@ export class PiRpc {
   readonly exited: Promise<void>;
   exit: { code: number | null; signal: string | null } | undefined;
   failure: Error | undefined;
+  outputClosed = false;
   private pending = new Map<string, Pending>();
   private sequence = 0;
   constructor(options: { executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; maxRecordBytes: number },
@@ -59,7 +60,7 @@ export class PiRpc {
     });
     this.exited = new Promise(resolve => this.child.once('exit', (code, signal) => {
       this.exit = { code, signal };
-      this.fail(new Error('Pi child exited'));
+      this.rejectPending(new Error('Pi child exited'));
       // Descendants can retain the pipes. Their state is not inferred from this exit.
       this.child.stdin.destroy(); this.child.stdout.destroy(); this.child.stderr.destroy();
       resolve();
@@ -85,15 +86,20 @@ export class PiRpc {
     });
     this.child.stdout.on('end', () => {
       try { frames.finish(); } catch (error) { this.fail(error as Error); }
-      if (!this.exit) this.fail(new Error('Pi output closed before child exit'));
+      this.outputClosed = true;
+      this.rejectPending(new Error('Pi output closed'));
     });
   }
   fail(error: Error): void {
     this.failure ??= error;
+    this.rejectPending(error);
+  }
+  private rejectPending(error: Error): void {
     for (const pending of this.pending.values()) pending.reject(error);
   }
   async request(type: string, fields: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
     if (this.failure) throw this.failure;
+    if (this.exit || this.outputClosed) throw new Error('Pi transport is closed');
     const id = `docket-${++this.sequence}`;
     let timer: NodeJS.Timeout | undefined;
     try {

@@ -15,6 +15,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
   const cwd = join(root, 'lease'); await mkdir(cwd);
   const record = join(root, 'peer.jsonl');
   let permitted = false;
+  let admissionHook: (() => Promise<void>) | undefined;
   const profile = { launcher: 'pi', provider: 'synthetic-provider', model: 'exact-model', reasoning: 'high', executionProfile: 'isolated' };
   const binding: WorkerBinding = { databaseId: randomUUID(), contextId: 'test', taskId: 'task', attemptId: randomUUID(),
     sessionId: randomUUID(), profileDigest: 'digest', owner: { claimId: randomUUID(), generation: 'generation' },
@@ -27,8 +28,11 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
     environment: { PATH: process.env.PATH, HOME: root, TMPDIR: tmpdir(), LANG: 'en_AU.UTF-8', HTTP_PROXY: 'http://proxy.invalid',
       HTTPS_PROXY: 'https://proxy.invalid', NO_PROXY: 'localhost', NODE_USE_ENV_PROXY: '1', PROVIDER_KEY: 'synthetic-secret',
       PEER_RECORD: record, PEER_MODE: mode, EXTRA_APPROVED: 'yes', UNAPPROVED: 'no', DOCKET_DATABASE: 'no', ANOTHER_PROVIDER_KEY: 'no' },
-    admit: async (reference, input, effectId, generation) => permitted && reference.sessionId === binding.sessionId
-      && JSON.stringify(input) === JSON.stringify(binding.specification) && effectId === 'activate' && generation === binding.owner.generation,
+    admit: async (reference, input, effectId, generation) => {
+      await admissionHook?.();
+      return permitted && reference.sessionId === binding.sessionId
+        && JSON.stringify(input) === JSON.stringify(binding.specification) && effectId === 'activate' && generation === binding.owner.generation;
+    },
   });
   let reference: WorkerReference | undefined;
   t.after(async () => { if (reference) await launcher.stop(reference, 'cleanup'); await rm(root, { recursive: true, force: true }); });
@@ -36,7 +40,8 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
   if (prepared.status === 'confirmed') reference = prepared.value;
   else if (prepared.status === 'uncertain' && prepared.referenceHints) reference = prepared.referenceHints as WorkerReference;
   const records = async () => (await readFile(record, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  return { launcher, binding, prepared, reference: reference!, records, root, permit: () => { permitted = true; } };
+  return { launcher, binding, prepared, reference: reference!, records, root, permit: () => { permitted = true; },
+    pauseAdmission: (hook: () => Promise<void>) => { admissionHook = hook; } };
 }
 
 test('R31/R35/A14: prepare is non-acting; only matching committed admission sends exactly one protocol-1 prompt', async t => {
@@ -61,6 +66,39 @@ test('R31/R35/A14: prepare is non-acting; only matching committed admission send
   assert.equal((await stat(protocol.questionsDirectory)).isDirectory(), true);
   assert.equal((await f.launcher.prepare(f.binding, 'prepare')).status, 'uncertain');
   assert.equal((await f.records()).filter(r => r.kind === 'spawn').length, 1);
+});
+
+test('R31/R35: concurrent activation consumes only one prompt attempt', async t => {
+  const f = await fixture(t); f.permit();
+  const replies = await Promise.all([1, 2].map(() => f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation')));
+  assert.equal(replies.filter(reply => reply.status === 'confirmed').length, 1);
+  assert.equal((await f.records()).filter(record => record.type === 'prompt').length, 1);
+});
+
+test('R31/R35: concurrent preparation cannot spawn a second child for the same effect or session', async t => {
+  const f = await fixture(t);
+  const binding = { ...f.binding, sessionId: randomUUID() };
+  const replies = await Promise.all([1, 2].map(() => f.launcher.prepare(binding, 'concurrent-prepare')));
+  for (const reply of replies) if (reply.status === 'confirmed') {
+    t.after(async () => { await f.launcher.stop(reply.value, 'cleanup-concurrent'); });
+  }
+  assert.equal(replies.filter(reply => reply.status === 'confirmed').length, 1);
+  assert.equal((await f.launcher.prepare(binding, 'another-effect')).status, 'uncertain');
+  assert.equal((await f.records()).filter(record => record.kind === 'spawn').length, 2);
+});
+
+test('R07/R35: a fence during the admission read prevents even the first prompt', async t => {
+  const f = await fixture(t); f.permit();
+  let reached!: () => void, release!: () => void;
+  const paused = new Promise<void>(resolve => { reached = resolve; });
+  const resume = new Promise<void>(resolve => { release = resolve; });
+  f.pauseAdmission(async () => { reached(); await resume; });
+  const activating = f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation');
+  await paused;
+  try { assert.equal((await f.launcher.fence(f.reference, 'fence')).status, 'confirmed'); }
+  finally { release(); }
+  assert.equal((await activating).status, 'uncertain');
+  assert.equal((await f.records()).filter(record => record.type === 'prompt').length, 0);
 });
 
 for (const mode of ['lost-ack', 'wrong-ack']) test(`R35/A15: ${mode} is uncertain and never resends the prompt`, async t => {
@@ -120,7 +158,7 @@ test('R31/R33/R35: exact cwd/provider/model, controlled resources and environmen
     credentialVariable: 'PROVIDER_KEY', passEnvironment: ['DOCKET_ANYTHING'] } }, admit: async () => true }), /environment/);
 });
 
-for (const mode of ['crash', 'malformed', 'oversized']) test(`R35/A17: ${mode} cannot be mistaken for completion`, async t => {
+for (const mode of ['crash', 'malformed', 'oversized', 'malformed-with-result']) test(`R35/A17: ${mode} cannot be mistaken for completion`, async t => {
   const f = await fixture(t, mode); f.permit();
   assert.equal((await f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation')).status, 'uncertain');
   const observation = await f.launcher.inspect(f.reference);
@@ -132,7 +170,12 @@ for (const mode of ['crash', 'malformed', 'oversized']) test(`R35/A17: ${mode} c
     assert.equal(exited.status, 'known');
     if (exited.status === 'known') { assert.equal(exited.terminal, true); assert.equal(exited.exit?.code, 17); }
   } else assert.equal(observation.status, 'unknown');
-  assert.equal((await f.launcher.result(f.reference)).status, 'uncertain');
+  assert.equal((await f.launcher.result(f.reference)).status, 'rejected');
+  await f.launcher.fence(f.reference, 'failure-fence');
+  const terminal = await f.launcher.inspect(f.reference);
+  assert.equal(terminal.status, 'known');
+  if (terminal.status === 'known') { assert.equal(terminal.terminal, true); assert.ok(terminal.failure); }
+  assert.equal((await f.launcher.result(f.reference)).status, 'rejected');
 });
 
 test('R35: model mismatch during preparation retains a reference but sends no prompt', async t => {
@@ -141,7 +184,7 @@ test('R35: model mismatch during preparation retains a reference but sends no pr
   assert.equal((await f.records()).filter(r => r.type === 'prompt').length, 0);
 });
 
-test('R20/R31: usage is session cumulative, including reported zero, and remains available after exit', async t => {
+test('R20/R31: usage is session cumulative and remains available after exit', async t => {
   const f = await fixture(t);
   const first = await f.launcher.usage(f.reference), second = await f.launcher.usage(f.reference);
   assert.equal(first.status, 'reported'); assert.equal(second.status, 'reported');
@@ -151,6 +194,15 @@ test('R20/R31: usage is session cumulative, including reported zero, and remains
   }
   await f.launcher.stop(f.reference, 'stop');
   assert.deepEqual(await f.launcher.usage(f.reference), second);
+});
+test('R20: zero usage is reported, while regressing cumulative usage is unknown', async t => {
+  const zero = await fixture(t, 'zero-usage');
+  const report = await zero.launcher.usage(zero.reference);
+  assert.equal(report.status, 'reported');
+  if (report.status === 'reported') assert.deepEqual(report.metrics, { tokens: 0, cost: 0 });
+  const regressing = await fixture(t, 'regressing-usage');
+  assert.equal((await regressing.launcher.usage(regressing.reference)).status, 'reported');
+  assert.equal((await regressing.launcher.usage(regressing.reference)).status, 'unknown');
 });
 for (const mode of ['missing-usage', 'unsupported-usage']) test(`R20: ${mode} is never reported as zero`, async t => {
   const f = await fixture(t, mode);
@@ -170,6 +222,22 @@ test('R31/R35: result transport refers only to a bounded retained regular file, 
   assert.equal((await f.launcher.result(f.reference)).status, 'rejected');
   await rm(path); await symlink(join(f.root, 'peer.jsonl'), path);
   assert.equal((await f.launcher.result(f.reference)).status, 'rejected');
+});
+
+test('R31: returned references, usage and exit observations cannot mutate owner state', async t => {
+  const f = await fixture(t);
+  const repeated = await f.launcher.prepare(f.binding, 'prepare');
+  assert.equal(repeated.status, 'uncertain');
+  if (repeated.status === 'uncertain') (repeated.referenceHints as WorkerReference).sessionId = 'changed';
+  assert.equal((await f.launcher.inspect(f.reference)).status, 'known');
+  const report = await f.launcher.usage(f.reference);
+  if (report.status === 'reported') report.metrics.tokens = 999999;
+  assert.equal((await f.launcher.usage(f.reference)).status, 'reported');
+  await f.launcher.stop(f.reference, 'stop');
+  const observed = await f.launcher.inspect(f.reference);
+  if (observed.status === 'known' && observed.exit) observed.exit.code = 17;
+  const next = await f.launcher.inspect(f.reference);
+  if (next.status === 'known') { assert.notEqual(next.exit?.code, 17); assert.equal(next.failure, undefined); }
 });
 
 test('R35: optional real Pi prepares without a model request and fences by direct-child exit', {

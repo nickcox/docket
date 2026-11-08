@@ -9,6 +9,7 @@ const mode = process.env.PEER_MODE;
 const log = (value: unknown) => appendFileSync(record, `${JSON.stringify(value)}\n`);
 const emit = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 let active = false;
+let statsReads = 0;
 log({ kind: 'spawn', cwd: process.cwd(), args, environment: process.env });
 let buffered = '';
 process.stdin.setEncoding('utf8');
@@ -31,8 +32,17 @@ function receive(line: string) {
   else if (request.type === 'set_auto_retry') respond();
   else if (request.type === 'get_session_stats') {
     if (mode === 'unsupported-usage') emit({ type: 'response', command: request.type, id: request.id, success: false, error: 'Unknown command: get_session_stats' });
-    else respond(mode === 'missing-usage' ? {} : { tokens: { total: 123 }, cost: 0.004 });
+    else {
+      statsReads++;
+      const zero = mode === 'zero-usage' || (mode === 'regressing-usage' && statsReads > 1);
+      respond(mode === 'missing-usage' ? {} : { tokens: { total: zero ? 0 : 123 }, cost: zero ? 0 : 0.004 });
+    }
   } else if (request.type === 'prompt') {
+    if (mode === 'malformed-with-result') {
+      const protocol = JSON.parse(request.message.split('\n\n')[2]);
+      writeFileSync(protocol.resultPath, JSON.stringify({ version: 1, identity: protocol.identity, outcome: 'completed', summary: 'Must not complete' }));
+      process.stdout.write('{bad json}\n'); return;
+    }
     if (mode === 'crash') process.exit(17);
     if (mode === 'malformed') { process.stdout.write('{bad json}\n'); return; }
     if (mode === 'oversized') { process.stdout.write('x'.repeat(8192)); return; }

@@ -62,12 +62,16 @@ export class PiLauncher implements Launcher {
     }
     this.options = { ...options, profiles: structuredClone(options.profiles), environment: { ...(options.environment ?? process.env) } };
   }
-  capabilities(_profile: JsonObject): LauncherCapabilities { return structuredClone(capabilities); }
+  capabilities(profile: JsonObject): LauncherCapabilities {
+    const supported = profile.launcher === 'pi' && typeof profile.executionProfile === 'string'
+      && Object.hasOwn(this.options.profiles, profile.executionProfile);
+    return { ...structuredClone(capabilities), ...(supported ? {} : { preparation: 'unsupported', admission: false }) };
+  }
   async prepare(input: WorkerBinding, effectId: string): Promise<Result<WorkerReference>> {
     const binding = structuredClone(input);
     const previous = this.preparations.get(effectId);
     if (previous || this.attemptedPreparations.has(effectId) || this.attemptedSessions.has(binding.sessionId)) {
-      return uncertain('Pi preparation already attempted', previous?.reference ?? { sessionId: binding.sessionId, effectId });
+      return uncertain('Pi preparation already attempted', previous ? structuredClone(previous.reference) : { sessionId: binding.sessionId, effectId });
     }
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(binding.sessionId)) return rejected('Invalid Pi session UUID');
     const profile = binding.specification.profile;
@@ -77,7 +81,7 @@ export class PiLauncher implements Launcher {
       || (profile.reasoning !== null && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(String(profile.reasoning)))) {
       return rejected('Invalid Pi worker profile');
     }
-    const execution = this.options.profiles[profile.executionProfile];
+    const execution = Object.hasOwn(this.options.profiles, profile.executionProfile) ? this.options.profiles[profile.executionProfile] : undefined;
     if (!execution) return rejected('Unknown Pi execution profile');
     this.attemptedPreparations.add(effectId);
     this.attemptedSessions.add(binding.sessionId);
@@ -124,7 +128,7 @@ export class PiLauncher implements Launcher {
       worker.prepared = true;
       return confirmed(structuredClone(reference));
     } catch {
-      return uncertain('Pi preparation could not be confirmed', worker?.reference ?? { sessionId: binding.sessionId, effectId });
+      return uncertain('Pi preparation could not be confirmed', worker ? structuredClone(worker.reference) : { sessionId: binding.sessionId, effectId });
     }
   }
   async activate(reference: WorkerReference, storedInput: JsonObject, effectId: string, generation: string): Promise<Result<JsonObject>> {
@@ -146,11 +150,14 @@ export class PiLauncher implements Launcher {
   async inspect(reference: WorkerReference): Promise<WorkerObservation> {
     const worker = this.lookup(reference);
     if (!worker) return { status: 'unknown', reason: 'Pi direct child owner is unavailable' };
-    if (!worker.rpc.exit && worker.rpc.failure) return { status: 'unknown', reason: 'Pi transport failed before an observed child exit' };
+    if (!worker.rpc.exit && (!worker.prepared || worker.rpc.failure || worker.rpc.outputClosed)) {
+      return { status: 'unknown', reason: 'Pi preparation or transport is unconfirmed; child exit not observed' };
+    }
     return { status: 'known', sourceId: String(reference.ownerId), sequence: worker.sequence,
       worker: worker.rpc.exit ? 'stopped' : worker.attempted ? 'active' : 'prepared', turn: worker.turn,
-      terminal: worker.rpc.exit !== undefined, capabilities: this.capabilities({}),
-      ...(worker.rpc.exit ? { exit: worker.rpc.exit } : {}) };
+      terminal: worker.rpc.exit !== undefined, capabilities: this.capabilities(worker.binding.specification.profile as JsonObject),
+      ...(worker.rpc.exit ? { exit: structuredClone(worker.rpc.exit) } : {}),
+      ...(this.failed(worker) ? { failure: 'Pi protocol, model turn or child failed' } : {}) };
   }
   async deliver(_reference: WorkerReference, _message: string, _mode: MessageMode, _effectId: string): Promise<Result<JsonObject>> {
     return rejected('Pi message delivery is unsupported by this single-prompt profile');
@@ -161,13 +168,13 @@ export class PiLauncher implements Launcher {
     worker.fenced = true;
     const exited = await worker.rpc.terminate(this.options.stopMs ?? 5000);
     worker.sequence++;
-    return exited ? confirmed({ terminal: true, exit: worker.rpc.exit! }) : uncertain('Pi child exit not observed', reference);
+    return exited ? confirmed({ terminal: true, exit: structuredClone(worker.rpc.exit!) }) : uncertain('Pi child exit not observed', reference);
   }
   async fence(reference: WorkerReference, effectId: string): Promise<Result<JsonObject>> { return this.stop(reference, effectId); }
   async usage(reference: WorkerReference): Promise<Usage> {
     const worker = this.lookup(reference);
     if (!worker) return { status: 'unknown', reason: 'Pi direct child owner is unavailable' };
-    if (worker.rpc.exit) return worker.usage ?? { status: 'unknown', reason: 'Pi exited without a session usage report' };
+    if (worker.rpc.exit) return worker.usage ? structuredClone(worker.usage) : { status: 'unknown', reason: 'Pi exited without a session usage report' };
     try {
       const stats = await worker.rpc.request('get_session_stats', {}, this.requestMs);
       if (!object(stats) || !object(stats.tokens) || !nonnegative(stats.tokens.total) || !Number.isSafeInteger(stats.tokens.total) || !nonnegative(stats.cost)) {
@@ -177,7 +184,8 @@ export class PiLauncher implements Launcher {
       if (worker.usage?.status === 'reported' && (metrics.tokens < worker.usage.metrics.tokens! || metrics.cost < worker.usage.metrics.cost!)) {
         return { status: 'unknown', reason: 'Pi cumulative usage moved backwards' };
       }
-      return worker.usage = { status: 'reported', sourceId: String(reference.ownerId), sequence: ++worker.sequence, metrics };
+      worker.usage = { status: 'reported', sourceId: String(reference.ownerId), sequence: ++worker.sequence, metrics };
+      return structuredClone(worker.usage);
     } catch (error) {
       return error instanceof PiRpcRejection && error.unsupported
         ? { status: 'unsupported', reason: 'Pi does not support session usage' }
@@ -187,11 +195,16 @@ export class PiLauncher implements Launcher {
   async result(reference: WorkerReference): Promise<Result<{ transport: string; reference: JsonObject }>> {
     const worker = this.lookup(reference);
     if (!worker) return uncertain('Pi result owner is unavailable', reference);
+    if (this.failed(worker)) return rejected('Pi failure prevents a successful result transport');
     try {
       const stat = await lstat(worker.resultPath);
       if (!stat.isFile() || stat.nlink !== 1 || stat.size > 1024 * 1024) return rejected('Invalid Pi result file');
       return confirmed({ transport: 'regular_file', reference: { path: worker.resultPath } });
     } catch { return uncertain('Pi result file is unavailable', reference); }
+  }
+  private failed(worker: Worker): boolean {
+    return worker.rpc.failure !== undefined || (worker.rpc.exit !== undefined
+      && worker.rpc.exit.code !== 0 && !(worker.fenced && worker.rpc.exit.signal !== null));
   }
   private get requestMs(): number { return this.options.requestMs ?? 5000; }
   private lookup(reference: WorkerReference): Worker | undefined {
