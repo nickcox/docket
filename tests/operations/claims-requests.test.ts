@@ -140,7 +140,7 @@ test('R09: effect input, typed target, command linkage and recorded executor are
   assert.deepEqual(snapshot(db), before);
 });
 
-test('R09/A49: only the recorded claim/generation can claim or finish; claimed and uncertain effects block admission', async t => {
+test('R08/R09/A49: only the recorded claim/generation can finish; fresh claimed work does not block admission but uncertainty does', async t => {
   const { db } = await fixture(t);
   const { effect, claim } = await effectFixture(db);
   const [other] = await db.registerClaims([claimInput('other')], actor);
@@ -154,7 +154,7 @@ test('R09/A49: only the recorded claim/generation can claim or finish; claimed a
   assert.equal(claimed.state, 'claimed');
   assert.equal(claimed.claimId, claim.id);
   assert.ok(claimed.claimedAt);
-  assert.deepEqual(db.admissionBlockers(), [{ kind: 'effect', requestId: effect.id, reason: 'claimed' }]);
+  assert.deepEqual(db.admissionBlockers(), []);
   const claimedSnapshot = snapshot(db);
   await assert.rejects(db.claimEffect(effect.id, identity(claim)), conflict);
   for (const executor of wrong) await assert.rejects(db.recordEffectOutcome(effect.id, executor, 'succeeded', { ok: true }), conflict);

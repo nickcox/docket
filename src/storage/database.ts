@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { lstat, open, realpath, statfs, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -12,6 +12,8 @@ import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState
 
 import { claimIdentity, claimInput, heartbeatStatus, text, timestamp } from './claims.ts';
 import type { AdmissionBlocker, Claim, ClaimIdentity, ClaimInput } from './claims.ts';
+import { allocationInput, reservationEvidence, reservationInput, resolveReservationConfig } from './reservations.ts';
+import type { Allocation, Attempt, Reservation, ReservationInput } from './reservations.ts';
 import { commandInput, effectInput } from './requests.ts';
 import type { CommandInput, EffectInput, EffectOutcome, EffectState, EffectTarget, StoredRequest } from './requests.ts';
 
@@ -572,6 +574,177 @@ export class Database {
     return row;
   }
 
+  private decodeAttempt(row: Record<string, unknown>): Attempt {
+    return { id: String(row.id), taskId: String(row.task_id), number: Number(row.number), revision: Number(row.revision),
+      executionOpen: row.execution_open === 1, phase: String(row.phase), launchState: String(row.launch_state),
+      specification: object(JSON.parse(String(row.specification))),
+      allocation: row.allocation === null ? null : object(JSON.parse(String(row.allocation))) as Allocation,
+      leaseState: String(row.lease_state), outcome: row.outcome === null ? null : String(row.outcome) };
+  }
+
+  attempt(id: string): Attempt {
+    text(id);
+    return this.snapshot(() => this.decodeAttempt(this.attemptRow(id)));
+  }
+
+  /** The key comparison precedes selection, policy resolution and all admission decisions. */
+  async reserveAttempt(input: ReservationInput): Promise<Reservation> {
+    reservationInput(input);
+    const value = JSON.parse(json(input)) as ReservationInput;
+    const logicalInput = { taskId: value.taskId ?? null, profile: value.profile ?? null,
+      sourceAttemptId: value.sourceAttemptId ?? null, note: value.note ?? null };
+    const command: CommandInput = { requestKey: value.requestKey, operation: 'attempt.dispatch', caller: value.caller,
+      input: logicalInput, fingerprint: createHash('sha256').update(json(logicalInput)).digest('hex') };
+    return this.write(() => {
+      const previous = this.duplicateRequest(command, 'command');
+      if (previous) {
+        if (!previous.attemptId) throw new StorageError('conflict', 'Dispatch request has no reservation');
+        return { requestId: previous.id, replayed: true, attempt: this.decodeAttempt(this.attemptRow(previous.attemptId)) };
+      }
+      taskActor(value.caller);
+      reservationEvidence(value);
+      if (value.sourceAttemptId !== undefined) throw new StorageError('conflict', 'Continuation is not supported by dispatch');
+      const configured = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+      const genesis = this.db.prepare("SELECT * FROM events WHERE source_key = 'database.initialised'").get();
+      if (!configured || !genesis) throw new StorageError('conflict', 'Missing context identity or configuration');
+      const configEvent = this.decodeEvent(configured), identityEvent = this.decodeEvent(genesis);
+      if (configEvent.payloadVersion !== 1 || identityEvent.payloadVersion !== 1) throw new StorageError('version', 'Unsupported reservation evidence');
+      const identity = identityEvent.payload;
+      text(identity.databaseId); text(identity.contextId);
+      const repository = object(identity.repository);
+      const blockers = this.readAdmissionBlockers(Date.now());
+      if (blockers.length) throw new StorageError('conflict', `Admission blocked: ${json(blockers)}`);
+      const candidates = value.taskId === undefined
+        ? this.db.prepare('SELECT * FROM tasks ORDER BY position').all()
+        : [this.taskRow(value.taskId)];
+      for (const row of candidates) {
+        const task = this.decodeTask(row);
+        const config = resolveReservationConfig(configEvent.payload, task, value.profile);
+        if ((value.expectedConfigRevision !== undefined && value.expectedConfigRevision !== config.revision) ||
+          (value.expectedConfigDigest !== undefined && value.expectedConfigDigest !== config.digest)) throw new StorageError('conflict', 'Configuration changed');
+        const unavailable = task.state !== 'queued' || task.holdReason !== null ||
+          this.db.prepare(`SELECT 1 FROM dependencies JOIN tasks AS blocker ON blocker.id = blocker_id
+            WHERE task_id = ? AND blocker.state <> 'done' LIMIT 1`).get(task.id) ||
+          this.db.prepare("SELECT 1 FROM attempts WHERE task_id = ? AND (execution_open = 1 OR lease_state IN ('held', 'unknown')) LIMIT 1").get(task.id) ||
+          Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE task_id = ?').get(task.id)!.count) >= config.maxAttemptsPerTask;
+        if (unavailable || task.objectiveId !== null) {
+          if (value.taskId !== undefined) throw new StorageError('conflict', task.objectiveId !== null ? 'Objective-linked tasks are not supported' : 'Task is not eligible for reservation');
+          continue;
+        }
+        if ((value.expectedDefinitionRevision !== undefined && value.expectedDefinitionRevision !== task.definitionRevision) ||
+          (value.expectedDecisionRevision !== undefined && value.expectedDecisionRevision !== task.decisionRevision)) throw new StorageError('conflict', 'Task revision changed');
+        if (Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE execution_open = 1').get()!.count) >= config.maxAttempts) {
+          throw new StorageError('conflict', 'Context attempt capacity reached');
+        }
+        const id = randomUUID(), requestId = randomUUID(), now = new Date().toISOString();
+        const number = Number(this.db.prepare('SELECT coalesce(max(number), 0) + 1 AS number FROM attempts WHERE task_id = ?').get(task.id)!.number);
+        if (!Number.isSafeInteger(number)) throw new StorageError('conflict', 'Attempt number range exhausted');
+        const outputRef = `refs/heads/docket/${identity.databaseId}/${id}`;
+        const holder = { databaseId: identity.databaseId, contextId: identity.contextId, taskId: task.id, attemptId: id };
+        const specification: JsonObject = { version: 1, ...holder, number, task: object(task),
+          definitionRevision: task.definitionRevision, decisionRevision: task.decisionRevision, criteria: task.criteria,
+          objectiveId: null, delivery: object({ ...value.delivery, baseRef: config.baseBranch, startingCommit: value.startingCommit, outputBranch: outputRef }),
+          baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit: value.startingCommit,
+          repository, workspace: { holder, path: join(config.poolRoot, String(identity.databaseId), id), pool: config.poolRoot },
+          profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
+          finalisation: config.finalisation, checks: value.checks,
+          configuration: { revision: config.revision, digest: config.digest, sourceEventId: configEvent.id } };
+        this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, created_at)
+          VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?)`).run(requestId, command.requestKey, command.operation,
+            json(command.caller), command.fingerprint, json(command.input), now);
+        this.db.prepare(`INSERT INTO attempts (id, task_id, number, phase, specification, output_ref, created_at)
+          VALUES (?, ?, ?, 'reserved', ?, ?, ?)`).run(id, task.id, number, json(specification), outputRef, now);
+        this.changed(this.db.prepare('UPDATE requests SET attempt_id = ?, revision = revision + 1 WHERE id = ? AND attempt_id IS NULL').run(id, requestId));
+        this.insertEvent({ sourceKey: `attempt.reserved:${id}`, kind: 'attempt.reserved', payloadVersion: 1,
+          correlationId: requestId, actor: value.caller, occurredAt: now, taskId: task.id, attemptId: id, requestId,
+          payload: { specification, request: object(command) } });
+        return { requestId, replayed: false, attempt: this.decodeAttempt(this.attemptRow(id)) };
+      }
+      throw new StorageError('conflict', 'No eligible task');
+    });
+  }
+
+  /** One durable intent per reservation. An existing intent is never permission to call again. */
+  async beginWorkspaceAcquisition(attemptId: string, requestId: string, executor: ClaimIdentity, caller: TaskActor): Promise<{ effect: StoredRequest; claimed: boolean }> {
+    text(attemptId); text(requestId); claimIdentity(executor); taskActor(caller);
+    const expected = { ...executor }, actor = object(caller);
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId), command = this.decodeRequest(this.requestRow(requestId));
+      if (command.category !== 'command' || command.operation !== 'attempt.dispatch' || command.attemptId !== attemptId || json(command.caller) !== json(actor)) {
+        throw new StorageError('conflict', 'Acquisition must match its reservation command and caller');
+      }
+      const existing = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'workspace.acquire'").get(attemptId);
+      if (existing) return { effect: this.decodeRequest(existing), claimed: false };
+      const claim = this.activeClaim(expected);
+      if (json(claim.ownerRef) !== json(actor) || heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh' ||
+        (claim.attemptId !== undefined && claim.attemptId !== attemptId) || claim.objectiveId !== undefined) throw new StorageError('conflict', 'Acquisition executor does not match caller and scope');
+      const blockers = this.readAdmissionBlockers(Date.now());
+      if (blockers.length) throw new StorageError('conflict', `Admission blocked: ${json(blockers)}`);
+      if (attempt.phase !== 'reserved' || attempt.launch_state !== 'pending' || attempt.allocation !== null || attempt.lease_state !== 'none') throw new StorageError('conflict', 'Attempt is not reserved');
+      const specification = object(JSON.parse(String(attempt.specification)));
+      const input = { workspace: specification.workspace!, repository: specification.repository!, outputRef: specification.outputRef!, startingCommit: specification.startingCommit! };
+      const id = randomUUID(), now = new Date().toISOString();
+      this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, parent_id, attempt_id, caller,
+        fingerprint, input, target, state, claim_id, created_at, claimed_at)
+        VALUES (?, ?, 'effect', 'workspace.acquire', ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)`)
+        .run(id, `workspace.acquire:${attemptId}`, requestId, attemptId, json(actor), createHash('sha256').update(json(input)).digest('hex'),
+          json(input), json({ kind: 'workspace', reference: specification.workspace }), claim.id, now, now);
+      const effect = this.decodeRequest(this.requestRow(id));
+      this.storageEvent('request.claimed', actor, { request: object(effect), generation: expected.generation }, id);
+      return { effect, claimed: true };
+    });
+  }
+
+  /** Allocation and effect confirmation are one write-once fact, with both explanatory events. */
+  async recordAllocation(attemptId: string, effectId: string, executor: ClaimIdentity, allocation: Allocation): Promise<Allocation> {
+    text(attemptId); text(effectId); claimIdentity(executor); allocationInput(allocation);
+    const expected = { ...executor }, value = object(allocation) as Allocation;
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId), effect = this.decodeRequest(this.requestRow(effectId));
+      if (effect.operation !== 'workspace.acquire' || effect.attemptId !== attemptId || effect.claimId !== expected.claimId ||
+        this.claimRow(expected.claimId).generation !== expected.generation) throw new StorageError('conflict', 'Allocation effect identity mismatch');
+      if (attempt.allocation !== null) {
+        const recorded = object(JSON.parse(String(attempt.allocation))) as Allocation;
+        if (json(recorded) !== json(value) || effect.state !== 'succeeded') throw new StorageError('conflict', 'Allocation is immutable');
+        return recorded;
+      }
+      this.effectExecutor(effect, expected);
+      if (effect.state !== 'claimed' || attempt.phase !== 'reserved' || attempt.lease_state !== 'none') throw new StorageError('conflict', 'Acquisition is not awaiting confirmation');
+      const spec = object(JSON.parse(String(attempt.specification))), workspace = object(spec.workspace);
+      if (json(value.holder) !== json(workspace.holder) || value.path !== workspace.path || value.pool !== workspace.pool ||
+        json(value.repository) !== json(spec.repository) || value.outputRef !== spec.outputRef || value.startingCommit !== spec.startingCommit) throw new StorageError('conflict', 'Allocation does not match specification');
+      this.changed(this.db.prepare(`UPDATE attempts SET allocation = ?, lease_id = ?, lease_state = 'held', phase = 'allocated', revision = revision + 1
+        WHERE id = ? AND allocation IS NULL AND phase = 'reserved' AND revision = ?`).run(json(value), value.leaseId, attemptId, Number(attempt.revision)));
+      this.changed(this.db.prepare("UPDATE requests SET state = 'succeeded', result = ?, revision = revision + 1 WHERE id = ? AND state = 'claimed' AND revision = ?")
+        .run(json({ allocation: value }), effectId, effect.revision));
+      this.insertEvent({ sourceKey: `attempt.allocated:${attemptId}`, kind: 'attempt.allocated', payloadVersion: 1,
+        correlationId: effectId, actor: effect.caller, occurredAt: new Date().toISOString(), attemptId,
+        taskId: String(attempt.task_id), requestId: effectId, payload: { allocation: value } });
+      this.storageEvent('request.succeeded', effect.caller, { allocation: value }, effectId);
+      return value;
+    });
+  }
+
+  async recordUncertainAcquisition(attemptId: string, effectId: string, executor: ClaimIdentity, evidence: JsonObject): Promise<Attempt> {
+    text(attemptId); text(effectId); claimIdentity(executor);
+    const expected = { ...executor }, proof = object(evidence);
+    if (!Object.keys(proof).length) throw new TypeError('Uncertainty requires evidence');
+    return this.write(() => {
+      const effect = this.effect(effectId, 'claimed'), attempt = this.attemptRow(attemptId);
+      if (effect.operation !== 'workspace.acquire' || effect.attemptId !== attemptId || attempt.allocation !== null) throw new StorageError('conflict', 'Uncertain acquisition identity mismatch');
+      this.effectExecutor(effect, expected);
+      this.changed(this.db.prepare("UPDATE requests SET state = 'uncertain', result = ?, revision = revision + 1 WHERE id = ? AND state = 'claimed' AND revision = ?")
+        .run(json(proof), effectId, effect.revision));
+      this.changed(this.db.prepare("UPDATE attempts SET lease_state = 'unknown', phase = 'needs_resolution', revision = revision + 1 WHERE id = ? AND allocation IS NULL AND revision = ?")
+        .run(attemptId, Number(attempt.revision)));
+      this.insertEvent({ sourceKey: `attempt.acquisition_uncertain:${attemptId}`, kind: 'attempt.acquisition_uncertain', payloadVersion: 1,
+        correlationId: effectId, actor: effect.caller, occurredAt: new Date().toISOString(), attemptId,
+        taskId: String(attempt.task_id), requestId: effectId, payload: { evidence: proof } });
+      this.storageEvent('request.uncertain', effect.caller, { evidence: proof }, effectId);
+      return this.decodeAttempt(this.attemptRow(attemptId));
+    });
+  }
+
   private workerClaim(attemptId: string, claimId: string, host: WorkerHost): void {
     const claim = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
     if (!claim || claim.attempt_id !== attemptId || claim.resource_key !== `worker:${attemptId}`
@@ -1033,17 +1206,23 @@ export class Database {
   /** A consistent context-wide read. Time can block admission, never grant ownership. */
   admissionBlockers(now = Date.now()): AdmissionBlocker[] {
     if (!Number.isFinite(now)) throw new TypeError('Expected a finite observation time');
-    return this.snapshot(() => {
+    return this.snapshot(() => this.readAdmissionBlockers(now));
+  }
+
+  private readAdmissionBlockers(now: number): AdmissionBlocker[] {
       const blockers: AdmissionBlocker[] = [];
       for (const row of this.db.prepare('SELECT * FROM claims WHERE released_at IS NULL ORDER BY resource_key, id').all()) {
         const reason = heartbeatStatus(row.heartbeat_at, now);
         if (reason !== 'fresh') blockers.push({ kind: 'claim', claimId: String(row.id), resourceKey: String(row.resource_key), reason });
       }
-      for (const row of this.db.prepare("SELECT id, state FROM requests WHERE category = 'effect' AND state IN ('claimed', 'uncertain') ORDER BY id").all()) {
-        blockers.push({ kind: 'effect', requestId: String(row.id), reason: row.state as 'claimed' | 'uncertain' });
+      for (const row of this.db.prepare(`SELECT requests.id, requests.state, claims.released_at, claims.heartbeat_at
+        FROM requests LEFT JOIN claims ON claims.id = requests.claim_id
+        WHERE category = 'effect' AND state IN ('claimed', 'uncertain') ORDER BY requests.id`).all()) {
+        if (row.state === 'uncertain' || row.released_at !== null || heartbeatStatus(row.heartbeat_at, now) !== 'fresh') {
+          blockers.push({ kind: 'effect', requestId: String(row.id), reason: row.state as 'claimed' | 'uncertain' });
+        }
       }
       return blockers;
-    });
   }
 
   /** Connection diagnostics; requesting full fsync is not proof that the OS honours it. */
