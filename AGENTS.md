@@ -6,6 +6,12 @@ Docket is built from its [specification](docs/specification/README.md). Read the
 
 Docket succeeds Switchboard, but is not a port of it. Do not read Switchboard's code, tests, documents or history, unless your task names an entry in [reference implementations](docs/reference-implementations.md). In that case, read only the files the entry lists, and check everything you take from them against the specification. Where the two differ, the specification applies.
 
+## Changes to `main`
+
+Never commit directly to `main`. Every change, including documentation, is made on another branch and then integrated by fast-forwarding `main`. Code reaches `main` through a dispatched task: a worker commits to its own output branch, and a person or supervisor integrates it. If you are working in the backing checkout and want to change code, add or update a task instead, unless the person you are working with asks you to make that change directly. Even then, make it on a branch.
+
+Before continuing work that another agent session started, check that the session is stopped and has no queued or scheduled input, such as an automatic retry after a rate limit. Another session resuming the same work will make conflicting changes.
+
 ## Code
 
 - TypeScript on Node.js, at the version in `.node-version`, using `node:sqlite` as the specification assumes.
