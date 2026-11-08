@@ -92,6 +92,31 @@ test("R32/A11 real Treehouse acquire verifies complete allocation and removes pr
   assert.deepEqual(value(await restarted.list()), []);
 });
 
+test("R32 acquisition uses the requested exact commit rather than the backing branch's newer HEAD", async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.repository, "file"), "new main\n"); await f.git("add", "."); await f.git("commit", "-qm", "new main");
+  assert.notEqual(await f.git("rev-parse", "HEAD"), f.request.startingCommit);
+  const allocation = value(await f.workspace.acquire(f.request));
+  assert.equal(allocation.startingCommit, f.request.startingCommit);
+  assert.equal(value(await f.repo.inspectWorkspace(allocation.path)).head, f.request.startingCommit);
+});
+
+test("R31/R32 lost Treehouse return acknowledgement stays uncertain and makes one return attempt", async t => {
+  const f = await fixture(t);
+  const allocation = value(await f.workspace.acquire(f.request));
+  let returns = 0;
+  const run: Runner = async (...args) => {
+    const result = await f.run(...args);
+    if (args[1].includes("return")) { returns++; return { ...result, complete: false, code: null }; }
+    return result;
+  };
+  const workspace = new TreehouseWorkspace({ ...f.options, run });
+  const retention = { references: [{ ref: `refs/heads/${allocation.branch}`, commit: allocation.startingCommit }], artefacts: [], recyclableRoots: [f.poolRoot] };
+  assert.equal((await workspace.returnLease(allocation, { authorised: true, requestId: "return", retention })).status, "uncertain");
+  assert.equal(returns, 1);
+  assert.deepEqual(value(await workspace.inspect(allocation)), { state: "absent" });
+});
+
 test("R32/A11 a changed origin selects another pool and never proves a listed lease absent", async t => {
   const f = await fixture(t);
   const allocation = value(await f.workspace.acquire(f.request));

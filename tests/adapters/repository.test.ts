@@ -62,6 +62,15 @@ test("R32 workspace inspection separates tracked and untracked changes; changed 
   assert.equal(value(await f.repo.compare(f.head, f.base)), false);
 });
 
+test("R32 changed paths retain reverted changes rather than just the final tree difference", async t => {
+  const f = await fixture(t);
+  await f.git("switch", "-q", "output");
+  await f.git("revert", "--no-edit", f.head);
+  const reverted = await f.git("rev-parse", "HEAD");
+  assert.deepEqual(value(await f.repo.changedPaths(f.base, reverted)).sort(), ["file", "new\nfile"].sort());
+  assert.equal(await f.git("diff", "--name-only", f.base, reverted), "");
+});
+
 test("R32 create-only pins and conditional move/delete reject stale expected values and checked-out refs", async t => {
   const f = await fixture(t);
   value(await f.repo.createPinnedRef("refs/heads/pin", f.base));
@@ -197,6 +206,16 @@ test("R32 retention requires exact reachability, clean workspace and regular art
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [join(f.root, "missing")] })).status, "uncertain");
   await writeFile(join(f.path, "untracked"), "work");
   assert.equal((await f.repo.verifyRetention(request)).status, "rejected");
+});
+
+test("R32 retention recognises explicitly pinned non-branch refs and refuses orphaned workspace commits", async t => {
+  const f = await fixture(t);
+  await f.git("switch", "--detach", "-q", f.head);
+  value(await f.repo.conditionalDeleteRef("refs/heads/output", f.head));
+  const request = { references: [] as { ref: string; commit: string }[], artefacts: [], recyclableRoots: [], workspace: f.path };
+  assert.equal((await f.repo.verifyRetention(request)).status, "rejected");
+  value(await f.repo.createPinnedRef("refs/docket/retained", f.head));
+  value(await f.repo.verifyRetention({ ...request, references: [{ ref: "refs/docket/retained", commit: f.head }] }));
 });
 
 test("R32 detached rebase preserves original and accepted refs on success and conflict", async t => {
