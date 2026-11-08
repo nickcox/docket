@@ -692,7 +692,7 @@ export class Database {
         if (Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE execution_open = 1').get()!.count) >= config.maxAttempts) {
           throw new StorageError('conflict', 'Context attempt capacity reached');
         }
-        const id = randomUUID(), requestId = randomUUID(), now = new Date().toISOString();
+        const id = randomUUID(), now = new Date().toISOString();
         const number = Number(this.db.prepare('SELECT coalesce(max(number), 0) + 1 AS number FROM attempts WHERE task_id = ?').get(task.id)!.number);
         if (!Number.isSafeInteger(number)) throw new StorageError('conflict', 'Attempt number range exhausted');
         const outputRef = `refs/heads/docket/${identity.databaseId}/${id}`;
@@ -706,19 +706,16 @@ export class Database {
           profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
           finalisation: config.finalisation, checks: value.checks,
           configuration: { revision: config.revision, digest: config.digest, sourceEventId: configEvent.id } };
-        if (dryRun) return { requestId, replayed: false, skippedTasks, attempt: { id, taskId: task.id, number, revision: 1,
+        if (dryRun) return { requestId: randomUUID(), replayed: false, skippedTasks, attempt: { id, taskId: task.id, number, revision: 1,
           executionOpen: true, phase: 'reserved', launchState: 'pending', specification, allocation: null,
           leaseState: 'none', outcome: null, candidate: null } };
-        this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, created_at)
-          VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?)`).run(requestId, command.requestKey, command.operation,
-            json(command.caller), command.fingerprint, json(command.input), now);
+        const requestId = this.recordCommandInTransaction(command).id;
         this.db.prepare(`INSERT INTO attempts (id, task_id, number, phase, specification, output_ref, created_at)
           VALUES (?, ?, ?, 'reserved', ?, ?, ?)`).run(id, task.id, number, json(specification), outputRef, now);
-        this.changed(this.db.prepare('UPDATE requests SET attempt_id = ?, revision = revision + 1 WHERE id = ? AND attempt_id IS NULL').run(id, requestId));
+        this.bindCommandInTransaction(requestId, id, { skippedTasks });
         this.insertEvent({ sourceKey: `attempt.reserved:${id}`, kind: 'attempt.reserved', payloadVersion: 1,
           correlationId: requestId, actor: value.caller, occurredAt: now, taskId: task.id, attemptId: id, requestId,
           payload: { specification, request: object(command) } });
-        this.db.prepare('UPDATE requests SET result = ? WHERE id = ?').run(json({ skippedTasks }), requestId);
         return { requestId, replayed: false, skippedTasks, attempt: this.decodeAttempt(this.attemptRow(id)) };
       }
       throw new NoEligibleTaskError(skippedTasks);
@@ -745,14 +742,11 @@ export class Database {
       if (attempt.phase !== 'reserved' || attempt.launch_state !== 'pending' || attempt.allocation !== null || attempt.lease_state !== 'none') throw new StorageError('conflict', 'Attempt is not reserved');
       const specification = object(JSON.parse(String(attempt.specification)));
       const input = { workspace: specification.workspace!, repository: specification.repository!, outputRef: specification.outputRef!, startingCommit: specification.startingCommit! };
-      const id = randomUUID(), now = new Date().toISOString();
-      this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, parent_id, attempt_id, caller,
-        fingerprint, input, target, state, claim_id, created_at, claimed_at)
-        VALUES (?, ?, 'effect', 'workspace.acquire', ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)`)
-        .run(id, `workspace.acquire:${attemptId}`, requestId, attemptId, json(actor), createHash('sha256').update(json(input)).digest('hex'),
-          json(input), json({ kind: 'workspace', reference: specification.workspace }), claim.id, now, now);
-      const effect = this.decodeRequest(this.requestRow(id));
-      this.storageEvent('request.claimed', actor, { request: object(effect), generation: expected.generation }, id);
+      const recorded = this.recordEffectInTransaction({ requestKey: `workspace.acquire:${attemptId}`, operation: 'workspace.acquire',
+        parentId: requestId, attemptId, caller: actor, executor: expected,
+        fingerprint: createHash('sha256').update(json(input)).digest('hex'), input,
+        target: { kind: 'workspace', reference: object(specification.workspace) } });
+      const effect = this.claimEffectInTransaction(recorded.id, expected);
       return { effect, claimed: true };
     });
   }
@@ -1229,18 +1223,13 @@ export class Database {
         throw new StorageError('conflict', 'Configuration changed while resolving check policy');
       }
       if (!request) {
-        const id = randomUUID();
-        this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, attempt_id, created_at)
-          VALUES (?, ?, 'command', 'checks.run', ?, ?, ?, '{}', ?, ?)`).run(id, command.requestKey, json(command.caller),
-            command.fingerprint, json({ ...logical, checks: value.checks, profile: value.profile }), value.attemptId, new Date().toISOString());
-        request = this.decodeRequest(this.requestRow(id));
+        request = this.recordCommandInTransaction({ ...command, input: { ...logical, checks: value.checks, profile: value.profile } }, value.attemptId);
       }
       const previous = this.db.prepare(`SELECT * FROM requests WHERE operation = 'checks.run' AND id <> ?
         AND json_extract(input, '$.evidenceKey') = ? AND state IN ('succeeded', 'rejected') ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(request.id, key);
       if (previous && (previous.state === 'succeeded' || value.requestKey === undefined)) {
         const reused = this.decodeRequest(previous);
-        this.db.prepare('UPDATE requests SET state = ?, result = ?, revision = revision + 1 WHERE id = ?')
-          .run(reused.state, json(reused.result), request.id);
+        this.finishPendingCommandInTransaction(request.id, reused.state as 'succeeded' | 'rejected', reused.result!);
         this.storageEvent('checks.reused', value.caller, { evidenceKey: key, sourceRequestId: reused.id, attemptId: value.attemptId }, request.id);
         this.applyCheckOutcome(value.attemptId, reused.result as CheckRunResult);
         return { request: this.decodeRequest(this.requestRow(request.id)), execute: false, executor: null };
@@ -1262,11 +1251,10 @@ export class Database {
       const [claim] = this.registerClaimsInTransaction([{ resourceKey: `checks:${request.id}`, role: 'check_executor',
         attemptId: value.attemptId, generation, ownerRef: object(value.caller), schemaFamily: applicationId,
         schemaVersion, configRevision: this.configRevision(), heartbeatAt: new Date().toISOString() }], value.caller);
-      this.db.prepare("UPDATE requests SET state = 'claimed', claim_id = ?, claimed_at = ?, revision = revision + 1 WHERE id = ?")
-        .run(claim!.id, new Date().toISOString(), request.id);
+      const claimed = this.claimCommandInTransaction(request.id, { claimId: claim!.id, generation });
       this.db.prepare("UPDATE attempts SET phase = 'awaiting_checks', revision = revision + 1 WHERE id = ?").run(value.attemptId);
       this.storageEvent('checks.started', value.caller, { attemptId: value.attemptId, evidenceKey: key }, request.id);
-      return { request: this.decodeRequest(this.requestRow(request.id)), execute: true, executor: { claimId: claim!.id, generation } };
+      return { request: claimed, execute: true, executor: { claimId: claim!.id, generation } };
     });
   }
 
@@ -1861,17 +1849,56 @@ export class Database {
   async recordCommand(input: CommandInput): Promise<StoredRequest> {
     commandInput(input);
     const value: CommandInput = { ...JSON.parse(json(input)) as CommandInput, caller: object(input.caller), input: object(input.input) };
-    return this.write(() => {
-      const previous = this.duplicateRequest(value, 'command');
-      if (previous) return previous;
-      const id = randomUUID();
-      this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, created_at)
-        VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?)`)
-        .run(id, value.requestKey, value.operation, json(value.caller), value.fingerprint, json(value.input), new Date().toISOString());
-      const request = this.decodeRequest(this.requestRow(id));
-      this.storageEvent('request.recorded', value.caller, { request: object(request) }, id);
-      return request;
-    });
+    return this.write(() => this.recordCommandInTransaction(value));
+  }
+
+  private recordCommandInTransaction(input: CommandInput, attemptId?: string): StoredRequest {
+    commandInput(input);
+    const value: CommandInput = { ...JSON.parse(json(input)) as CommandInput, caller: object(input.caller), input: object(input.input) };
+    const previous = this.duplicateRequest(value, 'command');
+    if (previous) return previous;
+    this.validateScope(attemptId, undefined);
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, attempt_id, created_at)
+      VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?, ?)`)
+      .run(id, value.requestKey, value.operation, json(value.caller), value.fingerprint, json(value.input), attemptId ?? null, new Date().toISOString());
+    const request = this.decodeRequest(this.requestRow(id));
+    this.storageEvent('request.recorded', value.caller, { request: object(request) }, id);
+    return request;
+  }
+
+  private pendingCommand(id: string): StoredRequest {
+    const request = this.decodeRequest(this.requestRow(id));
+    if (request.category !== 'command' || request.state !== 'pending') throw new StorageError('conflict', 'Command is not pending');
+    return request;
+  }
+
+  private bindCommandInTransaction(id: string, attemptId: string, result: JsonObject): StoredRequest {
+    const before = this.pendingCommand(id);
+    this.validateScope(attemptId, undefined);
+    this.changed(this.db.prepare(`UPDATE requests SET attempt_id = ?, result = ?, revision = revision + 1
+      WHERE id = ? AND attempt_id IS NULL AND state = 'pending' AND revision = ?`)
+      .run(attemptId, json(result), id, before.revision));
+    return this.decodeRequest(this.requestRow(id));
+  }
+
+  private finishPendingCommandInTransaction(id: string, state: 'succeeded' | 'rejected', result: JsonObject): StoredRequest {
+    const before = this.pendingCommand(id);
+    this.changed(this.db.prepare(`UPDATE requests SET state = ?, result = ?, revision = revision + 1
+      WHERE id = ? AND state = 'pending' AND revision = ?`).run(state, json(result), id, before.revision));
+    return this.decodeRequest(this.requestRow(id));
+  }
+
+  private claimCommandInTransaction(id: string, executor: ClaimIdentity): StoredRequest {
+    const before = this.pendingCommand(id), claim = this.activeClaim(executor);
+    if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh' || json(claim.ownerRef) !== json(before.caller)
+      || (claim.attemptId !== undefined && claim.attemptId !== before.attemptId)
+      || (claim.objectiveId !== undefined && claim.objectiveId !== before.objectiveId)) {
+      throw new StorageError('conflict', 'Command executor does not match caller and scope');
+    }
+    this.changed(this.db.prepare(`UPDATE requests SET state = 'claimed', claim_id = ?, claimed_at = ?, revision = revision + 1
+      WHERE id = ? AND state = 'pending' AND revision = ?`).run(claim.id, new Date().toISOString(), id, before.revision));
+    return this.decodeRequest(this.requestRow(id));
   }
 
   async recordEffect(input: EffectInput): Promise<StoredRequest> {
