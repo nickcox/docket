@@ -22,15 +22,17 @@ export function redactDiagnostics(text: string, secrets: readonly string[] = [])
 export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: readonly string[] = []): CheckRunner {
   const env = Object.fromEntries(Object.entries(environment).filter(([name]) => !name.toUpperCase().startsWith('DOCKET_')));
   return (check, workspace) => new Promise(resolve => {
-    let stdout = '', stderr = '', truncated = false, timedOut = false, spawnFailed = false;
+    let stdout = '', stderr = '', stdoutTruncated = false, stderrTruncated = false, timedOut = false, spawnFailed = false;
     const child = spawn(check.command[0]!, check.command.slice(1), { cwd: workspace, env, shell: false,
       stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const keep = (value: string) => {
-      if (value.length > 65536) truncated = true;
-      return value.slice(0, 65536);
-    };
-    child.stdout.setEncoding('utf8').on('data', (text: string) => { stdout = keep(stdout + text); });
-    child.stderr.setEncoding('utf8').on('data', (text: string) => { stderr = keep(stderr + text); });
+    child.stdout.setEncoding('utf8').on('data', (text: string) => {
+      if (stdout.length + text.length > 65536) stdoutTruncated = true;
+      stdout = (stdout + text).slice(0, 65536);
+    });
+    child.stderr.setEncoding('utf8').on('data', (text: string) => {
+      if (stderr.length + text.length > 65536) stderrTruncated = true;
+      stderr = (stderr + text).slice(0, 65536);
+    });
     child.once('error', () => { spawnFailed = true; });
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, check.timeoutMs);
     // If descendants keep the pipes open, their existence is uncertain, not a pass.
@@ -42,8 +44,12 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
     child.once('close', (code, signal) => {
       clearTimeout(timer); clearTimeout(drain);
       resolve({ status: spawnFailed ? 'not_run' : timedOut ? 'failed' : signal || pipesOpen ? 'uncertain' : code === 0 ? 'passed' : 'failed',
-        exitCode: spawnFailed ? null : code, timedOut, stdout: redactDiagnostics(stdout, secrets).slice(0, 8192),
-        stderr: redactDiagnostics(stderr, secrets).slice(0, 8192), truncated });
+        exitCode: spawnFailed ? null : code, timedOut,
+        // Suppress an overflowing stream rather than retaining a credential cut at the buffer boundary.
+        stdout: stdoutTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stdout, secrets).slice(0, 8192),
+        stderr: stderrTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stderr, secrets).slice(0, 8192),
+        truncated: stdoutTruncated || stderrTruncated,
+        ...(spawnFailed ? { reason: 'Command could not be started' } : {}) });
     });
   });
 }

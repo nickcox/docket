@@ -14,7 +14,7 @@ import { FakeLauncher } from './fake-launcher.ts';
 export const person = { kind: 'person' as const, id: 'operator' };
 export const host: WorkerHost = { kind: 'host', id: 'backend', generation: 'generation-1' };
 export const start = 'a'.repeat(40), head = 'b'.repeat(40);
-export const profile: ExecutionProfile = { id: 'node-v1', tools: { node: '26.7.0' }, dependencies: { lock: 'digest' } };
+export const profile: ExecutionProfile = { id: 'node-v1', tools: { node: '26.7.0' }, dependencies: { lock: 'digest' }, ignoredGeneratedPaths: ['generated'] };
 export const contextChecks: ContextChecks = { executionProfile: profile.id, fast: [], full: [] };
 export const policyContent = JSON.stringify({ version: 1,
   fast: [{ name: 'fast', command: ['fast'], timeoutMs: 1000 }],
@@ -40,7 +40,7 @@ export async function checkFixture(t: TestContext, maximum = 1) {
   const [claim] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch-1', ownerRef: person,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
   const executor = { claimId: claim!.id, generation: claim!.generation };
-  async function attempt(name: string, criteria = ['Criterion'], workspacePath?: string, candidate = head, initial = start, recordedPolicy = policyContent) {
+  async function attempt(name: string, criteria = ['Criterion'], workspacePath?: string, candidate = head, initial = start, recordedPolicy = policyContent, stage: 'prepared' | 'validated' | 'completed' = 'completed') {
     await db.addTask({ id: name, title: name, kind: 'code', criteria }, person);
     const reservation = await db.reserveAttempt({ requestKey: `dispatch:${name}`, taskId: name, caller: person, startingCommit: initial,
       checks: parseCheckPolicy(initial, recordedPolicy, contextChecks),
@@ -66,8 +66,8 @@ export async function checkFixture(t: TestContext, maximum = 1) {
     const observation = (kind: 'terminal' | 'result_available', sequence: number) => ({ sourceId: name, sourceSequence: sequence,
       attemptId: id, workerRef: reference, observedAt: new Date().toISOString(), kind, payloadVersion: 1 as const,
       payload: kind === 'terminal' ? { terminal: true, laterTurnsRefused: true } : {} });
-    await observeWorker(db, observation('result_available', 1), host, retention);
-    await observeWorker(db, observation('terminal', 2), host, retention);
+    if (stage !== 'prepared') await observeWorker(db, observation('result_available', 1), host, retention);
+    if (stage === 'completed') await observeWorker(db, observation('terminal', 2), host, retention);
     return { id, allocation, binding, observation };
   }
   return { db, root, path, options, attempt };

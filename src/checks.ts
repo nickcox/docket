@@ -32,12 +32,15 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
   const commands: JsonObject[] = [];
   let status: 'passed' | 'failed' | 'uncertain' = 'passed';
   const clean = async (): Promise<boolean> => {
-    const state = await services.repository.inspectWorkspace(workspace);
+    const state = await services.repository.inspectWorkspace(workspace, true, services.profile.ignoredGeneratedPaths ?? []);
     return state.status === 'confirmed' && state.value.head === commit && state.value.clean;
   };
   try {
     const repository = await services.repository.identity(), allocated = await services.repository.identity(workspace);
-    if (repository.status !== 'confirmed' || allocated.status !== 'confirmed' || repository.value !== allocated.value || !await clean()) {
+    const recordedPath = (attempt.specification.repository as JsonObject).path;
+    const recorded = typeof recordedPath === 'string' ? await services.repository.identity(recordedPath) : repository;
+    if (repository.status !== 'confirmed' || allocated.status !== 'confirmed' || recorded.status !== 'confirmed'
+      || repository.value !== allocated.value || repository.value !== recorded.value || !await clean()) {
       status = 'failed';
       commands.push({ status: 'not_run', reason: 'Workspace is not clean at the candidate in the expected repository' });
     } else {
@@ -53,7 +56,8 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
           }
           const result = await services.run(check, workspace);
           const unchanged = await clean();
-          const commandStatus = result.status === 'uncertain' ? 'uncertain' : !unchanged ? 'failed' : result.status;
+          const commandStatus = result.status === 'uncertain' ? 'uncertain'
+            : !unchanged || result.timedOut || (result.status === 'passed' && result.exitCode !== 0) ? 'failed' : result.status;
           commands.push({ kind, name: check.name, definition: check, ...result, status: commandStatus,
             ...(unchanged ? {} : { reason: 'Command changed the workspace or candidate' }) });
           if (commandStatus !== 'passed') status = commandStatus === 'uncertain' ? 'uncertain' : 'failed';

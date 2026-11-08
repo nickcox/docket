@@ -1229,6 +1229,17 @@ export class Database {
       const request = this.decodeRequest(this.requestRow(requestId)), claim = this.activeClaim(executor);
       if (request.operation !== 'checks.run' || request.state !== 'claimed' || request.claimId !== claim.id
         || request.input.evidenceKey !== value.evidenceKey) throw new StorageError('conflict', 'Check executor or evidence mismatch');
+      if (value.status === 'passed') {
+        const checks = object(request.input.checks);
+        const expected = [...(checks.fast as JsonObject[]).map(definition => ({ kind: 'fast', definition })),
+          ...(checks.full as JsonObject[]).map(definition => ({ kind: 'full', definition }))];
+        if (!Array.isArray(value.commands) || value.commands.length !== expected.length
+          || expected.some((check, index) => {
+            const command = value.commands[index]!;
+            return command.kind !== check.kind || json(command.definition) !== json(check.definition)
+              || command.status !== 'passed' || command.exitCode !== 0 || command.timedOut !== false;
+          })) throw new StorageError('conflict', 'A pass requires every mandatory command to have passed');
+      }
       const state = value.status === 'passed' ? 'succeeded' : value.status === 'failed' ? 'rejected' : 'uncertain';
       this.db.prepare('UPDATE requests SET state = ?, result = ?, revision = revision + 1 WHERE id = ?').run(state, json(value), requestId);
       if (value.status !== 'uncertain') {

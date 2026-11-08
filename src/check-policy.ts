@@ -8,6 +8,7 @@ export interface ExecutionProfile extends JsonObject {
   id: string;
   tools: JsonObject;
   dependencies: JsonObject;
+  ignoredGeneratedPaths?: string[];
 }
 export interface CheckPolicy extends TrustedChecks {
   present: boolean;
@@ -65,8 +66,14 @@ export function mandatoryChecks(recorded: TrustedChecks, current: TrustedChecks)
     fast: unique([...recorded.fast, ...current.fast]), full: unique([...recorded.full, ...current.full]) };
 }
 export function checkEvidenceKey(repository: JsonObject, candidate: string, criteria: string[], checks: TrustedChecks, profile: ExecutionProfile): string {
-  if (!profile.id?.trim() || !profile.tools || !profile.dependencies) throw new TypeError('Expected declared profile identity and versions');
-  const definitions = { fast: checks.fast, full: checks.full };
-  return digest({ repository, candidate, criteriaDigest: digest(criteria), definitions, definitionsDigest: digest(definitions),
+  object(profile, ['id', 'tools', 'dependencies', 'ignoredGeneratedPaths']);
+  if (profile.ignoredGeneratedPaths !== undefined && (!Array.isArray(profile.ignoredGeneratedPaths)
+    || profile.ignoredGeneratedPaths.some(path => typeof path !== 'string' || !path || path.startsWith('/')
+      || path.includes('\\') || path.split('/').includes('..')))) throw new TypeError('Invalid ignored generated paths');
+  if (typeof profile.id !== 'string' || !profile.id.trim() || !profile.tools || !profile.dependencies
+    || Array.isArray(profile.tools) || Array.isArray(profile.dependencies)
+    || typeof profile.tools !== 'object' || typeof profile.dependencies !== 'object') throw new TypeError('Expected declared profile identity and versions');
+  const checkDefinitions = { fast: definitions(checks.fast), full: definitions(checks.full) };
+  return digest({ repository, candidate, criteriaDigest: digest(criteria), definitions: checkDefinitions, definitionsDigest: digest(checkDefinitions),
     policyDigest: checks.digest, executionProfile: profile });
 }

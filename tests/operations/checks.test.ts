@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { confirmed, uncertain } from '../../src/adapters/command.ts';
 import type { CheckCommandResult } from '../../src/adapters/checks.ts';
@@ -6,7 +7,9 @@ import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
 import type { CheckServices } from '../../src/checks.ts';
 import { Database } from '../../src/storage/database.ts';
-import { checkFixture, contextChecks, head, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
+import { reserveWithTrustedChecks } from '../../src/attempts.ts';
+import { observeWorker } from '../../src/workers.ts';
+import { checkFixture, contextChecks, head, host, person, policyContent, profile, retention, start } from '../helpers/check-attempt.ts';
 
 const passed: CheckCommandResult = { status: 'passed', exitCode: 0, timedOut: false, stdout: '', stderr: '', truncated: false };
 function fakeServices() {
@@ -21,7 +24,49 @@ function fakeServices() {
     dirty: () => { clean = false; }, move: () => { candidate = start; } };
 }
 
-test('R16: terminal/result gate, fast then full serial order, successful evidence reuse and unchanged target policy', async t => {
+test('R15: trusted reservation freezes target checks and provenance; replay does not reread policy', async t => {
+  const f = await checkFixture(t), fake = fakeServices();
+  await f.db.addTask({ id: 'task', title: 'Task' }, person);
+  const input = { requestKey: 'trusted-reservation', taskId: 'task', caller: person, startingCommit: start,
+    delivery: { kind: 'code' as const, acceptance: 'review_or_integration' as const, requiredEvidence: [], requiredDeliverables: [] } };
+  const reserved = await reserveWithTrustedChecks(f.db, input, fake.services.repository);
+  assert.deepEqual(reserved.attempt.specification.checks, parseCheckPolicy(start, policyContent, contextChecks));
+  fake.services.repository.readCheckPolicy = async () => { throw new Error('Policy no longer readable'); };
+  const replay = await reserveWithTrustedChecks(f.db, input, fake.services.repository);
+  assert.equal(replay.attempt.id, reserved.attempt.id); assert.equal(replay.replayed, true);
+});
+
+test('R16: missing terminal or validated result evidence refuses without starting commands', async t => {
+  for (const stage of ['prepared', 'validated'] as const) {
+    const f = await checkFixture(t), a = await f.attempt('task', ['Criterion'], undefined, head, start, policyContent, stage);
+    const fake = fakeServices();
+    await assert.rejects(runCandidateChecks(f.db, a.id, person, fake.services), /recorded candidate/);
+    await assert.rejects(f.db.beginChecks({ attemptId: a.id, commit: head, checks: parseCheckPolicy(start, policyContent, contextChecks), profile, caller: person }), /terminal worker/);
+    assert.deepEqual(fake.calls, []);
+    assert.equal(f.db.claims().filter(claim => claim.role === 'check_executor').length, 0);
+  }
+});
+
+test('R16: the worker observation path runs checks only after validated output and terminal evidence meet', async t => {
+  const f = await checkFixture(t), a = await f.attempt('task', ['Criterion'], undefined, head, start, policyContent, 'validated');
+  const fake = fakeServices();
+  const terminal = a.observation('terminal', 2);
+  await observeWorker(f.db, terminal, host, retention, { caller: person, services: fake.services });
+  assert.deepEqual(fake.calls, ['fast', 'full']);
+  await observeWorker(f.db, terminal, host, retention, { caller: person, services: fake.services });
+  assert.deepEqual(fake.calls, ['fast', 'full']);
+});
+
+test('R15/R16: an explicit empty check set verifies the workspace and records a pass without removing acceptance hold', async t => {
+  const empty = JSON.stringify({ version: 1, fast: [], full: [] });
+  const f = await checkFixture(t), a = await f.attempt('task', ['Criterion'], undefined, head, start, empty), fake = fakeServices();
+  fake.policy(null);
+  const result = await runCandidateChecks(f.db, a.id, person, fake.services);
+  assert.equal(result.state, 'succeeded'); assert.deepEqual(result.result!.commands, []);
+  assert.deepEqual(fake.calls, []); assert.equal(f.db.task('task').holdReason, 'awaiting_acceptance');
+});
+
+test('R16: fast then full serial order, successful evidence reuse and unchanged target policy', async t => {
   const f = await checkFixture(t), a = await f.attempt('task'), fake = fakeServices();
   const first = await runCandidateChecks(f.db, a.id, person, fake.services);
   assert.equal(first.state, 'succeeded'); assert.deepEqual(fake.calls, ['fast', 'full']);
@@ -103,6 +148,25 @@ test('R16: two database connections admit only one full run, show waiting and ad
   release(); await first;
   assert.equal((await runCandidateChecks(other, b.id, person, fake.services)).state, 'succeeded');
   assert.equal(maximum, 1); assert.deepEqual(fake.calls, ['fast', 'full', 'fast', 'full']);
+});
+
+test('R16: killing a separate executor process preserves its durable request and check slot', async t => {
+  const f = await checkFixture(t), a = await f.attempt('one'), b = await f.attempt('two', ['Other criterion']);
+  const databaseModule = new URL('../../src/storage/database.ts', import.meta.url).href;
+  const input = { attemptId: a.id, commit: head, checks: parseCheckPolicy(start, policyContent, contextChecks), profile, caller: person };
+  const script = `import { Database } from ${JSON.stringify(databaseModule)};
+    const db = await Database.open(${JSON.stringify(f.path)}, ${JSON.stringify(f.options)});
+    const admission = await db.beginChecks(${JSON.stringify(input)});
+    process.stdout.write(JSON.stringify(admission), () => process.kill(process.pid, 'SIGKILL'));`;
+  const killed = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(killed.error, undefined); assert.notEqual(killed.status, 0);
+  const admission = JSON.parse(killed.stdout);
+  assert.equal(admission.execute, true);
+  assert.equal(f.db.request(admission.request.id).state, 'claimed');
+  const fake = fakeServices();
+  assert.equal((await runCandidateChecks(f.db, b.id, person, fake.services)).state, 'pending');
+  assert.deepEqual(fake.calls, []);
+  assert.equal(f.db.claims().filter(value => value.role === 'check_executor' && !value.releasedAt).length, 1);
 });
 
 test('R16: a killed or interrupted executor remains uncertain and keeps its concurrency slot, even with a new request', async t => {

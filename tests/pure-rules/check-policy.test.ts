@@ -21,7 +21,8 @@ test('R15: exact evidence identity excludes policy source commit, credentials an
   const policy = parseCheckPolicy(start, policyContent, contextChecks);
   const key = checkEvidenceKey(repository, head, ['criterion'], policy, profile);
   assert.equal(checkEvidenceKey(repository, head, ['criterion'], { ...policy, sourceCommit: head }, profile), key);
-  assert.equal(checkEvidenceKey(repository, head, ['criterion'], policy, { dependencies: profile.dependencies, tools: profile.tools, id: profile.id }), key);
+  assert.equal(checkEvidenceKey(repository, head, ['criterion'], policy, { ignoredGeneratedPaths: profile.ignoredGeneratedPaths!, dependencies: profile.dependencies, tools: profile.tools, id: profile.id }), key);
+  assert.throws(() => checkEvidenceKey(repository, head, ['criterion'], policy, { ...profile, environment: { TOKEN: 'credential' } }), /Malformed/);
   const changes = [
     checkEvidenceKey({ path: '/other' }, head, ['criterion'], policy, profile),
     checkEvidenceKey(repository, start, ['criterion'], policy, profile),

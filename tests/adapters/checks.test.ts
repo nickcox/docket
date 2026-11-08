@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -53,6 +54,7 @@ test('R15: Git reads exact target content without checkout; worker changes canno
   const before = await git('rev-parse', 'HEAD');
   const trusted = await repo.readCheckPolicy('refs/heads/main', contextChecks);
   assert.equal(trusted.sourceCommit, source); assert.equal(trusted.full.length, 1);
+  assert.equal(trusted.sourceDigest, createHash('sha256').update(original).digest('hex')); 
   assert.equal(await git('rev-parse', 'HEAD'), before); assert.equal((await repo.inspectWorkspace(root)).status, 'confirmed');
   assert.equal(await readFile(join(root, '.docket/checks.json'), 'utf8'), '{"version":1,"fast":[],"full":[]}');
   await writeFile(join(root, '.docket/checks.json'), '{bad'); await git('commit', '-am', 'Bad policy');
@@ -60,8 +62,8 @@ test('R15: Git reads exact target content without checkout; worker changes canno
   await assert.rejects(repo.readCheckPolicy('refs/heads/missing', contextChecks), /target/);
 });
 
-test('R16/A35: candidate checks with real Git fail tracked and untracked mutations and allow ignored generated files', async t => {
-  for (const mutation of ['tracked', 'untracked', 'ignored', 'timeout', 'unstartable']) {
+test('R16/A35: candidate checks with real Git fail tracked/untracked mutations and hidden index entries, allowing ignored generated files', async t => {
+  for (const mutation of ['tracked', 'untracked', 'ignored', 'timeout', 'unstartable', 'hidden-index']) {
     const f = await checkFixture(t);
     const workspace = join(f.root, 'pool', 'repository'); await mkdir(workspace, { recursive: true });
     const repo = new GitRepository({ repository: workspace });
@@ -77,6 +79,7 @@ test('R16/A35: candidate checks with real Git fail tracked and untracked mutatio
     await git('add', '.'); await git('commit', '-m', 'Base'); const base = await git('rev-parse', 'HEAD');
     await git('switch', '-c', 'worker'); await writeFile(join(workspace, 'file'), 'candidate'); await git('commit', '-am', 'Candidate');
     const candidate = await git('rev-parse', 'HEAD');
+    if (mutation === 'hidden-index') await git('update-index', '--assume-unchanged', 'file');
     const a = await f.attempt('task', ['Criterion'], workspace, candidate, base, content);
     const result = await runCandidateChecks(f.db, a.id, person, { profile, repository: repo, run: checkCommandRunner(environment) });
     assert.equal(result.state, mutation === 'ignored' ? 'succeeded' : 'rejected', mutation);

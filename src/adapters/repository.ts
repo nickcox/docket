@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { lstat, open, realpath } from "node:fs/promises";
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute, matchesGlob, relative } from "node:path";
 import { commandRunner, confirmed, gitEnvironment, isCommit, isRef, rejected, uncertain } from "./command.ts";
 import type { Command, Result, Runner } from "./command.ts";
 import { parseCheckPolicy } from '../check-policy.ts';
@@ -60,15 +60,29 @@ export class GitRepository {
     const entry = await this.command(['ls-tree', '-z', sourceCommit, '--', '.docket/checks.json']);
     if (!entry.complete || entry.code !== 0) throw new Error('Trusted check policy cannot be read');
     if (entry.stdout === '') return parseCheckPolicy(sourceCommit, null, context);
-    if (!/^100644 blob [a-f0-9]+\t\.docket\/checks\.json\0$/.test(entry.stdout)) throw new Error('Check policy must be a regular file');
+    if (!/^100(?:644|755) blob [a-f0-9]+\t\.docket\/checks\.json\0$/.test(entry.stdout)) throw new Error('Check policy must be a regular file');
     const content = await this.command(['show', `${sourceCommit}:.docket/checks.json`]);
     if (!content.complete || content.code !== 0) throw new Error('Trusted check policy cannot be read');
     return parseCheckPolicy(sourceCommit, content.stdout, context);
   }
-  async inspectWorkspace(path: string): Promise<Result<WorkspaceState>> {
+  async inspectWorkspace(path: string, forChecks = false, ignoredGeneratedPaths: readonly string[] = []): Promise<Result<WorkspaceState>> {
     const head = await this.command(["rev-parse", "--verify", "HEAD^{commit}"], path);
     const branch = await this.command(["symbolic-ref", "--quiet", "HEAD"], path);
-    const status = await this.command(["status", "--porcelain=v1", "-z", "--untracked-files=all"], path);
+    const status = await this.command(forChecks
+      ? ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none']
+      : ["status", "--porcelain=v1", "-z", "--untracked-files=all"], path);
+    if (forChecks) {
+      const files = await this.command(['ls-files', '-v', '-z'], path);
+      if (!files.complete || files.code !== 0 || (files.stdout !== '' && !files.stdout.endsWith('\0'))) return uncertain('Check index could not be read');
+      if (files.stdout.split('\0').filter(Boolean).some(entry => /^[a-zS]/.test(entry))) {
+        return rejected('Check workspace has assume-unchanged or skip-worktree entries');
+      }
+      const ignored = await this.command(['ls-files', '--others', '--ignored', '--exclude-standard', '-z'], path);
+      if (!ignored.complete || ignored.code !== 0 || (ignored.stdout !== '' && !ignored.stdout.endsWith('\0'))) return uncertain('Ignored check output could not be read');
+      const undeclared = ignored.stdout.split('\0').filter(Boolean).filter(file => !ignoredGeneratedPaths.some(pattern =>
+        file === pattern || file.startsWith(pattern.endsWith('/') ? pattern : `${pattern}/`) || matchesGlob(file, pattern)));
+      if (undeclared.length) return rejected('Workspace has ignored files not allowed by the execution profile');
+    }
     if (!head.complete || head.code !== 0 || !isCommit(head.stdout.trim()) || !branch.complete || ![0, 1].includes(branch.code!) || !status.complete || status.code !== 0) return uncertain("Workspace could not be read", { head, branch, status });
     if (branch.code === 0 && !isRef(branch.stdout.trim())) return uncertain("Malformed workspace branch", branch);
     const uncommitted: string[] = [], untracked: string[] = [];

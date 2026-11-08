@@ -1,5 +1,5 @@
 import type { JsonObject } from './storage/database.ts';
-import { Database } from './storage/database.ts';
+import { Database, StorageError } from './storage/database.ts';
 import type { ClaimIdentity } from './storage/claims.ts';
 import type { Allocation, Reservation, ReservationInput } from './storage/reservations.ts';
 import type { GitRepository } from './adapters/repository.ts';
@@ -26,17 +26,25 @@ export async function reserveWithTrustedChecks(db: Database, input: Omit<Reserva
     return db.reserveAttempt({ ...input, checks: {} as ReservationInput['checks'] });
   }
   const config = db.checkConfiguration();
+  if ((input.expectedConfigRevision !== undefined && input.expectedConfigRevision !== config.revision)
+    || (input.expectedConfigDigest !== undefined && input.expectedConfigDigest !== config.digest)) {
+    throw new StorageError('conflict', 'Configuration changed');
+  }
   const target = config.targetBranch.startsWith('refs/') ? config.targetBranch : `refs/heads/${config.targetBranch}`;
   const checks = await repository.readCheckPolicy(target, config.checks);
   return db.reserveAttempt({ ...input, checks, expectedConfigRevision: config.revision, expectedConfigDigest: config.digest });
 }
 
 /** No provider or filesystem work occurs under a SQLite transaction. Replays only inspect progress. */
+export function reserveAndAllocate(db: Database, input: ReservationInput, executor: ClaimIdentity, provider: WorkspaceProvider): Promise<Reservation>;
+export function reserveAndAllocate(db: Database, input: Omit<ReservationInput, 'checks'>, executor: ClaimIdentity,
+  provider: WorkspaceProvider, repository: Pick<GitRepository, 'readCheckPolicy'>): Promise<Reservation>;
 export async function reserveAndAllocate(
-  db: Database, input: ReservationInput, executor: ClaimIdentity, provider: WorkspaceProvider,
+  db: Database, input: ReservationInput | Omit<ReservationInput, 'checks'>, executor: ClaimIdentity, provider: WorkspaceProvider,
+  repository?: Pick<GitRepository, 'readCheckPolicy'>,
 ): Promise<Reservation> {
   const caller = { ...input.caller }, identity = { ...executor };
-  const reservation = await db.reserveAttempt(input);
+  const reservation = repository ? await reserveWithTrustedChecks(db, input, repository) : await db.reserveAttempt(input as ReservationInput);
   if (reservation.replayed) return reservation;
   const { effect, claimed } = await db.beginWorkspaceAcquisition(reservation.attempt.id, reservation.requestId, identity, caller);
   if (!claimed) return { ...reservation, attempt: db.attempt(reservation.attempt.id) };
