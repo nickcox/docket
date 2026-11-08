@@ -165,9 +165,41 @@ test('R04/R29: named revisions and missing or invalid policy refuse without reco
     assert.deepEqual(snapshot(db, path), before);
   }
   seed.prepare("UPDATE events SET payload = ? WHERE kind = 'context.configured'").run(JSON.stringify(original.payload));
-  await assert.rejects(db.reserveAttempt({ ...input(), profile: 'unknown' }), /Unknown/);
+  await assert.rejects(db.reserveAttempt({ ...input(), profile: 'unknown' }), /not configured/);
   await assert.rejects(db.reserveAttempt({ ...input(), checks: { ...input().checks, sourceCommit: 'not-a-commit' } }), /commit/);
   assert.equal(db.requests().length, 0);
+});
+
+test('R29: task profile validation refuses add and update atomically, naming the field and configured names', async t => {
+  const { db, path } = await fixture(t);
+  await add(db, 'one');
+  const before = snapshot(db, path);
+  for (const profile of ['missing', 'toString']) {
+    await assert.rejects(add(db, 'bad', profile), /Profile.*not configured.*alternate, worker/);
+    await assert.rejects(db.updateTaskDefinition('one', { title: 'Changed', profile }, actor), /Profile.*not configured/);
+    assert.deepEqual(snapshot(db, path), before);
+  }
+});
+
+test('R04/R29: automatic reservation skips a removed task profile, with identical dry-run and replay reasons', async t => {
+  const { db, path } = await fixture(t);
+  await add(db, 'removed', 'alternate'); await add(db, 'next');
+  using seed = new DatabaseSync(path);
+  const event = db.events().find(e => e.kind === 'context.configured')!;
+  const resolved = event.payload.resolved as JsonObject;
+  delete (resolved.profiles as JsonObject).alternate;
+  seed.prepare("UPDATE events SET payload = ? WHERE kind = 'context.configured'").run(JSON.stringify(event.payload));
+  const before = snapshot(db, path);
+  await assert.rejects(db.reserveAttempt(input('named', 'removed')), /Profile "alternate" is not configured/);
+  const plan = await db.reserveAttempt(input(), true);
+  assert.equal(plan.attempt.taskId, 'next');
+  assert.deepEqual(plan.skippedTasks, [{ taskId: 'removed', reason: 'Profile "alternate" is not configured. Configured names: worker.' }]);
+  assert.deepEqual(snapshot(db, path), before);
+  const reserved = await db.reserveAttempt(input());
+  assert.equal(reserved.attempt.taskId, 'next');
+  assert.deepEqual(reserved.skippedTasks, plan.skippedTasks);
+  assert.deepEqual((await db.reserveAttempt(input())).skippedTasks, plan.skippedTasks);
+  assert.equal(db.task('removed').state, 'queued');
 });
 
 test('R04: objective-linked tasks refuse by name and automatic selection skips them', async t => {

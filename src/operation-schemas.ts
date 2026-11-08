@@ -33,7 +33,10 @@ function outputSchema(name: string): JsonSchema {
     capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
     blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
   const variants: JsonSchema[] = [object({ steps })];
-  if (name === 'attempt.dispatch') variants.push(object({ taskId: id, steps }), object({ attempt: view, steps }), object({ attempt: view, replayed: bool, steps }));
+  if (name === 'attempt.dispatch') {
+    const skippedTasks = { type: 'array', items: object({ taskId: id, reason: string }) };
+    variants.push(object({ taskId: id, skippedTasks, steps }), object({ attempt: view, skippedTasks, steps }), object({ attempt: view, replayed: bool, skippedTasks, steps }));
+  }
   else if (name.startsWith('attempt.')) variants.push(object({ attempt: view, steps }));
   else if (name === 'claim.resolve') variants.push(object({ steps, scope: view }), object({ claim: view, steps, scope: view }));
   else if (name === 'effect.resolve') variants.push(object({ steps, target: nullable(view) }), object({ effect: view, steps, target: nullable(view) }));

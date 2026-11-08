@@ -21,7 +21,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const replay = await db.reserveAttempt({ requestKey, caller, ...(args.taskId === null ? {} : { taskId: args.taskId }),
       ...(args.profile === null ? {} : { profile: args.profile }), startingCommit: '', checks: {} as ReservationInput['checks'],
       delivery: {} as ReservationInput['delivery'] }, args.dryRun);
-    return { attempt: replay.attempt, replayed: true, steps: [] };
+    return { attempt: replay.attempt, replayed: true, skippedTasks: replay.skippedTasks, steps: [] };
   }
   const config = db.checkConfiguration();
   const configured = db.events().findLast(e => e.kind === 'context.configured')!.payload.resolved as JsonObject;
@@ -46,10 +46,10 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   const steps = ['attempt.reserve', 'workspace.acquire', 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
     'worker.activate', 'worker.wait', 'worker.fence', 'attempt.complete', 'checks.run'].map(operation => step(operation, task.id,
       operation === 'attempt.reserve' ? ['ready', 'capacity', 'resolved_owners'] : ['current_authority'], operation === 'checks.run'));
-  if (args.dryRun) return { taskId: task.id, steps };
+  if (args.dryRun) return { taskId: task.id, skippedTasks: preview.skippedTasks, steps };
   progress('attempt.reserve');
   const reservation = await db.reserveAttempt(input);
-  if (reservation.replayed) return { attempt: reservation.attempt, replayed: true, steps: [] };
+  if (reservation.replayed) return { attempt: reservation.attempt, replayed: true, skippedTasks: reservation.skippedTasks, steps: [] };
   const id = reservation.attempt.id;
   const generation = randomUUID(), host: WorkerHost = { kind: 'host', id: `cli:${process.pid}:${randomUUID()}`, generation };
   const [claim] = await db.registerClaims([{ resourceKey: `dispatch:${id}`, role: 'maintenance', generation, ownerRef: caller,
@@ -150,7 +150,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       }
       if (checks.state === 'uncertain' || checks.state === 'claimed') throw new CommandFailure('effect_uncertain', { attemptId: id, checksRequestId: checks.id });
     }
-    return { attempt: db.attempt(id), steps };
+    return { attempt: db.attempt(id), skippedTasks: reservation.skippedTasks, steps };
   } finally {
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
     // A failed preparation can still own a non-acting child. Stop it using its

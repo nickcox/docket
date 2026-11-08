@@ -18,7 +18,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const options = { location: { retainedRoot: root, recyclableRoots: [] }, retryMs: 1000 };
   const db = await Database.initialise(path, { contextId: 'tasks', repository: { identity: 'example' },
     stateDirectory: root, createdBy: person,
-    configuration: { revision: 1, resolved: {}, digest: 'test', provenance: {} } }, options);
+    configuration: { revision: 1, resolved: { profiles: { worker: {}, other: {} } }, digest: 'test', provenance: {} } }, options);
   t.after(async () => db.close());
   return { db, path, options };
 }

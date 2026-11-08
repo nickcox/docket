@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { configuration } from '../fixtures/configuration.ts';
 import { Database, applicationId } from '../../src/storage/database.ts';
+import { DatabaseSync } from 'node:sqlite';
+import { parseConfiguration } from '../../src/configuration.ts';
 import { userInfo } from 'node:os';
 import { findOperation } from '../../src/catalog.ts';
 import { validateSchema } from '../../src/operation-schemas.ts';
@@ -59,6 +61,49 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
   return { home, repo, git, config, invoke, file };
 }
 const definition = { title: 'Implement feature', instructions: 'Implement the feature', criteria: ['Works'], kind: 'code', profile: null };
+
+test('R29/R04/R27: unknown profiles refuse definitions, automatic dispatch reports skips and status explains the repair', async t => {
+  const f = await fixture(t);
+  assert.equal(f.invoke('task.add', { id: 'removed', definition: { ...definition, profile: 'worker' }, objectiveId: null }).status, 0);
+  assert.equal(f.invoke('task.add', { id: 'next', definition, objectiveId: null }).status, 0);
+  const before = await snapshot(f.home);
+  for (const [operation, args] of [
+    ['task.add', { id: 'invalid', definition: { ...definition, profile: 'absent' }, objectiveId: null }],
+    ['task.update', { taskId: 'next', expectedRevision: 1, definition: { ...definition, title: 'Changed', profile: 'absent' } }],
+  ] as const) {
+    const refused = f.invoke(operation, args);
+    assert.equal(refused.envelope.code, 'invalid_input');
+    assert.equal(refused.data.field, 'profile');
+    assert.deepEqual(refused.data.configuredNames, ['worker']);
+    assert.deepEqual(await snapshot(f.home), before);
+  }
+  // Simulate a quiescent configuration change removing the task's chosen profile.
+  const changed = { ...f.config, profiles: { replacement: f.config.profiles.worker }, defaultProfile: 'replacement',
+    profileByKind: { code: 'replacement', report: 'replacement', review: 'replacement' } };
+  await writeFile(f.file, JSON.stringify(changed));
+  const parsed = await parseConfiguration(JSON.stringify(changed));
+  using seed = new DatabaseSync(f.config.databasePath);
+  const row = seed.prepare("SELECT payload FROM events WHERE kind = 'context.configured'").get()!;
+  seed.prepare("UPDATE events SET payload = ? WHERE kind = 'context.configured'").run(JSON.stringify({ ...JSON.parse(String(row.payload)), ...parsed }));
+  const stable = await snapshot(f.home);
+  const named = f.invoke('attempt.dispatch', { taskId: 'removed', profile: null, dryRun: false });
+  assert.equal(named.envelope.code, 'invalid_input');
+  const plan = f.invoke('attempt.dispatch', { taskId: null, profile: null, dryRun: true });
+  assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
+  assert.equal(plan.data.taskId, 'next');
+  assert.equal(plan.data.skippedTasks[0].taskId, 'removed');
+  assert.match(plan.data.skippedTasks[0].reason, /worker.*not configured/);
+  const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  const task = status.data.tasks.items.find((item: { id: string }) => item.id === 'removed');
+  assert.equal(task.reason, plan.data.skippedTasks[0].reason);
+  assert.match(task.nextAction.description, /Add the profile to the configuration, or change the task's profile/);
+  assert.deepEqual(await snapshot(f.home), stable);
+  const dispatched = f.invoke('attempt.dispatch', { taskId: null, profile: null, dryRun: false }, 'automatic');
+  assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope));
+  assert.equal(dispatched.data.attempt.taskId, 'next');
+  assert.deepEqual(dispatched.data.skippedTasks, plan.data.skippedTasks);
+  assert.deepEqual(f.invoke('attempt.dispatch', { taskId: null, profile: null, dryRun: false }, 'automatic').data.skippedTasks, plan.data.skippedTasks);
+});
 
 test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-merge and returns its lease', async t => {
   const f = await fixture(t);

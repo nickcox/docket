@@ -58,6 +58,7 @@ export interface Attempt {
 export interface Reservation {
   requestId: string;
   replayed: boolean;
+  skippedTasks: { taskId: string; reason: string }[];
   attempt: Attempt;
 }
 export interface ResolvedReservationConfig {

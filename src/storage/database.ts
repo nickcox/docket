@@ -20,6 +20,7 @@ import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState
 import { claimIdentity, claimInput, heartbeatStatus, text, timestamp } from './claims.ts';
 import type { AdmissionBlocker, Claim, ClaimIdentity, ClaimInput } from './claims.ts';
 import { allocationInput, reservationEvidence, reservationInput, resolveReservationConfig } from './reservations.ts';
+import { requireProfile, unknownProfile, UnknownProfileError } from '../profiles.ts';
 import type { Allocation, Attempt, Reservation, ReservationInput } from './reservations.ts';
 import { commandInput, effectInput } from './requests.ts';
 import type { CommandInput, EffectInput, EffectOutcome, EffectState, EffectTarget, StoredRequest } from './requests.ts';
@@ -37,6 +38,14 @@ export class StorageError extends Error {
     super(message);
     this.code = code;
     this.name = 'StorageError';
+  }
+}
+
+export class NoEligibleTaskError extends StorageError {
+  readonly skippedTasks: { taskId: string; reason: string }[];
+  constructor(skippedTasks: { taskId: string; reason: string }[]) {
+    super('conflict', 'No eligible task');
+    this.skippedTasks = skippedTasks;
   }
 }
 
@@ -474,12 +483,18 @@ export class Database {
     });
   }
 
+  private currentTaskConfiguration(): JsonObject {
+    const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+    return row ? this.decodeEvent(row).payload.resolved as JsonObject : {};
+  }
+
   async addTask(input: AddTaskInput, actor: TaskActor, command?: CommandInput): Promise<Task> {
     addTaskInput(input);
     taskActor(actor);
     const value = JSON.parse(json(input)) as AddTaskInput;
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
+      requireProfile(this.currentTaskConfiguration(), value.profile);
       let id = value.id;
       if (id === undefined) {
         const base = taskSlug(value.title);
@@ -510,6 +525,7 @@ export class Database {
       if ((before.kind !== 'review' && value.kind === 'review') || (before.kind === 'review'
         && ((value.kind !== undefined && value.kind !== before.kind) || (value.criteria !== undefined && json(value.criteria) !== json(before.criteria))
           || (value.instructions !== undefined && value.instructions !== before.instructions)))) throw new StorageError('conflict', 'Linked review definition cannot change');
+      requireProfile(this.currentTaskConfiguration(), value.profile);
       const after = { ...before, ...value };
       if (json(before) === json(after)) return before;
       this.changed(this.db.prepare(`UPDATE tasks SET title = ?, instructions = ?, criteria = ?, kind = ?,
@@ -629,7 +645,8 @@ export class Database {
       const previous = this.duplicateRequest(command, 'command');
       if (previous) {
         if (!previous.attemptId) throw new StorageError('conflict', 'Dispatch request has no reservation');
-        return { requestId: previous.id, replayed: true, attempt: this.decodeAttempt(this.attemptRow(previous.attemptId)) };
+        return { requestId: previous.id, replayed: true, skippedTasks: (previous.result?.skippedTasks ?? []) as { taskId: string; reason: string }[],
+          attempt: this.decodeAttempt(this.attemptRow(previous.attemptId)) };
       }
       taskActor(value.caller);
       reservationEvidence(value);
@@ -647,9 +664,14 @@ export class Database {
       const candidates = value.taskId === undefined
         ? this.db.prepare('SELECT * FROM tasks ORDER BY position').all()
         : [this.taskRow(value.taskId)];
+      const resolved = configEvent.payload.resolved as JsonObject;
+      requireProfile(resolved, value.profile);
+      const skippedTasks: { taskId: string; reason: string }[] = [];
       for (const row of candidates) {
         const task = this.decodeTask(row);
-        const config = resolveReservationConfig(configEvent.payload, task, value.profile);
+        const problem = unknownProfile(resolved, task.profile);
+        if (problem && value.taskId !== undefined) throw new UnknownProfileError(problem);
+        const config = resolveReservationConfig(configEvent.payload, problem ? { ...task, profile: null } : task, value.profile);
         if ((value.expectedConfigRevision !== undefined && value.expectedConfigRevision !== config.revision) ||
           (value.expectedConfigDigest !== undefined && value.expectedConfigDigest !== config.digest)) throw new StorageError('conflict', 'Configuration changed');
         const unavailable = task.state !== 'queued' || task.holdReason !== null ||
@@ -659,6 +681,10 @@ export class Database {
           Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE task_id = ?').get(task.id)!.count) >= config.maxAttemptsPerTask;
         if (unavailable || task.objectiveId !== null) {
           if (value.taskId !== undefined) throw new StorageError('conflict', task.objectiveId !== null ? 'Objective-linked tasks are not supported' : 'Task is not eligible for reservation');
+          continue;
+        }
+        if (problem) {
+          skippedTasks.push({ taskId: task.id, reason: problem.reason });
           continue;
         }
         if ((value.expectedDefinitionRevision !== undefined && value.expectedDefinitionRevision !== task.definitionRevision) ||
@@ -680,7 +706,7 @@ export class Database {
           profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
           finalisation: config.finalisation, checks: value.checks,
           configuration: { revision: config.revision, digest: config.digest, sourceEventId: configEvent.id } };
-        if (dryRun) return { requestId, replayed: false, attempt: { id, taskId: task.id, number, revision: 1,
+        if (dryRun) return { requestId, replayed: false, skippedTasks, attempt: { id, taskId: task.id, number, revision: 1,
           executionOpen: true, phase: 'reserved', launchState: 'pending', specification, allocation: null,
           leaseState: 'none', outcome: null, candidate: null } };
         this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, created_at)
@@ -692,9 +718,10 @@ export class Database {
         this.insertEvent({ sourceKey: `attempt.reserved:${id}`, kind: 'attempt.reserved', payloadVersion: 1,
           correlationId: requestId, actor: value.caller, occurredAt: now, taskId: task.id, attemptId: id, requestId,
           payload: { specification, request: object(command) } });
-        return { requestId, replayed: false, attempt: this.decodeAttempt(this.attemptRow(id)) };
+        this.db.prepare('UPDATE requests SET result = ? WHERE id = ?').run(json({ skippedTasks }), requestId);
+        return { requestId, replayed: false, skippedTasks, attempt: this.decodeAttempt(this.attemptRow(id)) };
       }
-      throw new StorageError('conflict', 'No eligible task');
+      throw new NoEligibleTaskError(skippedTasks);
     };
     return dryRun ? this.snapshot(build) : this.write(build);
   }

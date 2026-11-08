@@ -4,7 +4,7 @@ import { canonicalJson, ConfigurationError } from './configuration.ts';
 import { initialiseContext, openContext } from './context.ts';
 import type { ContextOptions, ContextSelector } from './context.ts';
 import type { OperationDefinition } from './catalog.ts';
-import { Database, StorageError } from './storage/database.ts';
+import { Database, StorageError, NoEligibleTaskError } from './storage/database.ts';
 import type { JsonObject } from './storage/database.ts';
 import type { Task, TaskActor, TaskDefinition } from './storage/tasks.ts';
 import type { CommandInput } from './storage/requests.ts';
@@ -15,6 +15,7 @@ import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptanc
 import { CommandFailure } from './response.ts';
 import { known } from './operation-utils.ts';
 import { step } from './plans.ts';
+import { unknownProfile, UnknownProfileError } from './profiles.ts';
 
 export interface OperationOptions extends ContextOptions {
   runtime?: typeof createRuntime;
@@ -44,6 +45,8 @@ function attemptView(db: Database, id: string) {
 function mapStorage(error: unknown, db: Database, requestKey: string): never {
   const request = db.requests().find(r => r.requestKey === requestKey);
   const data = request ? { requestId: requestKey, attemptId: request.attemptId } : {};
+  if (error instanceof UnknownProfileError) throw new CommandFailure('invalid_input', { ...data, ...error.details });
+  if (error instanceof NoEligibleTaskError) throw new CommandFailure('not_ready', { ...data, skippedTasks: error.skippedTasks });
   if (error instanceof ConfigurationError) throw error;
   if (error instanceof CommandFailure) throw new CommandFailure(error.code, { ...data, ...error.data });
   if (error instanceof OwnerReadError) throw new CommandFailure('owner_unknown', data);
@@ -85,9 +88,11 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         const action = (operation: string, args: Record<string, unknown>, description: string) => ({ operation, args, description });
         const tasks = db.tasks().map(t => {
           const ready = db.readyTasks().some(task => task.id === t.id);
+          const problem = t.state === 'queued' ? unknownProfile(context.configuration.resolved, t.profile) : null;
           return { id: t.id, title: t.title, state: t.state, ready, holdReason: t.holdReason, blockedBy: t.blockerIds,
-            reason: t.holdReason ?? (ready ? 'Task is ready to dispatch.' : null),
-            nextAction: t.holdReason !== null ? action('task.show', { taskId: t.id }, 'Inspect the task hold before deciding how to proceed.')
+            reason: problem?.reason ?? t.holdReason ?? (ready ? 'Task is ready to dispatch.' : null),
+            nextAction: problem ? action('task.show', { taskId: t.id }, 'Add the profile to the configuration, or change the task\'s profile.')
+              : t.holdReason !== null ? action('task.show', { taskId: t.id }, 'Inspect the task hold before deciding how to proceed.')
               : ready ? action('attempt.dispatch', { taskId: t.id, profile: null, dryRun: true }, 'Plan dispatch of the ready task.') : null };
         }).filter(t => !args.attentionOnly || t.reason !== null);
         const requests = db.requests();
