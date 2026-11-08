@@ -5,6 +5,8 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } from './tasks.ts';
+import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState } from './tasks.ts';
 
 export const applicationId = 0x444b5431;
 export const schemaVersion = 1;
@@ -365,6 +367,196 @@ export class Database {
     eventContent(event, true);
     return event;
   }
+
+  private taskRow(id: string): Record<string, unknown> {
+    const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+    if (!row) throw new StorageError('conflict', `Unknown task: ${id}`);
+    return row;
+  }
+
+  private decodeTask(row: Record<string, unknown>): Task {
+    return { id: String(row.id), title: String(row.title), instructions: String(row.instructions),
+      criteria: JSON.parse(String(row.criteria)) as string[], kind: row.kind as TaskKind,
+      profile: row.profile === null ? null : String(row.profile),
+      objectiveId: row.objective_id === null ? null : String(row.objective_id),
+      position: Number(row.position), state: row.state as TaskState,
+      holdReason: row.hold_reason === null ? null : String(row.hold_reason),
+      definitionRevision: Number(row.definition_revision), decisionRevision: Number(row.decision_revision),
+      blockerIds: this.db.prepare('SELECT blocker_id FROM dependencies WHERE task_id = ? ORDER BY blocker_id')
+        .all(String(row.id)).map(item => String(item.blocker_id)) };
+  }
+
+  private snapshot<T>(read: () => T): T {
+    this.db.exec('BEGIN');
+    try {
+      this.verifyVersion();
+      const result = read();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) { if (this.db.isTransaction) this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  task(id: string): Task {
+    taskText(id);
+    return this.snapshot(() => this.decodeTask(this.taskRow(id)));
+  }
+
+  tasks(): Task[] {
+    return this.snapshot(() => this.db.prepare('SELECT * FROM tasks ORDER BY position').all().map(row => this.decodeTask(row)));
+  }
+
+  readyTasks(): Task[] {
+    return this.snapshot(() => this.db.prepare(`SELECT * FROM tasks AS task
+      WHERE state = 'queued' AND hold_reason IS NULL AND NOT EXISTS
+        (SELECT 1 FROM dependencies JOIN tasks AS blocker ON blocker.id = blocker_id
+         WHERE task_id = task.id AND blocker.state <> 'done')
+      ORDER BY position`).all().map(row => this.decodeTask(row)));
+  }
+
+  private taskEvent(operation: string, actor: TaskActor, taskId: string | undefined, payload: JsonObject): void {
+    const actionId = randomUUID();
+    this.insertEvent({ sourceKey: `action:${actionId}`, kind: 'action.recorded', payloadVersion: 1,
+      correlationId: actionId, actor, occurredAt: new Date().toISOString(),
+      ...(taskId === undefined ? {} : { taskId }),
+      payload: { actionId, operation, person: actor.id, membershipBefore: null, membershipAfter: null,
+        classification: null, ...payload } });
+  }
+
+  private changed(result: { changes: number | bigint }): void {
+    if (Number(result.changes) !== 1) throw new StorageError('conflict', 'Task changed since it was read');
+  }
+
+  private insertBlocker(taskId: string, blockerId: string): boolean {
+    this.taskRow(taskId);
+    this.taskRow(blockerId);
+    if (taskId === blockerId) throw new StorageError('conflict', 'A task cannot block itself');
+    const cycle = this.db.prepare(`WITH RECURSIVE blockers(id) AS
+      (SELECT blocker_id FROM dependencies WHERE task_id = ? UNION
+       SELECT blocker_id FROM dependencies JOIN blockers ON task_id = blockers.id)
+      SELECT 1 FROM blockers WHERE id = ?`).get(blockerId, taskId);
+    if (cycle) throw new StorageError('conflict', 'Blocker would create a cycle');
+    if (this.db.prepare('SELECT 1 FROM dependencies WHERE task_id = ? AND blocker_id = ?').get(taskId, blockerId)) return false;
+    this.db.prepare('INSERT INTO dependencies (task_id, blocker_id) VALUES (?, ?)').run(taskId, blockerId);
+    return true;
+  }
+
+  async addTask(input: AddTaskInput, actor: TaskActor): Promise<Task> {
+    addTaskInput(input);
+    taskActor(actor);
+    const value = JSON.parse(json(input)) as AddTaskInput;
+    const person = object(actor) as TaskActor;
+    return this.write(() => {
+      let id = value.id;
+      if (id === undefined) {
+        const base = taskSlug(value.title);
+        id = base;
+        for (let suffix = 2; this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(id); suffix++) id = `${base}-${suffix}`;
+      }
+      const position = Number(this.db.prepare('SELECT coalesce(max(position), 0) + 1 AS position FROM tasks').get()!.position);
+      this.db.prepare(`INSERT INTO tasks (id, title, instructions, criteria, kind, profile, objective_id, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, value.title, value.instructions ?? '', json(value.criteria ?? []),
+        value.kind ?? 'code', value.profile ?? null, value.objectiveId ?? null, position);
+      for (const blockerId of value.blockerIds ?? []) this.insertBlocker(id, blockerId);
+      const task = this.decodeTask(this.taskRow(id));
+      this.taskEvent('task.add', person, id, { after: object(task) });
+      return task;
+    });
+  }
+
+  async updateTaskDefinition(id: string, patch: Partial<TaskDefinition>, actor: TaskActor): Promise<Task> {
+    taskText(id);
+    taskDefinition(patch);
+    taskActor(actor);
+    const value = JSON.parse(json(patch)) as Partial<TaskDefinition>;
+    const person = object(actor) as TaskActor;
+    return this.write(() => {
+      const before = this.decodeTask(this.taskRow(id));
+      const after = { ...before, ...value };
+      if (json(before) === json(after)) return before;
+      this.changed(this.db.prepare(`UPDATE tasks SET title = ?, instructions = ?, criteria = ?, kind = ?,
+        profile = ?, objective_id = ?, definition_revision = definition_revision + 1
+        WHERE id = ? AND definition_revision = ?`).run(after.title, after.instructions, json(after.criteria),
+        after.kind, after.profile, after.objectiveId, id, before.definitionRevision));
+      const task = this.decodeTask(this.taskRow(id));
+      this.taskEvent('task.update', person, id, { before: object(before), after: object(task) });
+      return task;
+    });
+  }
+
+  async addBlocker(taskId: string, blockerId: string, actor: TaskActor): Promise<Task> {
+    taskText(taskId); taskText(blockerId); taskActor(actor);
+    const person = object(actor) as TaskActor;
+    return this.write(() => {
+      if (this.insertBlocker(taskId, blockerId)) this.taskEvent('task.block', person, taskId, { blockerId });
+      return this.decodeTask(this.taskRow(taskId));
+    });
+  }
+
+  async removeBlocker(taskId: string, blockerId: string, actor: TaskActor): Promise<Task> {
+    taskText(taskId); taskText(blockerId); taskActor(actor);
+    const person = object(actor) as TaskActor;
+    return this.write(() => {
+      this.taskRow(taskId); this.taskRow(blockerId);
+      const result = this.db.prepare('DELETE FROM dependencies WHERE task_id = ? AND blocker_id = ?').run(taskId, blockerId);
+      if (Number(result.changes) !== 0) this.taskEvent('task.unblock', person, taskId, { blockerId });
+      return this.decodeTask(this.taskRow(taskId));
+    });
+  }
+
+  /** A complete permutation avoids ambiguous partial-order edits. */
+  async reorderTasks(ids: readonly string[], actor: TaskActor): Promise<Task[]> {
+    taskIds(ids); taskActor(actor);
+    const order = [...ids];
+    const person = object(actor) as TaskActor;
+    return this.write(() => {
+      const before = this.db.prepare('SELECT id, position FROM tasks ORDER BY position').all();
+      if (before.length !== order.length || before.some(row => !order.includes(String(row.id)))) {
+        throw new StorageError('conflict', 'Reorder must name every task exactly once');
+      }
+      if (before.every((row, index) => row.id === order[index])) return before.map(row => this.decodeTask(this.taskRow(String(row.id))));
+      // Move above the old range first, preserving positive unique positions throughout.
+      const offset = Math.max(...before.map(row => Number(row.position)));
+      if (!Number.isSafeInteger(offset + order.length)) throw new StorageError('conflict', 'Task position range exhausted');
+      const move = this.db.prepare('UPDATE tasks SET position = ? WHERE id = ? AND position = ?');
+      for (let index = 0; index < before.length; index++) {
+        const row = before[index]!;
+        this.changed(move.run(offset + index + 1, String(row.id), Number(row.position)));
+      }
+      for (let index = 0; index < order.length; index++) {
+        const oldIndex = before.findIndex(row => row.id === order[index]);
+        this.changed(move.run(index + 1, order[index]!, offset + oldIndex + 1));
+      }
+      this.taskEvent('task.reorder', person, undefined, { before: before.map(row => String(row.id)), after: order });
+      return order.map(id => this.decodeTask(this.taskRow(id)));
+    });
+  }
+
+  private async decideTask(id: string, operation: 'hold' | 'release' | 'done' | 'reopen', actor: TaskActor, reason?: string): Promise<Task> {
+    taskText(id); taskActor(actor);
+    const person = object(actor) as TaskActor;
+    return this.write(() => {
+      const before = this.decodeTask(this.taskRow(id));
+      const state = operation === 'done' ? 'done' : operation === 'reopen' ? 'queued' : before.state;
+      const holdReason = operation === 'hold' ? reason! : operation === 'release' ? null : before.holdReason;
+      if (state === before.state && holdReason === before.holdReason) return before;
+      this.changed(this.db.prepare(`UPDATE tasks SET state = ?, hold_reason = ?, decision_revision = decision_revision + 1
+        WHERE id = ? AND state = ? AND decision_revision = ?`).run(state, holdReason, id, before.state, before.decisionRevision));
+      const task = this.decodeTask(this.taskRow(id));
+      this.taskEvent(`task.${operation}`, person, id, { before: object(before), after: object(task),
+        ...(operation === 'done' ? { judgement: 'person' } : {}) });
+      return task;
+    });
+  }
+
+  holdTask(id: string, reason: string, actor: TaskActor): Promise<Task> {
+    taskText(reason);
+    if ([...reason].length > 200 || /[\r\n\u2028\u2029]/u.test(reason)) throw new TypeError('Hold reason must be one line of at most 200 characters');
+    return this.decideTask(id, 'hold', actor, reason);
+  }
+
+  releaseTask(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'release', actor); }
+  markTaskDone(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'done', actor); }
+  reopenTask(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'reopen', actor); }
 
   /** Connection diagnostics; requesting full fsync is not proof that the OS honours it. */
   settings(): { journalMode: string; foreignKeys: number; synchronous: number; busyTimeout: number; fullfsync: number; checkpointFullfsync: number } {
