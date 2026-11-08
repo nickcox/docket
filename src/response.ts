@@ -26,6 +26,13 @@ export interface Envelope {
 // Messages are fixed, rather than copied from parser, filesystem or runtime errors.
 // Those errors can contain credentials, input contents or environment values.
 const failures = {
+  invalid_configuration: { exit: 2, message: "Invalid context configuration.", retryable: false },
+  context_registered: { exit: 1, message: "The context name is already registered.", retryable: false },
+  database_not_empty: { exit: 1, message: "Initialisation requires an empty database path.", retryable: false },
+  context_mismatch: { exit: 1, message: "Context identity or storage does not match.", retryable: false },
+  config_changed: { exit: 1, message: "Configuration differs from the recorded digest or revision. Restore the file or explicitly configure the context.", retryable: false },
+  storage_busy: { exit: 1, message: "Context storage is busy.", retryable: true },
+  not_initialised: { exit: 1, message: "The context is not initialised.", retryable: false },
   invalid_input: { exit: 2, message: "Invalid arguments or input at $. Use catalog show --json to inspect the supported operations.", retryable: false },
   unknown_operation: { exit: 2, message: "Unknown operation. Use catalog show --json to inspect the supported operations.", retryable: false },
   unsupported_version: { exit: 2, message: "The requested contract version is not supported.", retryable: false },
@@ -73,7 +80,7 @@ export function successEnvelope(operation: string, requestId: string | null, dat
     operation,
     requestId,
     outcome: "succeeded",
-    code: "catalog_shown",
+    code: operation === "context.init" ? "context_initialised" : "catalog_shown",
     data,
     diagnostics: [],
     nextAction: null,

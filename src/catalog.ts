@@ -1,3 +1,7 @@
+import { initialiseContext } from './context.ts';
+import type { ContextSelector } from './context.ts';
+import { CommandFailure } from './response.ts';
+
 export type Role = "person" | "supervisor" | "worker" | "host";
 export type JsonSchema = Readonly<Record<string, unknown>>;
 
@@ -44,6 +48,26 @@ export const catalogue: { readonly catalogueVersion: 1; readonly operations: rea
   catalogueVersion: 1,
   operations: [
     {
+      name: "context.init",
+      description: "Initialise an empty context and register its configuration file.",
+      inputSchema: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object", properties: {}, required: [], additionalProperties: false,
+      },
+      roles: ["person"], bindingDerivedFields: [], mutates: true, plans: false,
+      outputSchema: {
+        type: "object", additionalProperties: false,
+        required: ["contextId", "databaseId", "configurationFile", "stateDirectory", "databasePath", "poolRoot", "digest", "revision"],
+        properties: {
+          contextId: { type: "string" }, databaseId: { type: "string", format: "uuid" },
+          configurationFile: { type: "string" }, stateDirectory: { type: "string" },
+          databasePath: { type: "string" }, poolRoot: { type: "string" },
+          digest: { type: "string" }, revision: { type: "integer", const: 1 },
+        },
+      },
+      tool: { name: "dk_context_init", description: "Initialise an empty context and register its configuration file." },
+    },
+    {
       name: "catalog.show",
       description,
       inputSchema: {
@@ -78,8 +102,12 @@ export function findOperation(name: string): OperationDefinition | undefined {
   return catalogue.operations.find((operation) => operation.name === name);
 }
 
-export function executeOperation(operation: OperationDefinition): Record<string, unknown> {
+export function executeOperation(operation: OperationDefinition, _args?: Record<string, unknown>, _progress?: (message: string) => void,
+  selector?: ContextSelector): Record<string, unknown> | Promise<Record<string, unknown>> {
   switch (operation.name) {
+    case "context.init":
+      if (!selector) throw new CommandFailure("invalid_input");
+      return initialiseContext(selector);
     case "catalog.show":
       return catalogue;
     default:

@@ -3,6 +3,11 @@ import type { OperationDefinition } from "./catalog.ts";
 import { CommandFailure, exitCodeFor, failureEnvelope, successEnvelope } from "./response.ts";
 import type { ExitCode } from "./response.ts";
 
+import { ConfigurationError } from './configuration.ts';
+import { ContextError } from './context.ts';
+import type { ContextSelector } from './context.ts';
+import { StorageError } from './storage/database.ts';
+
 export const MAX_RESPONSE_BYTES = 256 * 1024;
 export const MAX_INPUT_BYTES = 256 * 1024;
 
@@ -17,12 +22,14 @@ export type OperationRunner = (
   operation: OperationDefinition,
   args: Record<string, unknown>,
   progress: (message: string) => void,
+  selector?: ContextSelector,
 ) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
 interface Options {
   input: string | null;
   stdin: boolean;
   requestId: string | null;
+  selector?: ContextSelector;
 }
 
 function parseOptions(args: readonly string[]): Options {
@@ -39,11 +46,16 @@ function parseOptions(args: readonly string[]): Options {
         options.stdin = true;
         break;
       case "--input":
-      case "--request-id": {
+      case "--request-id":
+      case "--config":
+      case "--context": {
         const value = args[++index];
         if (!value || value.startsWith("--")) throw new CommandFailure("invalid_input");
         if (flag === "--input") options.input = value;
-        else {
+        else if (flag === "--config" || flag === "--context") {
+          if (options.selector) throw new CommandFailure("invalid_input");
+          options.selector = flag === "--config" ? { config: value } : { context: value };
+        } else {
           if (value.length > 200 || /[\r\n\0]/u.test(value)) throw new CommandFailure("invalid_input");
           options.requestId = value;
         }
@@ -110,20 +122,27 @@ export async function runCli(
     operation = definition.name;
     const options = parseOptions(argv.slice(2));
     requestId = options.requestId;
+    if ((definition.name === 'catalog.show' && options.selector) || (definition.name !== 'catalog.show' && !options.selector)) throw new CommandFailure('invalid_input');
     const args = await readArgs(options, io);
     validateArgs(definition, args);
-    const data = await runOperation(definition, args, (message) => io.stderr(`${message}\n`));
+    const data = await runOperation(definition, args, (message) => io.stderr(`${message}\n`), options.selector);
     const envelope = successEnvelope(operation, requestId, data);
     exitCode = exitCodeFor(envelope.outcome);
     // Serialise once, inside the failure boundary (for example circular data).
     output = `${JSON.stringify(envelope)}\n`;
     if (Buffer.byteLength(output, "utf8") > MAX_RESPONSE_BYTES) throw new CommandFailure("response_too_large");
   } catch (error) {
-    const failure = failureEnvelope(
-      error instanceof CommandFailure ? error.code : "internal_failure",
-      operation,
-      requestId,
-    );
+    const code = error instanceof CommandFailure ? error.code
+      : error instanceof ConfigurationError ? 'invalid_configuration'
+      : error instanceof ContextError ? error.code
+      : error instanceof StorageError ? (error.code === 'busy' ? 'storage_busy' : error.code === 'not_empty' ? 'database_not_empty' : error.code === 'not_initialised' ? 'not_initialised' : 'context_mismatch')
+      : 'internal_failure';
+    const failure = failureEnvelope(code, operation, requestId);
+    if (error instanceof ConfigurationError) {
+      const field = error.field.replace(/[^A-Za-z0-9_.$\[\]-]/gu, '?').slice(0, 200);
+      failure.envelope.diagnostics[0]!.message = `Invalid configuration at ${field}.`;
+    }
+    if (error instanceof ContextError) failure.envelope.data = error.data;
     exitCode = failure.exitCode;
     output = `${JSON.stringify(failure.envelope)}\n`;
     io.stderr(`${failure.envelope.diagnostics[0]?.message}\n`);
