@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { lstat, open, realpath, statfs, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
@@ -6,6 +6,8 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } from './tasks.ts';
+import { bbWorkerReference, workerHost } from './launch.ts';
+import type { BbWorkerReference, InitialPromptAdmission, LaunchDecision, WorkerHost } from './launch.ts';
 import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState } from './tasks.ts';
 
 export const applicationId = 0x444b5431;
@@ -558,6 +560,184 @@ export class Database {
   releaseTask(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'release', actor); }
   markTaskDone(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'done', actor); }
   reopenTask(id: string, actor: TaskActor): Promise<Task> { return this.decideTask(id, 'reopen', actor); }
+
+  private attemptRow(id: string): Record<string, unknown> {
+    const row = this.db.prepare('SELECT * FROM attempts WHERE id = ?').get(id);
+    if (!row) throw new StorageError('conflict', `Unknown attempt: ${id}`);
+    return row;
+  }
+
+  private workerClaim(attemptId: string, claimId: string, host: WorkerHost): void {
+    const claim = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
+    if (!claim || claim.attempt_id !== attemptId || claim.resource_key !== `worker:${attemptId}`
+      || claim.role !== 'worker_owner' || claim.released_at !== null
+      || claim.generation !== host.generation || Number(claim.schema_family) !== applicationId
+      || Number(claim.schema_version) !== schemaVersion) {
+      throw new StorageError('conflict', 'Worker owner claim does not match the attempt and host');
+    }
+    const owner = object(JSON.parse(String(claim.owner_ref)));
+    if (owner.id !== host.id) throw new StorageError('conflict', 'Worker owner claim belongs to another host');
+    const configured = this.db.prepare("SELECT payload FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+    if (!configured || Number(JSON.parse(String(configured.payload)).revision) !== Number(claim.config_revision)) {
+      throw new StorageError('conflict', 'Worker owner claim has an obsolete configuration');
+    }
+    const age = Date.now() - Date.parse(String(claim.heartbeat_at));
+    if (!Number.isFinite(age) || age < 0 || age >= 30_000) {
+      throw new StorageError('conflict', 'Worker owner claim is not fresh');
+    }
+  }
+
+  private launchEvent(attemptId: string, taskId: string, host: WorkerHost, kind: string, payload: JsonObject): void {
+    this.insertEvent({ sourceKey: `${kind}:${attemptId}`, kind, payloadVersion: 1,
+      correlationId: attemptId, actor: host, occurredAt: new Date().toISOString(),
+      attemptId, taskId, payload });
+  }
+
+  /** Register the one worker owner before asking the launcher to prepare a worker. */
+  async registerWorkerOwner(attemptId: string, host: WorkerHost): Promise<string> {
+    nonblank(attemptId); workerHost(host);
+    const caller = object(host) as WorkerHost;
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      const existing = this.db.prepare('SELECT id FROM claims WHERE resource_key = ? AND released_at IS NULL')
+        .get(`worker:${attemptId}`);
+      if (existing) {
+        this.workerClaim(attemptId, String(existing.id), caller);
+        return String(existing.id);
+      }
+      if (attempt.phase !== 'allocated' || attempt.launch_state !== 'pending'
+        || attempt.allocation === null || attempt.lease_state !== 'held') {
+        throw new StorageError('conflict', 'Attempt is not allocated for worker ownership');
+      }
+      const configured = this.db.prepare("SELECT payload FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+      const configRevision = configured ? Number(JSON.parse(String(configured.payload)).revision) : NaN;
+      if (!Number.isSafeInteger(configRevision) || configRevision < 1) {
+        throw new StorageError('conflict', 'Current configuration revision is unknown');
+      }
+      const claimId = randomUUID();
+      this.db.prepare(`INSERT INTO claims (id, resource_key, role, attempt_id, generation, owner_ref,
+        schema_family, schema_version, config_revision, heartbeat_at)
+        VALUES (?, ?, 'worker_owner', ?, ?, ?, ?, ?, ?, ?)`)
+        .run(claimId, `worker:${attemptId}`, attemptId, caller.generation, json({ id: caller.id }),
+          applicationId, schemaVersion, configRevision, new Date().toISOString());
+      this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.owner_registered', { claimId });
+      return claimId;
+    });
+  }
+
+  /** A stale claim cannot be made fresh by a heartbeat. */
+  async heartbeatWorkerOwner(attemptId: string, claimId: string, host: WorkerHost): Promise<void> {
+    nonblank(attemptId); nonblank(claimId); workerHost(host);
+    const caller = object(host) as WorkerHost;
+    await this.write(() => {
+      this.workerClaim(attemptId, claimId, caller);
+      this.changed(this.db.prepare('UPDATE claims SET heartbeat_at = ?, revision = revision + 1 WHERE id = ? AND released_at IS NULL')
+        .run(new Date().toISOString(), claimId));
+    });
+  }
+
+  /** Bind a prepared bb thread before its first prompt. */
+  async bindWorkerReference(attemptId: string, claimId: string, reference: BbWorkerReference, host: WorkerHost): Promise<BbWorkerReference> {
+    nonblank(attemptId); nonblank(claimId); bbWorkerReference(reference); workerHost(host);
+    const bound = object(reference) as BbWorkerReference;
+    const caller = object(host) as WorkerHost;
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      if (attempt.runtime_ref !== null) {
+        if (attempt.owner_claim_id === claimId && json(JSON.parse(String(attempt.runtime_ref))) === json(bound)) return bound;
+        throw new StorageError('conflict', 'Attempt is bound to another worker');
+      }
+      if (attempt.phase !== 'allocated' || attempt.launch_state !== 'pending'
+        || attempt.allocation === null || attempt.lease_state !== 'held'
+        || attempt.owner_claim_id !== null) throw new StorageError('conflict', 'Attempt is not ready for worker binding');
+      this.workerClaim(attemptId, claimId, caller);
+      const used = this.db.prepare("SELECT id FROM attempts WHERE json_extract(runtime_ref, '$.launcher') = 'bb' AND json_extract(runtime_ref, '$.threadId') = ?").get(bound.threadId);
+      if (used) throw new StorageError('conflict', 'bb thread is bound to another attempt');
+      this.changed(this.db.prepare(`UPDATE attempts SET runtime_ref = ?, owner_claim_id = ?, revision = revision + 1
+        WHERE id = ? AND runtime_ref IS NULL AND owner_claim_id IS NULL AND launch_state = 'pending'`)
+        .run(json(bound), claimId, attemptId));
+      this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.worker_bound', { claimId, reference: bound });
+      return bound;
+    });
+  }
+
+  /** Commit one launch-or-fence decision; permission creates one pending activation effect. */
+  async decideWorkerLaunch(attemptId: string, claimId: string, decision: 'permit' | 'fence', host: WorkerHost): Promise<LaunchDecision> {
+    nonblank(attemptId); nonblank(claimId); workerHost(host);
+    if (decision !== 'permit' && decision !== 'fence') throw new TypeError('Invalid launch decision');
+    const caller = object(host) as WorkerHost;
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      if (attempt.owner_claim_id !== null && attempt.owner_claim_id !== claimId) throw new StorageError('conflict', 'Attempt belongs to another owner claim');
+      this.workerClaim(attemptId, claimId, caller);
+      if (attempt.launch_state !== 'pending') {
+        if (attempt.launch_state !== (decision === 'permit' ? 'permitted' : 'fenced')) {
+          throw new StorageError('conflict', 'Launch decision cannot be reversed');
+        }
+        const effect = decision === 'permit' ? this.db.prepare("SELECT id FROM requests WHERE attempt_id = ? AND operation = 'worker.activate'").get(attemptId) : undefined;
+        return { state: attempt.launch_state as LaunchDecision['state'], changed: false,
+          effectId: effect ? String(effect.id) : null };
+      }
+      if (attempt.phase !== 'allocated' || attempt.allocation === null || attempt.lease_state !== 'held') {
+        throw new StorageError('conflict', 'Attempt is not allocated');
+      }
+      const taskId = String(attempt.task_id);
+      if (decision === 'fence') {
+        this.changed(this.db.prepare("UPDATE attempts SET launch_state = 'fenced', revision = revision + 1 WHERE id = ? AND launch_state = 'pending'").run(attemptId));
+        this.launchEvent(attemptId, taskId, caller, 'attempt.launch_fenced', { claimId });
+        return { state: 'fenced', changed: true, effectId: null };
+      }
+      if (attempt.runtime_ref === null || attempt.owner_claim_id !== claimId) {
+        throw new StorageError('conflict', 'Worker reference must be bound before launch permission');
+      }
+      const reference = object(JSON.parse(String(attempt.runtime_ref))) as unknown as BbWorkerReference;
+      bbWorkerReference(reference);
+      const task = this.taskRow(taskId);
+      const specification = object(JSON.parse(String(attempt.specification)));
+      if (!Number.isSafeInteger(specification.definitionRevision)
+        || Number(task.definition_revision) !== specification.definitionRevision
+        || task.state !== 'queued' || task.hold_reason !== null
+        || this.db.prepare(`SELECT 1 FROM dependencies JOIN tasks AS blocker ON blocker.id = blocker_id
+          WHERE task_id = ? AND blocker.state <> 'done' LIMIT 1`).get(taskId)) {
+        throw new StorageError('conflict', 'Task definition or readiness changed before launch');
+      }
+      const effectId = randomUUID();
+      const fingerprint = createHash('sha256').update(json({ attemptId, claimId, reference })).digest('hex');
+      this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, attempt_id, caller,
+        fingerprint, input, target, state, created_at) VALUES (?, ?, 'effect', 'worker.activate', ?, ?, ?, ?, ?, 'pending', ?)`)
+        .run(effectId, `worker.activate:${attemptId}`, attemptId, json(caller), fingerprint,
+          json({ attemptId }), json(reference), new Date().toISOString());
+      this.changed(this.db.prepare(`UPDATE attempts SET launch_state = 'permitted', phase = 'running',
+        started_decision_revision = ?, revision = revision + 1 WHERE id = ? AND launch_state = 'pending'`)
+        .run(Number(task.decision_revision), attemptId));
+      this.changed(this.db.prepare("UPDATE tasks SET state = 'in_flight' WHERE id = ? AND state = 'queued' AND definition_revision = ?")
+        .run(taskId, Number(task.definition_revision)));
+      this.launchEvent(attemptId, taskId, caller, 'attempt.launch_permitted', { claimId, reference, effectId });
+      return { state: 'permitted', changed: true, effectId };
+    });
+  }
+
+  /** A hook claims the activation effect before returning proceed; a lost reply stays uncertain. */
+  async admitInitialBbPrompt(attemptId: string, threadId: string, host: WorkerHost): Promise<InitialPromptAdmission> {
+    nonblank(attemptId); nonblank(threadId); workerHost(host);
+    const caller = object(host) as WorkerHost;
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      if (attempt.launch_state === 'fenced') return { kind: 'fenced' };
+      if (attempt.launch_state === 'pending') return { kind: 'pending' };
+      const reference = object(JSON.parse(String(attempt.runtime_ref))) as unknown as BbWorkerReference;
+      bbWorkerReference(reference);
+      if (reference.threadId !== threadId) throw new StorageError('conflict', 'Prompt thread does not match the bound worker');
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), caller);
+      const effect = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.activate'").get(attemptId);
+      if (!effect) throw new StorageError('conflict', 'Activation effect is missing');
+      if (effect.state !== 'pending') return { kind: 'already_admitted' };
+      this.changed(this.db.prepare("UPDATE requests SET state = 'claimed', claim_id = ?, claimed_at = ?, revision = revision + 1 WHERE id = ? AND state = 'pending'")
+        .run(String(attempt.owner_claim_id), new Date().toISOString(), String(effect.id)));
+      this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.prompt_admitted', { effectId: String(effect.id), threadId });
+      return { kind: 'admitted', effectId: String(effect.id) };
+    });
+  }
 
   /** Connection diagnostics; requesting full fsync is not proof that the OS honours it. */
   settings(): { journalMode: string; foreignKeys: number; synchronous: number; busyTimeout: number; fullfsync: number; checkpointFullfsync: number } {

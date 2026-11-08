@@ -2,7 +2,7 @@
 
 Docket is a command-line tool that keeps the record of agent work in a project: its tasks, the attempts agents make at them, the evidence for each result, and the approvals needed before work is accepted or a workspace is returned. A host such as [bb](https://getbb.app) runs the agents and shows the work; Docket decides what is allowed and records what happened.
 
-**Status:** the version-1 CLI envelope, `catalog.show`, SQLite schema, database opener and in-process task operations are implemented. Other operations are not yet available. The [specification](docs/specification/README.md) is a draft for review and defines what Docket must do. The bb launcher has not passed qualification.
+**Status:** the version-1 CLI envelope, `catalog.show`, SQLite schema, database opener, in-process task operations and internal bb first-prompt launch storage are implemented. Attempt reservation, allocation and public launch operations are not yet available. The [specification](docs/specification/README.md) is a draft for review and defines what Docket must do. The bb launcher has not passed qualification.
 
 Docket succeeds [Switchboard](https://github.com/nickcox/switchboard). It is built from its specification, not from Switchboard's code.
 

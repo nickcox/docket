@@ -32,6 +32,17 @@ Task types are in `tasks.ts`; `Database` owns all task SQL. These in-process met
 
 Every effective operation writes one `action.recorded` event in the same `BEGIN IMMEDIATE` transaction as its rows. Definition and decision updates match the revision read under that lock and require one affected row. No-op operations emit no event. All caller-owned inputs are detached before waiting for the write lock. Definitions, graph checks and end-position/ID allocation are decided under the lock. The operation tests inject failure both before and after event insertion for each task write method, then inspect through a fresh connection to prove all-or-none persistence.
 
+## Worker launch admission
+
+`launch.ts` defines the trusted bb worker reference and host binding used by the internal launch methods. An allocated attempt must already exist. Reservation, allocation and a bb plugin caller are not implemented yet; these methods are not CLI operations.
+
+- `registerWorkerOwner` records the one active `worker_owner` claim for an allocated attempt; `heartbeatWorkerOwner` refreshes it while fresh. A stale claim cannot be renewed by heartbeat.
+- `bindWorkerReference` records the bb thread ID and matching owner claim together. Repeating the exact binding has no effect; a different thread or claim is refused.
+- `decideWorkerLaunch` commits either permission or a fence. Permission rechecks task definition and readiness, changes the task to `in_flight`, and creates one pending `worker.activate` effect in the same transaction. A fence cannot be reversed into permission.
+- `admitInitialBbPrompt` is for the enabled plugin's dispatch hook. It atomically claims the pending activation effect before returning `admitted`. A repeated call returns `already_admitted`, including after reopening the database. If the hook crashes after this claim but before bb receives its answer, the effect remains unresolved and no second prompt is authorised.
+
+Each write checks the active owner claim, schema and configuration version, and its fresh heartbeat. Current-field changes and their events commit together. The operation tests seed allocated attempts at the fixture boundary so they can test the binding and launch race before the preceding storage operations exist. These methods do not yet qualify the bb launcher: the real reservation, allocation, effect reconciliation, terminal fence and host restart cases remain to be implemented and tested.
+
 ## Durability and qualification
 
 Every connection requests foreign keys, synchronous FULL, fullfsync and checkpoint_fullfsync. Writable connections establish WAL; read-only ones require it. `settings()` exposes requested SQLite settings, not a proof of hardware durability. SQLite's full-fsync options have additional effect on macOS where supported; other OS/filesystem combinations can provide only their ordinary sync guarantees. Network filesystems are unsupported. Devices, virtualised storage and filesystems can still fail to honour sync requests. No stronger power-loss guarantee is claimed.
