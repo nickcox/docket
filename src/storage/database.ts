@@ -204,12 +204,14 @@ export class Database {
   readonly path: string;
   private readonly readOnly: boolean;
   private readonly retryMs: number;
+  private readonly recyclableRoots: string[];
 
-  private constructor(db: DatabaseSync, path: string, readOnly: boolean, retryMs: number) {
+  private constructor(db: DatabaseSync, path: string, readOnly: boolean, retryMs: number, recyclableRoots: readonly string[]) {
     this.db = db;
     this.path = path;
     this.readOnly = readOnly;
     this.retryMs = retryMs;
+    this.recyclableRoots = [...recyclableRoots];
   }
 
   private static retryLimit(options: OpenOptions): number {
@@ -257,13 +259,13 @@ export class Database {
     await verifyPath(path, options.location, false);
     // Admission is read-only, before WAL or any other persistent setting can alter a refused file.
     await this.retry(limit, () => {
-      const check = new Database(this.connection(path, true), path, true, limit);
+      const check = new Database(this.connection(path, true), path, true, limit, options.location.recyclableRoots);
       try { check.verifyVersion(); } finally { check.close(); }
     }, true);
     const readOnly = options.readOnly ?? true;
     if (!readOnly) await exclusiveProbe(path);
     return this.retry(limit, () => {
-      const result = new Database(this.connection(path, readOnly), path, readOnly, limit);
+      const result = new Database(this.connection(path, readOnly), path, readOnly, limit, options.location.recyclableRoots);
       try {
         result.verifyVersion();
         result.configure();
@@ -292,7 +294,7 @@ export class Database {
     const databaseId = randomUUID();
     const now = new Date().toISOString();
     const result = await this.retry(limit, () => {
-      const candidate = new Database(this.connection(path, false), path, false, limit);
+      const candidate = new Database(this.connection(path, false), path, false, limit, options.location.recyclableRoots);
       try { candidate.configure(); return candidate; }
       catch (error) { candidate.close(); throw error; }
     }, true);
@@ -1021,7 +1023,8 @@ export class Database {
     return { identity: { databaseId: spec.databaseId!, contextId: spec.contextId!, taskId: spec.taskId!,
       attemptId, leaseId: String(attempt.lease_id), sessionId: input.sessionId! },
       startingCommit: String(spec.startingCommit), outputRef: String(spec.outputRef), criteria: spec.criteria as string[],
-      delivery: object(spec.delivery), resultPath: String(input.resultPath), recyclableRoots: [String(object(spec.workspace).pool)] };
+      delivery: object(spec.delivery), resultPath: String(input.resultPath),
+      recyclableRoots: [...new Set([...this.recyclableRoots, String(object(spec.workspace).pool)])] };
   }
 
   workerResultBinding(attemptId: string): ResultBinding {

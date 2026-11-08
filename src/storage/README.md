@@ -67,6 +67,27 @@ The latest recorded `context.configured` event supplies limits, base and target 
 
 Each write checks the active owner claim, schema and configuration version, and its fresh heartbeat. Current-field changes and their events commit together. The launch operation tests seed allocated attempts at the fixture boundary to isolate the binding and launch race. These methods do not yet qualify the bb launcher: the real workspace/launcher adapters, effect reconciliation, terminal fence and host restart cases remain to be implemented and tested.
 
+## Worker results and completion
+
+`results.ts` defines the version 1 worker result and observation validation rules. Reservation freezes `resultPath` at `<stateDirectory>/attempts/<attemptId>/result.json`; preparation records that path and the internal session UUID before binding a worker. The host creates private retained directories outside recyclable roots. `workerResultBinding(attemptId)` returns the exact identity, refs, ordered criteria and delivery requirements to include in a result.
+
+The result is a strict JSON object with these fields:
+
+- `version: 1` and `identity: { databaseId, contextId, taskId, attemptId, leaseId, sessionId }`.
+- `startingCommit` and `outputRef`, matching the stored attempt.
+- `outcome: completed|held|failed`, a nonblank `summary`, and `reason` (null for completed, nonblank for held/failed).
+- `criteriaReport`: every stored criterion once as `{ position, criterion, status: met|not_met, evidence }`. Positions count from 1; text matches exactly. Array order need not match position order. These are worker claims, not independent acceptance evidence.
+- `evidence`: named `{ name, summary }` records, including every required evidence name.
+- `workReferences`: named Git `{ kind: git, name, branch, commit }` or artefact `{ kind: artefact, name, path, description }` records, including every required deliverable name. Git branches match the full output ref. Artefact paths are relative to the retained result directory, without traversal or links.
+
+`validateWorkerResult(attemptId, host, repository)` checks a regular, unlinked source of at most 1 MiB, all identities and contract fields, and retained artefacts. Completed code needs one exact commit strictly descending from the starting commit, with confirmed ancestry and retention from the repository adapter. It records content, source SHA-256, relative path, validation version/time and artefact SHA-256 digests in one immutable `attempt.result_validated` event. Repeated validation reads the files again and returns that original event; changed or missing source/artefacts produce `result_discrepancy`, never replacement evidence. Filesystem reads and repository queries happen outside the SQLite write lock; the binding and owner are rechecked under it. As with database paths, trusted directory ownership must prevent concurrent untrusted parent replacement.
+
+`recordWorkerObservation(observation, host)` accepts a bound worker's turn-end, result-available, terminal or internal idle observation. Source ID/sequence pairs are immutable and deduplicated. Old sequences are retained because independent facts can arrive out of order. Pi terminal proof names direct child exit; bb terminal proof includes durable refusal of later turns. Neither is a claim that child processes have stopped. Unknown or mismatched host/worker identities and unsupported payloads refuse.
+
+`../workers.ts` exposes `observeWorker` to retain observations before processing results. Result-available observations trigger validation. A valid result without terminal evidence stays execution-open, as does terminal evidence without a validated result. Idle, turn-end and a file merely existing never suffice. Invalid result processing does not roll back an already recorded terminal observation, so a later valid result can finish the attempt.
+
+`completeWorker` rechecks the files, then atomically records the outcome, candidate, task change and `attempt.completed` event once. Completed code selects the exact validated commit and holds the task for acceptance; a retained report completes its task. Held/failed outcomes hold the task without inventing a candidate. Every task change is conditional on the decision revision captured at start, so a newer person hold, done or reopen wins. Candidate identity is exposed in `attempt().candidate`. Completion neither accepts nor integrates output, runs mandatory checks, returns a lease, releases the owner nor confirms that no processes remain. Checks, review verdicts, acceptance and return remain separate operations.
+
 ## Durability and qualification
 
 Every connection requests foreign keys, synchronous FULL, fullfsync and checkpoint_fullfsync. Writable connections establish WAL; read-only ones require it. `settings()` exposes requested SQLite settings, not a proof of hardware durability. SQLite's full-fsync options have additional effect on macOS where supported; other OS/filesystem combinations can provide only their ordinary sync guarantees. Network filesystems are unsupported. Devices, virtualised storage and filesystems can still fail to honour sync requests. No stronger power-loss guarantee is claimed.

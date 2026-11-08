@@ -66,6 +66,11 @@ async function retainedFile(root: string, name: string, recyclableRoots: string[
   if (!isAbsolute(root) || resolve(root) !== root || !within(path, root)) invalid('Result must be inside retained storage');
   for (const recyclable of recyclableRoots) {
     if (within(path, recyclable)) invalid('Result is inside recyclable storage');
+    try {
+      if (within(path, await realpath(recyclable))) invalid('Result is inside recyclable storage');
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    }
   }
   if (await realpath(root) !== root || await realpath(path) !== path) invalid('Result links are not allowed');
   const before = await lstat(path);
@@ -150,6 +155,9 @@ export async function readWorkerResult(binding: ResultBinding): Promise<Validate
     }
     for (const name of binding.delivery.requiredDeliverables as string[]) if (!names.has(name)) invalid(`Missing required deliverable: ${name}`);
     if (content.outcome === 'completed' && binding.delivery.kind === 'code' && !code) invalid('Completed code result requires an exact commit');
+    // Artefact reads can take time. Do not record a source changed while they were checked.
+    const finalSource = await retainedFile(root, relative(root, binding.resultPath), binding.recyclableRoots, maximumResultBytes);
+    if (finalSource.digest !== source.digest) invalid('Result file changed during validation');
     return { content, digest: source.digest, relativePath: relative(root, binding.resultPath), validationVersion: resultValidationVersion,
       validatedAt: new Date().toISOString(), artefacts };
   } catch (error) {

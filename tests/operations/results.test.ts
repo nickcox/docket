@@ -10,7 +10,7 @@ import type { WorkerHost, WorkerReference } from '../../src/storage/launch.ts';
 import type { WorkerObservation } from '../../src/storage/results.ts';
 import { maximumResultBytes } from '../../src/storage/results.ts';
 import type { Allocation } from '../../src/storage/reservations.ts';
-import { confirmed } from '../../src/adapters/command.ts';
+import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { observeWorker, prepareWorker } from '../../src/workers.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
 
@@ -26,7 +26,7 @@ async function fixture(t: TestContext, kind: 'code' | 'report' = 'code', deliver
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-result-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
-  const options = { location: { retainedRoot: root, recyclableRoots: [join(root, 'pool')] }, retryMs: 1000 };
+  const options = { location: { retainedRoot: root, recyclableRoots: [join(root, 'pool')] }, readOnly: false, retryMs: 1000 };
   const profile = { launcher: 'bb', provider: 'example', model: 'model', reasoning: null,
     runMs: 1000, maxCost: 0, maxTokens: null, executionProfile: 'test' };
   const db = await Database.initialise(path, { contextId: 'results', repository: { identity: 'example' },
@@ -247,6 +247,9 @@ test('R11: starting commit, unrelated commit, unretained candidate and unknown r
   (f.result.workReferences as JsonObject[])[0]!.commit = head; await f.save();
   await assert.rejects(f.db.validateWorkerResult(f.attemptId, host), refuses('result_invalid', /repository/));
   await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, { ...repository, compare: async () => confirmed(false) }), refuses('result_invalid', /descend/));
+  await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, { ...repository, compare: async () => uncertain('Unknown ancestry') }), refuses('result_invalid', /descend/));
+  await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, { ...repository, verifyRetention: async () => rejected('Absent ref') }), refuses('result_invalid', /retained/));
+  await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, { ...repository, verifyRetention: async () => uncertain('Unknown ref') }), refuses('result_invalid', /retained/));
   assert.equal(f.db.attempt(f.attemptId).candidate, null);
   assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
 });
@@ -308,4 +311,86 @@ test('R10/R25: an interrupted completion rolls back outcome, candidate, task cha
   assert.deepEqual(f.db.attempt(f.attemptId), before); assert.deepEqual(f.db.task('task'), task);
   assert.equal(f.db.events().filter(event => event.kind === 'attempt.completed').length, 0);
   assert.equal((await f.db.completeWorker(f.attemptId, host)).outcome, 'completed');
+});
+
+test('R11/A17: exactly 1 MiB is allowed; the limit counts UTF-8 bytes, not characters', async t => {
+  const f = await fixture(t);
+  const source = JSON.stringify(f.result);
+  await writeFile(f.binding.resultPath, source + ' '.repeat(maximumResultBytes - Buffer.byteLength(source)));
+  assert.ok(await f.db.validateWorkerResult(f.attemptId, host, repository));
+  const other = await fixture(t);
+  other.result.summary = '🙂'.repeat(maximumResultBytes / 4);
+  await other.save();
+  await assert.rejects(other.db.validateWorkerResult(other.attemptId, host, repository), refuses('result_invalid', /1 MiB/));
+  assert.equal(other.db.validatedWorkerResult(other.attemptId), null);
+});
+
+test('R11: malformed result fields and incomplete work references refuse with no validated record', async t => {
+  const f = await fixture(t);
+  const changes: ((value: JsonObject) => void)[] = [
+    value => { value.version = 2; },
+    value => { value.extra = true; },
+    value => { delete value.reason; },
+    value => { value.reason = 'Unexpected completed reason'; },
+    value => { value.outcome = 'idle'; },
+    value => { value.summary = ''; },
+    value => { value.workReferences = []; },
+    value => { (value.workReferences as JsonObject[])[0]!.commit = 'HEAD'; },
+    value => { (value.workReferences as JsonObject[])[0]!.branch = 'main'; },
+    value => { (value.workReferences as JsonObject[]).push((value.workReferences as JsonObject[])[0]!); },
+    value => { (value.evidence as JsonObject[]).push((value.evidence as JsonObject[])[0]!); },
+    value => { value.outcome = 'held'; value.reason = ''; },
+    value => { value.outcome = 'failed'; value.reason = null; },
+  ];
+  for (const change of changes) {
+    const value = clone(f.result); change(value); await f.save(value);
+    await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, repository), refuses('result_invalid'));
+    assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
+  }
+});
+
+test('R11: the host inventory also excludes recyclable roots other than this attempt pool', async t => {
+  const f = await fixture(t); await f.save();
+  const other = await Database.open(f.path, { ...f.options,
+    location: { retainedRoot: f.root, recyclableRoots: [dirname(f.binding.resultPath)] } });
+  t.after(() => other.close());
+  await assert.rejects(other.validateWorkerResult(f.attemptId, host, repository), refuses('result_invalid', /recyclable/));
+  assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
+});
+
+test('R07: Pi terminal proof requires direct child exit and rejects process-stop claims', async () => {
+  const { workerObservation } = await import('../../src/storage/results.ts');
+  const observation: WorkerObservation = { sourceId: 'pi', sourceSequence: 1, attemptId: 'attempt',
+    workerRef: { launcher: 'pi', sessionId: 'session', processId: '123' }, observedAt: new Date().toISOString(),
+    kind: 'terminal', payloadVersion: 1, payload: { directChildExited: true } };
+  workerObservation(observation);
+  assert.throws(() => workerObservation({ ...observation, payload: { directChildExited: false } }), refuses('result_invalid'));
+  assert.throws(() => workerObservation({ ...observation, payload: { directChildExited: true, noProcesses: true } }), refuses('result_invalid'));
+});
+
+test('R10/R25: simultaneous validation and completion through independent stores retain one result and outcome', async t => {
+  const f = await fixture(t); await f.save();
+  const other = await Database.open(f.path, f.options); t.after(() => other.close());
+  await f.db.recordWorkerObservation(f.observation('terminal'), host);
+  const results = await Promise.all([f.db.validateWorkerResult(f.attemptId, host, repository), other.validateWorkerResult(f.attemptId, host, repository)]);
+  assert.deepEqual(results[0], results[1]);
+  const attempts = await Promise.all([f.db.completeWorker(f.attemptId, host), other.completeWorker(f.attemptId, host)]);
+  assert.deepEqual(attempts[0], attempts[1]);
+  assert.equal(f.db.events().filter(event => event.kind === 'attempt.result_validated').length, 1);
+  assert.equal(f.db.events().filter(event => event.kind === 'attempt.completed').length, 1);
+});
+
+test('R11/R25: result validation rolls back completely if its evidence insertion fails', async t => {
+  const f = await fixture(t); await f.save();
+  const target = f.db as unknown as { insertEvent: (event: EventInput) => unknown };
+  const original = target.insertEvent;
+  target.insertEvent = function (event) {
+    const value = original.call(this, event);
+    if (event.kind === 'attempt.result_validated') throw new Error('injected validation failure');
+    return value;
+  };
+  await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, repository), /injected validation failure/);
+  target.insertEvent = original;
+  assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
+  assert.ok(await f.db.validateWorkerResult(f.attemptId, host, repository));
 });
