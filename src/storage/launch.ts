@@ -7,9 +7,24 @@ export interface WorkerHost extends JsonObject {
   generation: string;
 }
 
-export interface BbWorkerReference extends JsonObject {
+/** Host identifiers are opaque to the core; paths and process IDs alone are not references. */
+export interface WorkerReference extends JsonObject {
+  launcher: string;
+}
+
+export interface BbWorkerReference extends WorkerReference {
   launcher: 'bb';
   threadId: string;
+}
+
+export function workerReference(value: unknown): asserts value is WorkerReference {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid worker reference');
+  const reference = value as Record<string, unknown>;
+  if (typeof reference.launcher !== 'string' || !reference.launcher.trim()
+    || Object.keys(reference).length < 2) throw new TypeError('Worker reference requires launcher and host identifiers');
+  for (const [key, identifier] of Object.entries(reference)) {
+    if (!key.trim() || typeof identifier !== 'string' || !identifier.trim()) throw new TypeError('Invalid worker identifier');
+  }
 }
 
 export type LaunchDecision = { state: 'permitted' | 'fenced'; changed: boolean; effectId: string | null };
