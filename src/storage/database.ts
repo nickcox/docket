@@ -8,6 +8,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } from './tasks.ts';
 import { workerReference, workerHost } from './launch.ts';
 import type { WorkerReference, InitialPromptAdmission, LaunchDecision, WorkerHost } from './launch.ts';
+import { readWorkerResult, workerObservation } from './results.ts';
+import type { ResultBinding, ValidatedResult, WorkerObservation } from './results.ts';
+import type { GitRepository } from '../adapters/repository.ts';
 import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState } from './tasks.ts';
 
 import { claimIdentity, claimInput, heartbeatStatus, text, timestamp } from './claims.ts';
@@ -25,7 +28,7 @@ type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type JsonObject = { [key: string]: Json };
 
 export class StorageError extends Error {
-  readonly code: 'path' | 'not_initialised' | 'family' | 'version' | 'not_empty' | 'busy' | 'conflict' | 'read_only' | 'request_input_mismatch';
+  readonly code: 'path' | 'not_initialised' | 'family' | 'version' | 'not_empty' | 'busy' | 'conflict' | 'read_only' | 'request_input_mismatch' | 'result_invalid' | 'result_identity_mismatch' | 'result_discrepancy';
   constructor(code: StorageError['code'], message: string) {
     super(message);
     this.code = code;
@@ -578,7 +581,8 @@ export class Database {
       executionOpen: row.execution_open === 1, phase: String(row.phase), launchState: String(row.launch_state),
       specification: object(JSON.parse(String(row.specification))),
       allocation: row.allocation === null ? null : object(JSON.parse(String(row.allocation))) as Allocation,
-      leaseState: String(row.lease_state), outcome: row.outcome === null ? null : String(row.outcome) };
+      leaseState: String(row.lease_state), outcome: row.outcome === null ? null : String(row.outcome),
+      candidate: row.candidate === null ? null : object(JSON.parse(String(row.candidate))) };
   }
 
   attempt(id: string): Attempt {
@@ -644,6 +648,7 @@ export class Database {
           definitionRevision: task.definitionRevision, decisionRevision: task.decisionRevision, criteria: task.criteria,
           objectiveId: null, delivery: object({ ...value.delivery, baseRef: config.baseBranch, startingCommit: value.startingCommit, outputBranch: outputRef }),
           baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit: value.startingCommit,
+          resultPath: join(String(identity.stateDirectory), 'attempts', id, 'result.json'),
           repository, workspace: { holder, pool: config.poolRoot },
           profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
           finalisation: config.finalisation, checks: value.checks,
@@ -813,7 +818,7 @@ export class Database {
       }
       const spec = object(JSON.parse(String(attempt.specification)));
       const input = { databaseId: spec.databaseId!, contextId: spec.contextId!, taskId: spec.taskId!, attemptId,
-        specification: spec, allocation: JSON.parse(String(attempt.allocation)), sessionId: randomUUID(),
+        specification: spec, allocation: JSON.parse(String(attempt.allocation)), sessionId: randomUUID(), resultPath: spec.resultPath!,
         profileDigest: createHash('sha256').update(json(spec.profile)).digest('hex'),
         owner: { claimId, generation: owner.generation } };
       const effect = this.workerEffect(attemptId, claimId, owner.generation, 'worker.prepare', input, { launcher: object(spec.profile).launcher! });
@@ -1003,6 +1008,127 @@ export class Database {
     } else if (effect.operation !== 'worker.prepare' || attempt.launch_state !== 'pending' || attempt.runtime_ref !== null) {
       throw new StorageError('conflict', 'Worker preparation is not permitted');
     }
+  }
+
+  private resultBindingInTransaction(attemptId: string): ResultBinding {
+    const attempt = this.attemptRow(attemptId);
+    const spec = object(JSON.parse(String(attempt.specification)));
+    const preparation = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.prepare'").get(attemptId);
+    if (!preparation || attempt.runtime_ref === null || attempt.lease_id === null || attempt.started_decision_revision === null) {
+      throw new StorageError('result_identity_mismatch', 'Result requires a bound, started worker and allocation');
+    }
+    const input = this.decodeRequest(preparation).input;
+    return { identity: { databaseId: spec.databaseId!, contextId: spec.contextId!, taskId: spec.taskId!,
+      attemptId, leaseId: String(attempt.lease_id), sessionId: input.sessionId! },
+      startingCommit: String(spec.startingCommit), outputRef: String(spec.outputRef), criteria: spec.criteria as string[],
+      delivery: object(spec.delivery), resultPath: String(input.resultPath), recyclableRoots: [String(object(spec.workspace).pool)] };
+  }
+
+  workerResultBinding(attemptId: string): ResultBinding {
+    text(attemptId);
+    return this.snapshot(() => this.resultBindingInTransaction(attemptId));
+  }
+
+  private validatedResultInTransaction(attemptId: string): ValidatedResult | null {
+    const row = this.db.prepare("SELECT * FROM events WHERE source_key = ?").get(`attempt.result_validated:${attemptId}`);
+    return row ? this.decodeEvent(row).payload as ValidatedResult : null;
+  }
+
+  validatedWorkerResult(attemptId: string): ValidatedResult | null {
+    text(attemptId);
+    return this.snapshot(() => { this.attemptRow(attemptId); return this.validatedResultInTransaction(attemptId); });
+  }
+
+  /** The source and retained artefacts are checked even after validation. Evidence is never replaced. */
+  async validateWorkerResult(attemptId: string, host: WorkerHost,
+    repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>): Promise<ValidatedResult> {
+    text(attemptId); workerHost(host);
+    const actor = object(host) as WorkerHost;
+    const binding = this.workerResultBinding(attemptId), previous = this.validatedWorkerResult(attemptId);
+    let value: ValidatedResult;
+    try {
+      value = await readWorkerResult(binding);
+      if (previous && (previous.digest !== value.digest || json(previous.artefacts) !== json(value.artefacts))) {
+        throw new StorageError('result_discrepancy', 'Validated result or retained artefacts changed');
+      }
+    } catch (error) {
+      if (previous) throw new StorageError('result_discrepancy', `Validated result is missing or changed: ${String(error)}`);
+      throw error;
+    }
+    if (!previous && value.content.outcome === 'completed' && binding.delivery.kind === 'code') {
+      if (!repository) throw new StorageError('result_invalid', 'Code result needs repository retention and ancestry evidence');
+      const reference = (value.content.workReferences as JsonObject[]).find(item => item.kind === 'git')!;
+      const comparison = await repository.compare(binding.startingCommit, String(reference.commit));
+      if (comparison.status !== 'confirmed' || !comparison.value) throw new StorageError('result_invalid', 'Code candidate must descend from the starting commit');
+      const retained = await repository.verifyRetention({ references: [{ ref: binding.outputRef, commit: String(reference.commit) }],
+        artefacts: [], recyclableRoots: binding.recyclableRoots });
+      if (retained.status !== 'confirmed') throw new StorageError('result_invalid', 'Exact candidate is not known to be retained');
+    }
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), actor);
+      if (json(binding) !== json(this.resultBindingInTransaction(attemptId))) throw new StorageError('result_identity_mismatch', 'Result binding changed');
+      const recorded = this.validatedResultInTransaction(attemptId);
+      if (recorded) {
+        if (recorded.digest !== value.digest || json(recorded.artefacts) !== json(value.artefacts)) throw new StorageError('result_discrepancy', 'Validated result changed');
+        return recorded;
+      }
+      this.launchEvent(attemptId, String(attempt.task_id), actor, 'attempt.result_validated', value);
+      return value;
+    });
+  }
+
+  /** Old source sequences still carry independent facts. A duplicate cannot erase terminal evidence. */
+  async recordWorkerObservation(observation: WorkerObservation, host: WorkerHost): Promise<Attempt> {
+    workerObservation(observation); workerHost(host);
+    const value = object(observation) as WorkerObservation, actor = object(host) as WorkerHost;
+    return this.write(() => {
+      const attempt = this.attemptRow(value.attemptId);
+      this.workerClaim(value.attemptId, String(attempt.owner_claim_id), actor);
+      if (attempt.runtime_ref === null || json(JSON.parse(String(attempt.runtime_ref))) !== json(value.workerRef)) {
+        throw new StorageError('result_identity_mismatch', 'Observation worker does not match the attempt');
+      }
+      this.insertEvent({ sourceKey: `worker.observation:${json([value.attemptId, value.sourceId, value.sourceSequence])}`,
+        kind: 'worker.observed', payloadVersion: 1, correlationId: value.attemptId, actor,
+        occurredAt: value.observedAt, attemptId: value.attemptId, taskId: String(attempt.task_id), payload: value });
+      return this.decodeAttempt(attempt);
+    });
+  }
+
+  /** No acceptance, integration, lease return or process-stop confirmation is implied. */
+  async completeWorker(attemptId: string, host: WorkerHost,
+    repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>): Promise<Attempt> {
+    text(attemptId); workerHost(host);
+    const actor = object(host) as WorkerHost;
+    const terminal = this.snapshot(() => this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ?
+      AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(attemptId));
+    if (!terminal) return this.attempt(attemptId);
+    await this.validateWorkerResult(attemptId, actor, repository);
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId), taskId = String(attempt.task_id);
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), actor);
+      if (attempt.outcome !== null) return this.decodeAttempt(attempt);
+      const result = this.validatedResultInTransaction(attemptId)!;
+      const spec = object(JSON.parse(String(attempt.specification))), delivery = object(spec.delivery);
+      const outcome = String(result.content.outcome);
+      const reference = (result.content.workReferences as JsonObject[]).find(item => item.kind === 'git');
+      const candidate = outcome === 'completed' && delivery.kind === 'code'
+        ? { id: randomUUID(), commit: reference!.commit!, outputRef: spec.outputRef!, resultDigest: result.digest } : null;
+      const now = new Date().toISOString();
+      this.changed(this.db.prepare(`UPDATE attempts SET candidate = ?, outcome = ?, phase = 'settled', execution_open = 0,
+        settled_at = ?, revision = revision + 1 WHERE id = ? AND outcome IS NULL AND revision = ?`)
+        .run(candidate === null ? null : json(candidate), outcome, now, attemptId, Number(attempt.revision)));
+      const task = this.taskRow(taskId);
+      // Person decision revisions, including a reopen, always win over this automated outcome.
+      if (task.decision_revision === attempt.started_decision_revision) {
+        const done = outcome === 'completed' && delivery.kind === 'report';
+        this.changed(this.db.prepare('UPDATE tasks SET state = ?, hold_reason = ? WHERE id = ? AND decision_revision = ?')
+          .run(done ? 'done' : 'queued', done ? null : candidate ? 'awaiting_acceptance' : `worker_${outcome}`,
+            taskId, Number(task.decision_revision)));
+      }
+      this.launchEvent(attemptId, taskId, actor, 'attempt.completed', { outcome, candidate, resultDigest: result.digest });
+      return this.decodeAttempt(this.attemptRow(attemptId));
+    });
   }
 
   private configRevision(): number {

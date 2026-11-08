@@ -4,6 +4,19 @@ import { Database, StorageError } from './storage/database.ts';
 import type { JsonObject } from './storage/database.ts';
 import type { WorkerHost, WorkerReference } from './storage/launch.ts';
 import type { StoredRequest } from './storage/requests.ts';
+import type { WorkerObservation } from './storage/results.ts';
+import type { Attempt } from './storage/reservations.ts';
+import type { GitRepository } from './adapters/repository.ts';
+
+/** Observations are retained before result processing, so a refusal cannot lose a terminal fact. */
+export async function observeWorker(db: Database, observation: WorkerObservation, host: WorkerHost,
+  repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>): Promise<Attempt> {
+  await db.recordWorkerObservation(observation, host);
+  if (observation.kind === 'result_available') await db.validateWorkerResult(observation.attemptId, host, repository);
+  // Turn-end and idle are not completion evidence. They may reconcile facts already recorded.
+  if (db.validatedWorkerResult(observation.attemptId)) return db.completeWorker(observation.attemptId, host, repository);
+  return db.attempt(observation.attemptId);
+}
 
 function evidence(result: Result<unknown>): JsonObject {
   // Adapter diagnostics may contain Error objects or undefined fields. Retain a JSON value.

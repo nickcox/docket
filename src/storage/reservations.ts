@@ -52,6 +52,7 @@ export interface Attempt {
   allocation: Allocation | null;
   leaseState: string;
   outcome: string | null;
+  candidate: JsonObject | null;
 }
 export interface Reservation {
   requestId: string;
