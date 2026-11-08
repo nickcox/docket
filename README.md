@@ -32,7 +32,7 @@ Run `npm run check` and `npm test` for the type check and full test suite.
 - [Specification](docs/specification/README.md): required behaviour, interfaces and acceptance scenarios.
 - [Working on Docket](AGENTS.md): instructions for people and agents changing this repository.
 - [Reference implementations](docs/reference-implementations.md): Switchboard files a task may consult on purpose.
-- [bb admission probe](investigations/bb-qualification/2026-11-08-bb-admission.md): observed failure of a plugin-only message wait when the plugin is disabled.
+- [bb admission probe](investigations/bb-qualification/2026-11-08-bb-admission.md): records what happens when a waiting message loses its plugin hook after deliberate disablement; this case is outside the bb launcher guarantee.
 
 ## Licence
 

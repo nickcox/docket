@@ -102,7 +102,7 @@ These documents form one specification. Requirement IDs R01–R40 are normative.
 
 Host support requires evidence for two technical gates:
 
-- Q1: Verify that the bb launcher enforces admission before the first prompt and refuses all later/retried turns across plugin unload, disable and server restart.
+- Q1: Verify that the bb launcher enforces admission before the first prompt and refuses later/retried turns during normal operation, backend reload and server restart with the Docket plugin enabled. Deliberate plugin disable, unload or replacement is outside this guarantee.
 - Q2: Identify the pinned bb/provider combinations that provide the required worker resource isolation and trustworthy terminal-state observation.
 
 [Adapters](adapters.md#qualification-gates) defines the experiments and required outcomes. An adapter cannot be qualified without satisfying the applicable requirements.
