@@ -453,6 +453,7 @@ export class Database {
         for (let suffix = 2; this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(id); suffix++) id = `${base}-${suffix}`;
       }
       const position = Number(this.db.prepare('SELECT coalesce(max(position), 0) + 1 AS position FROM tasks').get()!.position);
+      if (!Number.isSafeInteger(position)) throw new StorageError('conflict', 'Task position range exhausted');
       this.db.prepare(`INSERT INTO tasks (id, title, instructions, criteria, kind, profile, objective_id, position)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, value.title, value.instructions ?? '', json(value.criteria ?? []),
         value.kind ?? 'code', value.profile ?? null, value.objectiveId ?? null, position);
@@ -515,7 +516,7 @@ export class Database {
       }
       if (before.every((row, index) => row.id === order[index])) return before.map(row => this.decodeTask(this.taskRow(String(row.id))));
       // Move above the old range first, preserving positive unique positions throughout.
-      const offset = Math.max(...before.map(row => Number(row.position)));
+      const offset = before.reduce((max, row) => Math.max(max, Number(row.position)), 0);
       if (!Number.isSafeInteger(offset + order.length)) throw new StorageError('conflict', 'Task position range exhausted');
       const move = this.db.prepare('UPDATE tasks SET position = ? WHERE id = ? AND position = ?');
       for (let index = 0; index < before.length; index++) {
@@ -548,7 +549,7 @@ export class Database {
     });
   }
 
-  holdTask(id: string, reason: string, actor: TaskActor): Promise<Task> {
+  async holdTask(id: string, reason: string, actor: TaskActor): Promise<Task> {
     taskText(reason);
     if ([...reason].length > 200 || /[\r\n\u2028\u2029]/u.test(reason)) throw new TypeError('Hold reason must be one line of at most 200 characters');
     return this.decideTask(id, 'hold', actor, reason);

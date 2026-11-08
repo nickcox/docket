@@ -201,7 +201,7 @@ test('R02/R25: strict task inputs and single-line bounded hold reasons refuse wi
     await assert.rejects(db.updateTaskDefinition('a', value as Partial<TaskDefinition>, person), TypeError);
   }
   for (const reason of ['', '  ', 'a\nb', 'a\rb', 'a\u2028b', 'x'.repeat(201)]) {
-    assert.throws(() => db.holdTask('a', reason, person), TypeError);
+    await assert.rejects(db.holdTask('a', reason, person), TypeError);
   }
   await assert.rejects(db.addTask({ title: 'No authority' }, { kind: 'supervisor', id: 'worker' } as unknown as TaskActor), TypeError);
   assert.deepEqual(snapshot(db), before);
@@ -265,6 +265,31 @@ test('R25: concurrent stores serialise generated IDs, end positions, definition 
   const results = await Promise.allSettled([db.addBlocker('same', 'same-2', person), other.addBlocker('same-2', 'same', person)]);
   assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
   assert.equal(results.filter(result => result.status === 'rejected' && conflict(result.reason)).length, 1);
+});
+
+test('R25: task inputs are detached before asynchronous lock admission', async t => {
+  const { db, path } = await fixture(t);
+  using locker = new DatabaseSync(path);
+  locker.exec('BEGIN IMMEDIATE');
+  const input = { title: 'Original', criteria: ['Original criterion'] };
+  const actor: TaskActor = { kind: 'person', id: 'original-person' };
+  const pending = db.addTask(input, actor);
+  input.title = 'Mutated';
+  input.criteria.push('Mutated');
+  actor.id = 'mutated-person';
+  locker.exec('COMMIT');
+  const task = await pending;
+  assert.equal(task.id, 'original');
+  assert.equal(task.title, 'Original');
+  assert.deepEqual(task.criteria, ['Original criterion']);
+  assert.equal(db.events().at(-1)!.actor.id, 'original-person');
+
+  locker.exec('BEGIN IMMEDIATE');
+  const patch = { criteria: ['Updated criterion'] };
+  const updating = db.updateTaskDefinition(task.id, patch, person);
+  patch.criteria[0] = 'Mutated again';
+  locker.exec('COMMIT');
+  assert.deepEqual((await updating).criteria, ['Updated criterion']);
 });
 
 test('R25: read-only task inspection cannot mutate or record an event', async t => {
