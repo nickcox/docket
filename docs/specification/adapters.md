@@ -94,7 +94,7 @@ The restricted Pi supervisor exposes only catalogue tools, with no general shell
 
 Shutdown/error preserves outstanding event IDs and tool request keys. A fresh supervisor session starts with current briefing and pending notifications. It does not reconstruct authority from an old conversation or restart an existing worker.
 
-Keeping the machine awake is a host service invoked once per active execution/check period where configured. Native helper failure warns in diagnostics without inventing termination. It is not a safety prerequisite, and closing a laptop may still suspend processes. Lost heartbeats remain uncertainty after wake.
+Keeping the machine awake is a host service invoked once per active execution/check period where configured. Under bb, the bb host already holds a sleep assertion for as long as its server runs, so Docket's bb backend relies on it and starts no keep-awake helper of its own. The standalone Pi path, which has no such host, starts its own. Native helper failure warns in diagnostics without inventing termination. It is not a safety prerequisite, and closing a laptop may still suspend processes. Lost heartbeats remain uncertainty after wake.
 
 ## Qualification gates
 
