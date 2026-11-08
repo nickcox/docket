@@ -123,8 +123,8 @@ The operation-specific schema for ordinary task.add restricts kind to code/repor
 | attempt.accept | attemptId:UUID, candidateCommit:Commit\|null, overrideReason:Text\|null, dryRun:boolean | Person/supervisor; null selects recorded candidate, explicit commit selects committed output; only person can override missing checks/review with a reason |
 | attempt.stop | attemptId:UUID, dryRun:boolean | Person/supervisor; request stop, never claim stopped merely from request |
 | attempt.steer | attemptId:UUID, message:Text, mode:active\|after_turn, dryRun:boolean | Person/supervisor; capability checked before delivery |
-| attempt.return | attemptId:UUID, noProcesses:boolean, dryRun:boolean | Person only; true is explicit scoped confirmation |
-| attempt.discard | attemptId:UUID, confirmDiscard:boolean, noProcesses:boolean, reason:Text, dryRun:boolean | Person only |
+| attempt.return | attemptId:UUID, dryRun:boolean | Person; applies the same checks as automatic return |
+| attempt.discard | attemptId:UUID, confirmDiscard:boolean, reason:Text, dryRun:boolean | Person only |
 | effect.resolve | effectId:UUID, outcome:happened\|not_happened, evidence:Text, confirmStopped:boolean, dryRun:boolean | Person; specialised owner read must still agree |
 | claim.resolve | claimId:UUID, confirmStopped:boolean, evidence:Text, dryRun:boolean | Person; stale alone insufficient |
 | request.show | requestId:String | Scoped read of the exact public replay key |
