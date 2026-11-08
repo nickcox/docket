@@ -55,7 +55,7 @@ export async function resolveContext(selector: ContextSelector, options: Context
   let source: string;
   try {
     const info = await lstat(file);
-    if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$config', 'Configuration must be a regular, unlinked file');
+    if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$config', 'Configuration must be a regular file without hard links');
     source = new TextDecoder('utf-8', { fatal: true }).decode(await readFile(file));
   } catch (error) {
     if (error instanceof ConfigurationError) throw error;
@@ -87,7 +87,9 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
     const entries = await registry(path);
     if (Object.hasOwn(entries, config.contextId)) throw new ContextError('context_registered', 'Context name is already registered');
     for (const existingFile of Object.values(entries)) {
-      const existing = (await resolveContext({ config: existingFile }, options)).resolved;
+      const registered = await openContext({ config: existingFile }, options);
+      using registeredDatabase = registered.database;
+      const existing = registered.configuration.resolved;
       const currentRoots = [config.stateDirectory, config.workspace.poolRoot];
       const existingRoots = [existing.stateDirectory, existing.workspace.poolRoot];
       if (currentRoots.some(current => existingRoots.some(root => inside(current, root) || inside(root, current)))) {
@@ -97,12 +99,12 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
     // Refuse before creating state/pool directories or changing the registry.
     try {
       const info = await lstat(config.databasePath);
-      if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$.databasePath', 'Expected an unlinked regular file');
+      if (!info.isFile() || info.nlink !== 1) throw new ConfigurationError('$.databasePath', 'Expected a regular file without hard links');
       if (info.size !== 0) throw new StorageError('not_empty', 'Initialisation requires an empty database path');
     } catch (error) { if (!missing(error)) throw error; }
-    for (const [field, directory] of [['$.stateDirectory', config.stateDirectory], ['$.workspace.poolRoot', config.workspace.poolRoot]]) {
+    for (const [field, directory] of [['$.stateDirectory', config.stateDirectory], ['$.workspace.poolRoot', config.workspace.poolRoot]] as const) {
       try {
-        if (!(await lstat(directory!)).isDirectory()) throw new ConfigurationError(field!, 'Expected a directory');
+        if (!(await lstat(directory)).isDirectory()) throw new ConfigurationError(field, 'Expected a directory');
       } catch (error) { if (!missing(error)) throw error; }
     }
     try {
@@ -144,6 +146,11 @@ export async function openContext(selector: ContextSelector, options: ContextOpt
   if (options.expectedRevision !== undefined && (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 1)) throw new ConfigurationError('$binding.expectedRevision', 'Expected a positive configuration revision');
   const configuration = await resolveContext(selector, options);
   const { resolved: config } = configuration;
+  try { await lstat(config.databasePath); }
+  catch (error) {
+    if (missing(error)) throw new ContextError('not_initialised', 'The selected context database does not exist');
+    throw error;
+  }
   const database = await Database.open(config.databasePath, { readOnly: options.readOnly ?? true,
     location: { retainedRoot: config.stateDirectory, recyclableRoots: options.recyclableRoots ?? [] } });
   try {

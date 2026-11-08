@@ -150,6 +150,20 @@ test('R01/R39: different context names cannot collide on state or pool paths', a
   assert.deepEqual(await readFile(f.registry), before);
 });
 
+test('R01/R39: an edited registered configuration cannot hide storage collisions during another init', async t => {
+  const f = await fixture(t);
+  await initialiseContext({ config: f.file }, f.options);
+  f.config.workspace.poolRoot = join(f.home, 'moved-pool');
+  await writeFile(f.file, JSON.stringify(f.config));
+  const other = configuration(f.home, 'other');
+  const file = join(f.home, 'other.json');
+  await writeFile(file, JSON.stringify(other));
+  const before = await readFile(f.registry);
+  await assert.rejects(initialiseContext({ config: file }, f.options), contextError('config_changed'));
+  assert.deepEqual(await readFile(f.registry), before);
+  await assert.rejects(lstat(other.stateDirectory), { code: 'ENOENT' });
+});
+
 test('R39: a held registry lock refuses without changing it or creating context state', async t => {
   const f = await fixture(t);
   await mkdir(join(f.home, '.config', 'docket'), { recursive: true });
@@ -194,7 +208,7 @@ test('R39: malformed registry and retained pool contents refuse without replacem
 test('R01/R29: missing or mismatched registry names refuse, and a read-only open creates no missing context', async t => {
   const f = await fixture(t);
   await assert.rejects(resolveContext({ context: 'absent' }, f.options), contextError('not_initialised'));
-  await assert.rejects(openContext({ config: f.file }, f.options));
+  await assert.rejects(openContext({ config: f.file }, f.options), contextError('not_initialised'));
   await assert.rejects(lstat(f.config.stateDirectory), { code: 'ENOENT' });
   await mkdir(join(f.home, '.config', 'docket'), { recursive: true });
   await writeFile(f.registry, JSON.stringify({ wrong: f.file }));
