@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonicalJson } from '../../src/configuration.ts';
 import { applicationId } from '../../src/storage/database.ts';
@@ -39,7 +39,7 @@ async function fixture(t: Parameters<typeof checkFixture>[0]) {
     const executor = { claimId: claim!.id, generation: claim!.generation };
     const acquisition = await f.db.beginWorkspaceAcquisition(id, reservation.requestId, executor, person);
     const workspace = acquisition.effect.input.workspace as JsonObject;
-    const allocation: Allocation = { ...source.allocation, leaseId: `lease:${id}`, path: `${source.allocation.pool}/${id}`,
+    const allocation: Allocation = { ...source.allocation, leaseId: `lease:${id}`, path: join(source.allocation.pool, id),
       holder: workspace.holder as JsonObject, startingCommit: head, outputRef: String(reservation.attempt.specification.outputRef) };
     await f.db.recordAllocation(id, acquisition.effect.id, executor, allocation);
     await f.db.startAttempt(id, person);
