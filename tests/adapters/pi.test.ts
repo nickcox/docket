@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { PiLauncher } from '../../src/adapters/pi.ts';
+import { windowsPowerShellEnvironment } from '../../src/adapters/host-files.ts';
 import { PiFrames } from '../../src/adapters/pi-rpc.ts';
 import type { WorkerBinding } from '../../src/adapters/launcher.ts';
 import type { WorkerReference } from '../../src/storage/launch.ts';
@@ -185,7 +186,7 @@ test('R31/R33/R35: exact cwd/provider/model, controlled resources and environmen
       '@{ owner = $sid; rules = $rules } | ConvertTo-Json -Depth 4';
     const acl = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
       Buffer.from(script, 'utf16le').toString('base64')],
-    { env: { ...process.env, PRIVATE_HOME: spawn.environment.HOME }, encoding: 'utf8' }));
+    { env: { ...windowsPowerShellEnvironment(), PRIVATE_HOME: spawn.environment.HOME }, encoding: 'utf8' }));
     assert.ok(acl.rules.length > 0);
     for (const rule of acl.rules) assert.deepEqual(rule, { sid: acl.owner, allow: true, full: true });
   } else {

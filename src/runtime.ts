@@ -39,8 +39,15 @@ export async function loadExecutionProfiles(home = homedir()): Promise<Execution
     if (info.nlink !== 1) throw new Error();
     condition = 'file exceeds 256 KiB';
     if (info.size > 256 * 1024) throw new Error();
-    condition = process.platform === 'win32' ? 'Windows owner/write ACL is untrusted or could not be verified' : 'group or other write permission';
-    if (process.platform === 'win32' ? !await windowsSettingsWritableOnlyByOwner(path) : (info.mode & 0o022) !== 0) throw new Error();
+    if (process.platform === 'win32') {
+      condition = 'Windows owner/write ACL could not be verified';
+      const trusted = await windowsSettingsWritableOnlyByOwner(path);
+      condition = 'Windows owner/write ACL is untrusted';
+      if (!trusted) throw new Error();
+    } else {
+      condition = 'group or other write permission';
+      if ((info.mode & 0o022) !== 0) throw new Error();
+    }
     condition = 'file contents could not be read';
     const text = await readFile(path, 'utf8');
     condition = 'invalid JSON';
