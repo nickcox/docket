@@ -39,6 +39,14 @@ const schema = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type JsonObject = { [key: string]: Json };
 
+/** Repository retention and ancestry reads describe the repository, not the result file, so they never settle an attempt. */
+const repositoryUnconfirmedErrors = new WeakSet<StorageError>();
+function repositoryUnconfirmed(message: string): StorageError {
+  const error = new StorageError('result_invalid', message);
+  repositoryUnconfirmedErrors.add(error);
+  return error;
+}
+
 export class StorageError extends Error {
   readonly code: 'path' | 'not_initialised' | 'family' | 'version' | 'not_empty' | 'busy' | 'conflict' | 'read_only' | 'request_input_mismatch' | 'result_invalid' | 'result_identity_mismatch' | 'result_discrepancy';
   constructor(code: StorageError['code'], message: string) {
@@ -1428,7 +1436,7 @@ export class Database {
     try {
       return await this.validateWorkerResultFiles(attemptId, host, repository);
     } catch (error) {
-      if (error instanceof StorageError && ['result_invalid', 'result_identity_mismatch'].includes(error.code)) {
+      if (error instanceof StorageError && ['result_invalid', 'result_identity_mismatch'].includes(error.code) && !repositoryUnconfirmedErrors.has(error)) {
         await this.write(() => {
           const attempt = this.attemptRow(attemptId), taskId = String(attempt.task_id);
           this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
@@ -1467,17 +1475,18 @@ export class Database {
       if (!repository) throw new StorageError('result_invalid', 'Code result needs repository retention and ancestry evidence');
       const reference = (value.content.workReferences as JsonObject[]).find(item => item.kind === 'git')!;
       const comparison = await repository.compare(binding.startingCommit, String(reference.commit));
-      if (comparison.status !== 'confirmed' || !comparison.value) throw new StorageError('result_invalid', 'Code candidate must descend from the starting commit');
+      if (comparison.status !== 'confirmed') throw repositoryUnconfirmed('Code candidate must descend from the starting commit');
+      if (!comparison.value) throw new StorageError('result_invalid', 'Code candidate must descend from the starting commit');
       const retained = await repository.verifyRetention({ references: [{ ref: binding.outputRef, commit: String(reference.commit) }],
         artefacts: [], recyclableRoots: binding.recyclableRoots });
-      if (retained.status !== 'confirmed') throw new StorageError('result_invalid', 'Exact candidate is not known to be retained');
+      if (retained.status !== 'confirmed') throw repositoryUnconfirmed('Exact candidate is not known to be retained');
     }
     if (!previous && value.content.outcome === 'completed' && binding.delivery.kind === 'review') {
       const target = binding.reviewTarget as JsonObject;
       if (!repository) throw new StorageError('result_invalid', 'Review needs repository retention evidence');
       const retained = await repository.verifyRetention({ references: [{ ref: String(target.outputRef), commit: String(target.commit) }],
         artefacts: [], recyclableRoots: binding.recyclableRoots });
-      if (retained.status !== 'confirmed') throw new StorageError('result_invalid', 'Reviewed output is not retained');
+      if (retained.status !== 'confirmed') throw repositoryUnconfirmed('Reviewed output is not retained');
     }
     return this.write(() => {
       const attempt = this.attemptRow(attemptId);
