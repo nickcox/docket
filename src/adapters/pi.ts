@@ -30,6 +30,7 @@ export interface PiLauncherOptions {
   requestMs?: number;
   stopMs?: number;
   maxRecordBytes?: number;
+  windowsSecurePrivateDirectory?: (path: string) => Promise<void>;
   /** Trusted host must freshly verify the committed matching reference, effect and owning claim. */
   admit: (reference: WorkerReference, storedInput: JsonObject, effectId: string, claimGeneration: string) => Promise<boolean>;
 }
@@ -107,7 +108,7 @@ export class PiLauncher implements Launcher {
       if (!outside(cwd, root)) return rejected('Pi state must be outside the leased workspace');
       const directory = join(root, randomUUID());
       await mkdir(directory, { mode: 0o700 });
-      if (process.platform === 'win32') await windowsSecurePrivateDirectory(directory);
+      if (process.platform === 'win32') await (this.options.windowsSecurePrivateDirectory ?? windowsSecurePrivateDirectory)(directory);
       const home = join(directory, 'home'), sessions = join(directory, 'sessions');
       await mkdir(join(home, '.pi', 'agent'), { recursive: true, mode: 0o700 });
       await mkdir(sessions, { mode: 0o700 });

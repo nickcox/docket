@@ -1,7 +1,7 @@
 import { readFile, lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { windowsSettingsWritableOnlyByOwner } from './adapters/host-files.ts';
+import { windowsSettingsWritableOnlyByOwner, windowsSecurePrivateDirectory } from './adapters/host-files.ts';
 import { PiLauncher } from './adapters/pi.ts';
 import type { PiExecutionProfile } from './adapters/pi.ts';
 import { GitRepository } from './adapters/repository.ts';
@@ -21,13 +21,17 @@ export interface Runtime {
   completion: CompletionServices;
   launcher: Launcher;
 }
+export interface RuntimeOptions {
+  windowsSettingsWritableOnlyByOwner?: (path: string) => Promise<boolean>;
+  windowsSecurePrivateDirectory?: (path: string) => Promise<void>;
+}
 export interface ExecutionProfiles {
   version: 1;
   pi: Record<string, PiExecutionProfile>;
   checks: Record<string, ExecutionProfile>;
 }
 /** Host settings are person-controlled and never accepted in operation JSON. */
-export async function loadExecutionProfiles(home = homedir()): Promise<ExecutionProfiles> {
+export async function loadExecutionProfiles(home = homedir(), options: RuntimeOptions = {}): Promise<ExecutionProfiles> {
   const path = join(home, '.config', 'docket', 'execution-profiles.json');
   // Only fixed condition names reach diagnostics, never an OS error or parser input.
   let condition = 'file metadata could not be read';
@@ -41,7 +45,7 @@ export async function loadExecutionProfiles(home = homedir()): Promise<Execution
     if (info.size > 256 * 1024) throw new Error();
     if (process.platform === 'win32') {
       condition = 'Windows owner/write ACL could not be verified';
-      const trusted = await windowsSettingsWritableOnlyByOwner(path);
+      const trusted = await (options.windowsSettingsWritableOnlyByOwner ?? windowsSettingsWritableOnlyByOwner)(path);
       condition = 'Windows owner/write ACL is untrusted';
       if (!trusted) throw new Error();
     } else {
@@ -63,12 +67,13 @@ export async function loadExecutionProfiles(home = homedir()): Promise<Execution
     return value;
   } catch { throw new ConfigurationError('$executionProfiles', `Cannot read person-controlled execution profiles: ${condition}`); }
 }
-export async function createRuntime(db: Database, config: Configuration, home?: string): Promise<Runtime> {
-  const profiles = await loadExecutionProfiles(home);
+export async function createRuntime(db: Database, config: Configuration, home?: string, options: RuntimeOptions = {}): Promise<Runtime> {
+  const profiles = await loadExecutionProfiles(home, options);
   const repository = new GitRepository({ repository: config.repository });
   const workspace = new TreehouseWorkspace({ repository, poolRoot: config.workspace.poolRoot,
     receiptsDirectory: join(config.stateDirectory, 'workspace-receipts') });
   const launcher = new PiLauncher({ stateDirectory: join(config.stateDirectory, 'workers'), profiles: profiles.pi,
+    windowsSecurePrivateDirectory: options.windowsSecurePrivateDirectory ?? windowsSecurePrivateDirectory,
     admit: async (_reference, input, effectId, generation) => {
       const request = db.request(effectId);
       const checked = db.checkWorkerEffect(effectId, { claimId: request.claimId!, generation });

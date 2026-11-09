@@ -23,7 +23,8 @@ export async function snapshot(root: string): Promise<Record<string, string>> {
   };
   await visit(root); return files;
 }
-export const entry = fileURLToPath(new URL('../../bin/docket.ts', import.meta.url));
+export const entry = fileURLToPath(new URL('../fixtures/cli.ts', import.meta.url));
+export const realEntry = fileURLToPath(new URL('../../bin/docket.ts', import.meta.url));
 const peer = fileURLToPath(new URL('../fixtures/pi-peer.ts', import.meta.url));
 // Repository initialisation is not a CLI boundary. Copy an immutable seed so
 // each test still has independent refs, index, configuration and worktree files.
@@ -43,7 +44,7 @@ before(async () => {
 });
 after(() => rm(seed, { recursive: true, force: true }));
 
-export async function fixture(t: test.TestContext, mode = 'code-result') {
+export async function fixture(t: test.TestContext, mode = 'code-result', cliEntry = entry) {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-operations-')));
   t.after(() => rm(home, { recursive: true, force: true }));
   if (process.platform === 'win32') {
@@ -66,7 +67,7 @@ export async function fixture(t: test.TestContext, mode = 'code-result') {
     pi: { 'pi-test': { executable: process.execPath, entrypoint: peer, passEnvironment: ['PEER_MODE', 'PEER_RECORD'] } },
     checks: { 'node-project-v1': { id: 'node-project-v1', tools: { node: process.version }, dependencies: {} } } }), { mode: 0o600 });
   const invoke = (operation: string, args: object, key?: string, peerMode = mode) => {
-    const result = spawnSync(process.execPath, [entry, ...operation.split('.'), '--config', file, '--stdin', '--json', ...(key ? ['--request-id', key] : [])], {
+    const result = spawnSync(process.execPath, [cliEntry, ...operation.split('.'), '--config', file, '--stdin', '--json', ...(key ? ['--request-id', key] : [])], {
       encoding: 'utf8', input: JSON.stringify(args),
       // A rebase verifies and retains output, runs fresh checks and reattaches
       // the lease. Windows has taken 44 seconds at this real-process boundary.
