@@ -70,13 +70,13 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
   await writeFile(join(home, '.config', 'docket', 'execution-profiles.json'), JSON.stringify({ version: 1,
     pi: { 'pi-test': { executable: process.execPath, entrypoint: peer, passEnvironment: ['PEER_MODE', 'PEER_RECORD'] } },
     checks: { 'node-project-v1': { id: 'node-project-v1', tools: { node: process.version }, dependencies: {} } } }), { mode: 0o600 });
-  const invoke = (operation: string, args: object, key?: string) => {
+  const invoke = (operation: string, args: object, key?: string, peerMode = mode) => {
     const result = spawnSync(process.execPath, [entry, ...operation.split('.'), '--config', file, '--stdin', '--json', ...(key ? ['--request-id', key] : [])], {
       encoding: 'utf8', input: JSON.stringify(args),
       // A rebase verifies and retains output, runs fresh checks and reattaches
       // the lease. Windows has taken 44 seconds at this real-process boundary.
       timeout: operation === 'attempt.rebase' && !('dryRun' in args && args.dryRun) ? 60000 : 20000,
-      env: { ...process.env, HOME: home, USERPROFILE: home, PEER_MODE: mode, PEER_RECORD: join(home, 'peer.jsonl') },
+      env: { ...process.env, HOME: home, USERPROFILE: home, PEER_MODE: peerMode, PEER_RECORD: join(home, 'peer.jsonl') },
     });
     assert.ifError(result.error); assert.equal(result.signal, null);
     assert.equal(result.stdout.split('\n').length, 2, result.stdout);
@@ -728,6 +728,8 @@ test('R13/A28: CLI review creation, exact dispatch and verdict views share the w
   const review = f.invoke('attempt.dispatch', { taskId: task.id, profile: null, dryRun: false });
   assert.equal(review.status, 0, JSON.stringify(review.envelope));
   assert.equal(review.data.attempt.specification.startingCommit, source.data.attempt.candidate.commit);
+  assert.deepEqual(review.data.leaseReturn, { state: 'returned', reason: null });
+  assert.equal(review.data.attempt.leaseState, 'returned');
   assert.equal(f.invoke('task.show', { taskId: task.id }).data.task.state, 'done');
   const shown = f.invoke('attempt.show', { attemptId }).data;
   assert.equal(shown.review.current.payload.verdict, 'passed');
@@ -739,6 +741,47 @@ test('R13/A28: CLI review creation, exact dispatch and verdict views share the w
   using sql = new DatabaseSync(f.config.databasePath);
   assert.equal(sql.prepare("SELECT count(*) AS n FROM requests WHERE attempt_id = ? AND operation = 'checks.run'").get(review.data.attempt.id)!.n, 0);
 });
+
+for (const scenario of ['held', 'failed', 'replaced-candidate', 'dirty-untracked', 'dirty-tracked']) {
+  test(`R11/R13/A21: review dispatch safe return – ${scenario}`, async t => {
+    const f = await fixture(t);
+    f.invoke('task.add', { id: 'source', definition, objectiveId: null });
+    const source = f.invoke('attempt.dispatch', { taskId: 'source', profile: null, dryRun: false }).data.attempt;
+    const created = f.invoke('attempt.review', { attemptId: source.id, dryRun: false });
+    assert.equal(created.status, 0, JSON.stringify(created.envelope));
+    const task = created.data.task;
+    if (scenario === 'replaced-candidate') {
+      using sql = new DatabaseSync(f.config.databasePath);
+      sql.prepare('UPDATE attempts SET candidate = ? WHERE id = ?').run(
+        JSON.stringify({ ...source.candidate, id: 'replacement' }), source.id);
+    }
+    const mode = scenario.startsWith('dirty-') ? `review-${scenario}`
+      : scenario === 'held' || scenario === 'failed' ? `${scenario}-result` : 'code-result';
+    const args = { taskId: task.id, profile: null, dryRun: false };
+    const review = f.invoke('attempt.dispatch', args, 'review-dispatch', mode);
+    assert.equal(review.status, 0, JSON.stringify(review.envelope));
+    const attempt = review.data.attempt;
+    const dirty = scenario.startsWith('dirty-');
+    assert.equal(attempt.outcome, scenario === 'held' || scenario === 'failed' ? scenario : 'completed');
+    assert.equal(attempt.leaseState, dirty ? 'held' : 'returned');
+    assert.equal(review.data.leaseReturn.state, dirty ? 'kept' : 'returned');
+    const replay = f.invoke('attempt.dispatch', args, 'review-dispatch', mode);
+    assert.equal(replay.status, 0, JSON.stringify(replay.envelope));
+    assert.equal(replay.data.leaseReturn.state, review.data.leaseReturn.state);
+    const shown = f.invoke('attempt.show', { attemptId: source.id }).data;
+    assert.equal(shown.review.findings.length, dirty ? 1 : 0);
+    if (dirty) {
+      assert.match(review.data.leaseReturn.reason, /uncommitted or untracked/);
+      const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+      const attention = status.data.attempts.items.find((item: any) => item.id === attempt.id);
+      assert.match(attention.reason, /uncommitted or untracked/);
+      assert.equal(attention.nextAction.operation, 'attempt.return');
+      assert.ok(attention.nextAction.description);
+      const path = join(attempt.allocation.path, scenario === 'dirty-untracked' ? 'unfinished.txt' : 'implementation.txt');
+      assert.match(await readFile(path, 'utf8'), /review work/);
+    }
+  });
+}
 
 test('R28/R27: strict task inputs, mutations, revisions, replay and paginated reads share one envelope', async t => {
   const f = await fixture(t);

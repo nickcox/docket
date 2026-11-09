@@ -215,7 +215,10 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     }
     if (db.workerStopRequested(id)) {
       const attempt = await db.interruptWorker(id, host);
-      return { attempt, leaseReturn: { state: 'kept', reason: 'Stopped work is retained for inspection.' },
+      const leaseReturn = reviewTarget ? await automaticReturn(db, id, caller, runtime.completion) : null;
+      return { attempt: leaseReturn?.attempt ?? attempt,
+        leaseReturn: leaseReturn ? { state: leaseReturn.state, reason: leaseReturn.reason }
+          : { state: 'kept', reason: 'Stopped work is retained for inspection.' },
         skippedTasks: reservation.skippedTasks, steps };
     }
     await withHeartbeat(db.completeWorker(id, host, runtime.repository));
@@ -230,11 +233,11 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       if (checks.state === 'uncertain' || checks.state === 'claimed') throw new CommandFailure('effect_uncertain', { attemptId: id, checksRequestId: checks.id });
     }
     const attempt = db.attempt(id);
-    const leaseReturn = ['held', 'failed'].includes(attempt.outcome ?? '')
+    const leaseReturn = reviewTarget || ['held', 'failed'].includes(attempt.outcome ?? '')
       ? await automaticReturn(db, id, caller, runtime.completion) : null;
     return { attempt: leaseReturn?.attempt ?? attempt,
       leaseReturn: leaseReturn ? { state: leaseReturn.state, reason: leaseReturn.reason }
-        : { state: 'kept', reason: reviewTarget ? 'Review is complete; the lease is kept until return.' : 'Candidate is awaiting acceptance.' },
+        : { state: 'kept', reason: 'Candidate is awaiting acceptance.' },
       skippedTasks: reservation.skippedTasks, steps };
   } finally {
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);

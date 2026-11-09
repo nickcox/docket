@@ -65,7 +65,7 @@ function receive(line: string) {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       writeFileSync(protocol.resultPath, 'invalid JSON');
     }
-    if (['result', 'code-result', 'held-result', 'failed-result'].includes(mode ?? '')) {
+    if (['result', 'code-result', 'held-result', 'failed-result', 'review-dirty-untracked', 'review-dirty-tracked'].includes(mode ?? '')) {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       let commit = 'b'.repeat(40);
       if (mode !== 'result' && !protocol.reviewTarget) {
@@ -75,6 +75,8 @@ function receive(line: string) {
         git('-c', 'user.name=Synthetic peer', '-c', 'user.email=peer@example.invalid', 'commit', '-qm', 'Implement task');
         commit = git('rev-parse', 'HEAD');
       }
+      if (protocol.reviewTarget && mode === 'review-dirty-untracked') writeFileSync(join(process.cwd(), 'unfinished.txt'), 'Untracked review work\n');
+      if (protocol.reviewTarget && mode === 'review-dirty-tracked') writeFileSync(join(process.cwd(), 'implementation.txt'), 'Uncommitted review work\n');
       writeFileSync(protocol.resultPath, JSON.stringify({ version: 1, identity: protocol.identity,
         startingCommit: protocol.startingCommit, outputRef: protocol.outputRef,
         outcome: mode === 'held-result' ? 'held' : mode === 'failed-result' ? 'failed' : 'completed',
