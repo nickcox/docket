@@ -27,7 +27,7 @@ test('R16/A35: real commands have no stdin, shell or DOCKET variables and diagno
   assert.equal(clipped.stdout.length, 8192); assert.equal(clipped.truncated, true);
 });
 
-test('R16/A35: timeout and spawn failure never pass; a signal-killed command remains uncertain', async t => {
+test('R16/A35: timeout fails, spawn failure does not run, and self-kill uses the platform ending', async t => {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-command-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const run = checkCommandRunner(environment);
@@ -36,11 +36,32 @@ test('R16/A35: timeout and spawn failure never pass; a signal-killed command rem
   const missing = await run({ name: 'missing', command: [join(root, 'nonexistent')], timeoutMs: 1000 }, root);
   assert.equal(missing.status, 'not_run'); assert.equal(missing.exitCode, null);
   const signal = await run(check("process.kill(process.pid, 'SIGKILL')"), root);
-  assert.equal(signal.status, 'uncertain'); assert.equal(signal.exitCode, null);
+  assert.equal(signal.status, process.platform === 'win32' ? 'failed' : 'uncertain');
+  assert.equal(signal.signal, process.platform === 'win32' ? null : 'SIGKILL');
+  assert.equal(signal.exitCode, process.platform === 'win32' ? 1 : null);
   const failure = await run(check('process.exit(1)'), root);
-  assert.equal(failure.status, process.platform === 'win32' ? 'uncertain' : 'failed');
-  assert.equal(failure.exitCode, process.platform === 'win32' ? null : 1);
-  if (process.platform === 'win32') assert.equal(failure.observedExitCode, 1);
+  assert.equal(failure.status, 'failed'); assert.equal(failure.exitCode, 1);
+});
+
+test('R16/A35: crashes fail and interruptions stay uncertain with observed termination diagnostics', async t => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-ending-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const run = checkCommandRunner(environment);
+  if (process.platform === 'win32') {
+    for (const code of [0xC0000005, 0xC000001D, 0xC000013A]) {
+      const result = await run(check(`process.exit(${code})`), root);
+      assert.equal(result.status, code === 0xC000013A ? 'uncertain' : 'failed');
+      assert.equal(result.exitCode! >>> 0, code); assert.equal(result.signal, null);
+    }
+  } else {
+    for (const signal of ['SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGFPE', 'SIGABRT', 'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGKILL']) {
+      // exec replaces the shell so core dumps can be disabled without changing the observed signal.
+      const result = await run({ name: 'ending', command: ['/bin/sh', '-c', 'ulimit -c 0; exec "$@"', 'check',
+        process.execPath, '-e', `process.kill(process.pid, '${signal}')`], timeoutMs: 2000 }, root);
+      assert.equal(result.status, ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGKILL'].includes(signal) ? 'uncertain' : 'failed', signal);
+      assert.equal(result.signal, signal); assert.equal(result.exitCode, null);
+    }
+  }
 });
 
 test('R15: Git reads exact target content without checkout; worker changes cannot relax it; absence differs from malformed', async t => {

@@ -9,7 +9,7 @@ import { catalogue } from "../../src/catalog.ts";
 import type { Envelope } from "../../src/response.ts";
 
 const entry = fileURLToPath(new URL("../../bin/docket.ts", import.meta.url));
-const failureImport = fileURLToPath(new URL("./fixtures/fail-serialisation.ts", import.meta.url));
+const failureImport = new URL("./fixtures/fail-serialisation.ts", import.meta.url).href;
 const secret = "ENV_SECRET_7a2efc_NOT_FOR_OUTPUT";
 
 function invoke(args: string[], options: { input?: string | Buffer; unexpectedFailure?: boolean } = {}) {

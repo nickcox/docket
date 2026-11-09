@@ -2,7 +2,7 @@ import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { reserveAndAllocate, WorkspaceAcquisitionError } from '../../src/attempts.ts';
@@ -269,7 +269,7 @@ test('A10/R05: provider-chosen path is recorded once, identical allocations retu
 });
 
 test('A11/R05: wrong provider holder, path, pool, repository, ref or commit never records an allocation', async t => {
-  const changes = { holder: { taskId: 'another' }, path: '/another/path', pool: '/another/pool', repository: { identity: 'other' },
+  const changes = { holder: { taskId: 'another' }, path: resolve('another/path'), pool: resolve('another/pool'), repository: { identity: 'other' },
     outputRef: 'refs/heads/wrong', startingCommit: 'b'.repeat(40) };
   for (const [field, changed] of Object.entries(changes)) await t.test(field, async t => {
     const { db, executor } = await fixture(t);

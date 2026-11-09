@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -73,7 +73,7 @@ test("R32/A11 real Treehouse acquire verifies complete allocation and removes pr
   assert.ok(allocation.leaseId); assert.equal(allocation.holder, f.request.holder);
   assert.equal(allocation.branch, f.request.branch); assert.equal(allocation.startingCommit, f.request.startingCommit);
   assert.equal(allocation.repository, value(await f.repo.identity()));
-  assert.ok(allocation.pool.includes(f.poolRoot));
+  assert.equal(JSON.parse(allocation.pool).root, f.poolRoot);
   assert.equal(value(await f.repo.inspectWorkspace(allocation.path)).head, f.request.startingCommit);
   assert.deepEqual(value(await f.repo.inspectRef(`refs/heads/${startingBranch(f.request.databaseId, f.request.attemptId)}`)), { state: "absent" });
   assert.deepEqual(value(await f.workspace.recyclableRoots()), [f.poolRoot]);
@@ -234,12 +234,13 @@ test("R32/A11 wrong live branch, repository, path or holder never matches a reco
   const other = join(f.root, "other-repository"); await mkdir(other);
   assert.equal((await f.run("git", ["init", "-qb", allocation.branch], other)).code, 0);
   assert.equal((await f.run("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "other"], other)).code, 0);
-  const markerPath = join(allocation.path, ".git"), marker = await readFile(markerPath, "utf8");
+  const markerPath = join(allocation.path, ".git"), savedMarker = join(f.root, 'saved-git');
+  await rename(markerPath, savedMarker);
   try {
     await writeFile(markerPath, `gitdir: ${join(other, ".git")}\n`);
     const wrongRepository = await f.workspace.inspect(allocation);
     assert.notEqual(wrongRepository.status === "confirmed" ? wrongRepository.value.state : wrongRepository.status, "matching");
-  } finally { await writeFile(markerPath, marker); }
+  } finally { await rm(markerPath, { force: true }); await rename(savedMarker, markerPath); }
   // The pool owner can still list a lease while Git no longer has its recorded branch checked out.
   assert.equal((await f.run("git", ["switch", "--detach", "-q"], allocation.path)).code, 0);
   const detached = await f.workspace.inspect(allocation);

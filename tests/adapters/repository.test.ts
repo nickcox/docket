@@ -266,7 +266,7 @@ test("R32 retention requires exact reachability, clean workspace and regular art
   assert.equal((await f.repo.verifyRetention({ ...request, references: [{ ref: "refs/heads/main", commit: f.head }] })).status, "rejected");
   const recycled = join(pool, "report"); await writeFile(recycled, "{}");
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [recycled] })).status, "rejected");
-  const linked = join(f.root, "linked"); await symlink(recycled, linked, process.platform === 'win32' ? 'junction' : 'dir');
+  const linked = join(f.root, "linked"); await symlink(recycled, linked, 'file');
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [linked] })).status, "rejected");
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [join(f.root, "missing")] })).status, "uncertain");
   await writeFile(join(f.path, "untracked"), "work");

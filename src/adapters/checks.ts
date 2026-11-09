@@ -47,12 +47,12 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
       // Suppress an overflowing stream rather than retaining a credential cut at the buffer boundary.
       const out = stdoutTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stdout, redactions);
       const err = stderrTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stderr, redactions);
-      // Windows can report a self-killed child as exit code 1 with no signal,
-      // indistinguishable from an ordinary failure. Preserve that uncertainty.
-      const unknownTermination = process.platform === 'win32' && code !== null && code !== 0 && !timedOut && !spawnFailed;
-      resolve({ status: spawnFailed ? 'not_run' : timedOut ? 'failed' : signal || pipesOpen || unknownTermination ? 'uncertain' : code === 0 ? 'passed' : 'failed',
-        exitCode: spawnFailed || unknownTermination ? null : code, timedOut,
-        ...(unknownTermination ? { observedExitCode: code } : {}),
+      const crash = signal !== null && ['SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGFPE', 'SIGABRT'].includes(signal);
+      // Windows reports NT status values as exit codes, including console interruption.
+      const interrupted = process.platform === 'win32' ? code !== null && (code >>> 0) === 0xC000013A : signal !== null && !crash;
+      resolve({ status: spawnFailed ? 'not_run' : timedOut ? 'failed' : interrupted ? 'uncertain'
+        : crash || (code !== null && code !== 0) ? 'failed' : pipesOpen || signal || code === null ? 'uncertain' : 'passed',
+        exitCode: spawnFailed ? null : code, signal, timedOut,
         stdout: out.slice(0, 8192), stderr: err.slice(0, 8192),
         truncated: stdoutTruncated || stderrTruncated || out.length > 8192 || err.length > 8192,
         ...(spawnFailed ? { reason: 'Command could not be started' } : {}) });

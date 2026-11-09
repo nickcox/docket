@@ -1,6 +1,7 @@
 import { readFile, lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { windowsSettingsWritableOnlyByOwner } from './adapters/host-files.ts';
 import { PiLauncher } from './adapters/pi.ts';
 import type { PiExecutionProfile } from './adapters/pi.ts';
 import { GitRepository } from './adapters/repository.ts';
@@ -30,7 +31,8 @@ export async function loadExecutionProfiles(home = homedir()): Promise<Execution
   const path = join(home, '.config', 'docket', 'execution-profiles.json');
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o022) !== 0 || info.size > 256 * 1024) throw new Error();
+    if (!info.isFile() || info.nlink !== 1 || info.size > 256 * 1024) throw new Error();
+    if (process.platform === 'win32' ? !await windowsSettingsWritableOnlyByOwner(path) : (info.mode & 0o022) !== 0) throw new Error();
     const value = strictJson(await readFile(path, 'utf8')) as ExecutionProfiles;
     if (!value || value.version !== 1 || Object.keys(value).some(k => !['version', 'pi', 'checks'].includes(k))
       || !value.pi || typeof value.pi !== 'object' || Array.isArray(value.pi) || !value.checks || typeof value.checks !== 'object' || Array.isArray(value.checks)) throw new Error();
