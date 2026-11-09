@@ -22,6 +22,7 @@ import { step } from './plans.ts';
 import { unknownProfile, UnknownProfileError } from './profiles.ts';
 import { requestView } from './request-view.ts';
 import { nextAction as action } from './next-action.ts';
+import { validateSchema } from './operation-schemas.ts';
 
 export interface OperationOptions extends ContextOptions {
   runtime?: typeof createRuntime;
@@ -86,7 +87,9 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
 
 export async function executeCoreOperation(operation: OperationDefinition, args: Record<string, unknown>, progress: (message: string) => void,
   selector: ContextSelector, requestKey: string = randomUUID(), options: OperationOptions = {}): Promise<Record<string, unknown>> {
-  const caller = options.caller ?? { kind: 'person', id: String(userInfo().uid) };
+  if (validateSchema(operation.inputSchema, args)) throw new CommandFailure('invalid_input');
+  args = structuredClone(args);
+  const caller: TaskActor = structuredClone(options.caller ?? { kind: 'person' as const, id: String(userInfo().uid) });
   if (!operation.roles.includes(caller.kind)) throw new CommandFailure('person_required');
   if (operation.name === 'context.init') return initialiseContext(selector, { ...options, caller });
   if (operation.name === 'context.configure') return configureContext(selector, { ...options, caller, dryRun: args.dryRun === true });
@@ -97,13 +100,15 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   let runtime: Runtime | undefined;
   const services = async () => runtime ??= await (options.runtime ?? createRuntime)(db, context.configuration.resolved, options.home);
   try {
+    db.checkAuthority(caller, operation.name, input);
+    const visibleTask = (task: Task) => caller.kind !== 'supervisor' || task.objectiveId === caller.objectiveId;
     const id = String(args.taskId);
     switch (operation.name) {
       case 'diagnostics.clean': return await cleanDiagnostics(db, args as unknown as Parameters<typeof cleanDiagnostics>[1], caller, requestKey);
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
       case 'status.show': {
-        const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!));
-        const tasks = db.tasks().map(t => {
+        const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!)).filter(a => visibleTask(db.task(a.taskId)));
+        const tasks = db.tasks().filter(visibleTask).map(t => {
           const ready = db.readyTasks().some(task => task.id === t.id);
           const problem = t.state === 'queued' ? unknownProfile(context.configuration.resolved, t.profile) : null;
           return { id: t.id, title: t.title, state: t.state, ready, holdReason: t.holdReason, blockedBy: t.blockerIds,
@@ -112,7 +117,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
               : t.holdReason !== null ? action('task.show', { taskId: t.id }, 'Inspect the task hold before deciding how to proceed.')
               : ready ? action('attempt.dispatch', { taskId: t.id, profile: null, dryRun: true }, 'Plan dispatch of the ready task.') : null };
         }).filter(t => !args.attentionOnly || t.reason !== null);
-        const requests = db.requests();
+        const requests = db.requests().filter(r => caller.kind !== 'supervisor' || r.attemptId && visibleTask(db.task(db.attempt(r.attemptId).taskId)));
         const attentionAttempts = (await Promise.all(attempts.map(async a => {
           const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
           const checksState = String(checks?.result?.status ?? checks?.state ?? 'missing');
@@ -136,8 +141,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           return { id: a.id, taskId: a.taskId, number: a.number, phase: a.phase, outcome: a.outcome,
             leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, review: db.reviewEvidence(a.id), checksState, resultInvalid: invalidResult, reason, nextAction };
         }))).filter(a => !args.attentionOnly || a.reason !== null);
-        const blockers = db.admissionBlockers();
-        const claims = db.claims().filter(c => !c.releasedAt).map(c => {
+        const blockers = db.admissionBlockers().filter(b => caller.kind !== 'supervisor' || 'attemptId' in b && typeof b.attemptId === 'string' && visibleTask(db.task(db.attempt(b.attemptId).taskId)));
+        const claims = db.claims().filter(c => !c.releasedAt && (caller.kind !== 'supervisor' || c.attemptId && visibleTask(db.task(db.attempt(c.attemptId).taskId)))).map(c => {
           if (!args.attentionOnly) return c;
           const blocker = blockers.find(b => b.kind === 'claim' && b.claimId === c.id);
           return blocker ? { ...c, reason: `Claim heartbeat is ${blocker.reason}; ownership is unresolved.`,
@@ -163,7 +168,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             nextAction: b.kind === 'claim'
               ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
-          objectives: db.objectives(), openPersonQuestions: [] };
+          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId), openPersonQuestions: [] };
       }
       case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));
       case 'objective.add': return { objective: await db.addObjective(args as unknown as Parameters<Database['addObjective']>[0], caller, command) };
@@ -173,7 +178,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         operation.name === 'objective.abandon' ? 'abandon' : 'reopen', String(args.reason), caller, command) };
       case 'task.move': return { task: await db.moveTask(id, Number(args.expectedRevision), args.objectiveId as string | null, caller, command) };
       case 'task.show': return { task: taskView(db, db.task(id)) };
-      case 'task.list': return paginate(db.tasks().map(t => taskView(db, t)).filter(t => (args.state === null || t.state === args.state) && (!args.readyOnly || t.ready)), args.page as Page, t => t.id);
+      case 'task.list': return paginate(db.tasks().filter(visibleTask).map(t => taskView(db, t)).filter(t => (args.state === null || t.state === args.state) && (!args.readyOnly || t.ready)), args.page as Page, t => t.id);
       case 'task.add': return { task: await db.addTask({ ...(args.definition as Omit<TaskDefinition, 'objectiveId'>),
         ...(args.id === null ? {} : { id: String(args.id) }), objectiveId: args.objectiveId as string | null }, caller, command) };
       case 'task.update': return { task: await db.updateTaskDefinition(id, args.definition as Partial<TaskDefinition>, caller, command, Number(args.expectedRevision)) };

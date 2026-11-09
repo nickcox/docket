@@ -19,7 +19,9 @@ import { continuationEvidence, continuationHandover } from './continuation.ts';
 
 export async function dispatch(db: Database, args: { taskId: string | null; profile: string | null; dryRun: boolean; sourceAttemptId?: string; sourceCommit?: string | null; note?: string | null },
   caller: TaskActor, requestKey: string, runtime: Runtime, progress: (message: string) => void) {
-  if (args.sourceAttemptId && caller.kind !== 'person') throw new CommandFailure('person_required');
+  db.checkAuthority(caller, args.sourceAttemptId ? 'attempt.continue' : 'attempt.dispatch', {
+    taskId: args.taskId, ...(args.sourceAttemptId ? { sourceAttemptId: args.sourceAttemptId, sourceCommit: args.sourceCommit ?? null } : {}),
+  });
   const continuationInput = args.sourceAttemptId ? { sourceAttemptId: args.sourceAttemptId, sourceCommit: args.sourceCommit ?? null,
     ...(args.note == null ? {} : { note: args.note }) } : {};
   const previous = db.requests().find(r => r.requestKey === requestKey);
@@ -123,6 +125,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     known(result);
   };
   const recheck = async () => {
+    db.checkAuthority(caller, args.sourceAttemptId ? 'attempt.continue' : 'attempt.dispatch', { taskId: task.id, sourceCommit: args.sourceCommit ?? null });
     if (args.sourceAttemptId) await continuationEvidence(db, args.sourceAttemptId, task.id, runtime, args.sourceCommit ?? null, id, starting.commit);
   };
   const pin = `refs/docket/continuations/${id}`;
@@ -134,6 +137,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       fingerprint: canonicalJson({ ref: pin, commit: starting.commit }), target: { kind: 'repository', reference: { ref: pin } } });
     await db.claimEffect(effect.id, executor);
     const existing = await runtime.repository.inspectRef(pin);
+    db.checkRequestAuthority(effect.id);
     const result = existing.status !== 'confirmed' ? existing
       : cleanup ? existing.value.state === 'absent' ? existing : await runtime.repository.conditionalDeleteRef(pin, starting.commit)
       : existing.value.state === 'present' ? existing.value.commit === starting.commit ? existing
@@ -151,6 +155,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, caller);
     try {
       const spec = reservation.attempt.specification;
+      db.checkRequestAuthority(acquisition.effect.id);
       const allocation = known(await withHeartbeat(runtime.workspace.acquire({ databaseId: String(spec.databaseId), attemptId: id,
         holder: canonicalJson((spec.workspace as JsonObject).holder), branch: String(spec.outputRef).replace(/^refs\/heads\//u, ''), startingCommit: starting.commit })));
       const stored: Allocation = { leaseId: allocation.leaseId, holder: (spec.workspace as JsonObject).holder as JsonObject,

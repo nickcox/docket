@@ -114,6 +114,38 @@ for (const [candidate, chosen] of [[true, false], [false, false], [false, true]]
   await assert.rejects(dispatch(f.db, { ...f.args, sourceCommit: chosen ? head : start }, person, 'continue', f.runtime, () => {}), { code: 'request_input_mismatch' });
 });
 
+test('R17/R18/A36: supervisor continuation uses the bound objective and refuses a person-selected source commit', async t => {
+  const f = await fixture(t);
+  await f.db.addObjective({ id: 'goal', request: 'Build', criteria: ['Works'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  await f.db.moveTask('task', f.db.task('task').definitionRevision, 'goal', person);
+  const supervisor = { kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  await assert.rejects(dispatch(f.db, { ...f.args, sourceCommit: start }, supervisor, 'forbidden', f.runtime, () => {}), { code: 'person_required' });
+  assert.equal(f.acquired(), 0);
+  const plan = await dispatch(f.db, { ...f.args, dryRun: true }, supervisor, 'supervisor-continue', f.runtime, () => {});
+  assert.equal('startingCommit' in plan && plan.startingCommit, head);
+  await assert.rejects(dispatch(f.db, f.args, supervisor, 'supervisor-continue', f.runtime, () => {}), { code: 'worker_failed' });
+  assert.equal(f.acquired(), 1);
+  const request = f.db.requests().find(r => r.requestKey === 'supervisor-continue')!;
+  assert.equal(f.db.attempt(request.attemptId!).specification.objectiveId, 'goal');
+});
+
+test('R18/A39: revocation after pinning stops acquisition and activation without losing the pin', async t => {
+  const f = await fixture(t);
+  const goal = await f.db.addObjective({ id: 'goal', request: 'Build', criteria: ['Works'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  await f.db.moveTask('task', f.db.task('task').definitionRevision, 'goal', person);
+  const supervisor = { kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  const pin = f.runtime.repository.createPinnedRef;
+  f.runtime.repository.createPinnedRef = async (...args) => {
+    const result = await pin(...args);
+    await f.db.updateObjective('goal', goal.revision, { ...goal, permissions: { ...goal.permissions, continueAttempts: false } }, person);
+    return result;
+  };
+  await assert.rejects(dispatch(f.db, f.args, supervisor, 'revoked-continue', f.runtime, () => {}), { code: 'permission_denied' });
+  assert.equal(f.acquired(), 0);
+  assert.equal(f.launcher.prompts.length, 0);
+  assert.equal(f.pins.size, 1);
+});
+
 test('R12/A19: an invalid-result held attempt continues from its retained branch without a candidate', async t => {
   const f = await fixture(t, true, true);
   assert.equal(f.db.attempt(f.source.id).outcome, 'held');
@@ -134,7 +166,7 @@ test('R12/A26: person chooses an earlier commit; unrelated commits refuse', asyn
   const handover = continuationHandover(f.db, f.source.id, start, true, 'note');
   assert.equal(handover.personChoseCommit, true);
   assert.deepEqual(handover.reviewFindings, []);
-  assert.deepEqual(catalogue.operations.find(o => o.name === 'attempt.continue')!.roles, ['person']);
+  assert.deepEqual(catalogue.operations.find(o => o.name === 'attempt.continue')!.roles, ['person', 'supervisor']);
 });
 
 test('R12/A26: moved pin is retained and uncertain cleanup is reported without launching', async t => {

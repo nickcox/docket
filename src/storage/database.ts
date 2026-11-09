@@ -10,6 +10,7 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } from './tasks.ts';
+import { supervisorPermissions } from '../authority.ts';
 import { objectiveDefinition, permissions, unlimitedBudget } from './objectives.ts';
 import type { Objective, ObjectiveDefinition } from './objectives.ts';
 import { workerReference, workerHost } from './launch.ts';
@@ -486,6 +487,7 @@ export class Database {
   private writeTask<T>(command: CommandInput | undefined, change: () => T): Promise<T> {
     if (command) commandInput(command);
     return this.write(() => {
+      if (command) this.checkAuthority(command.caller as TaskActor, command.operation, command.input);
       const previous = command && this.duplicateRequest(command, 'command');
       if (previous) return previous.result!.value as T;
       const value = change();
@@ -554,6 +556,58 @@ export class Database {
       createdAt: String(row.created_at), closedAt: row.closed_at === null ? null : String(row.closed_at) };
   }
 
+  /** Read current membership, never the attempt's frozen objective registration. */
+  checkAuthority(actor: TaskActor, operation: string, input: JsonObject = {}): void {
+    taskActor(actor);
+    if (actor.kind === 'person') return;
+    if (!this.db.isTransaction) return this.snapshot(() => this.checkAuthority(actor, operation, input));
+    const automaticReturn = operation === 'attempt.return' && input.automatic === true;
+    if (!automaticReturn && !Object.hasOwn(supervisorPermissions, operation)) throw new CommandFailure('person_required');
+    if ((operation === 'attempt.continue' && input.sourceCommit != null)
+      || (operation === 'attempt.accept' && input.overrideReason != null)) throw new CommandFailure('person_required');
+    const objective = this.decodeObjective(this.objectiveRow(actor.objectiveId));
+    const permission = supervisorPermissions[operation];
+    if (permission && !objective.permissions[permission]) throw new CommandFailure('permission_denied');
+    if (permission && objective.state !== 'open' && operation !== 'objective.reopen') throw new CommandFailure('policy_refused');
+    if (input.objectiveId !== undefined && input.objectiveId !== actor.objectiveId) throw new CommandFailure('outside_objective');
+    const taskIds = [input.taskId, input.blockerId, ...((input.orderedTaskIds ?? []) as string[])].filter((id): id is string => typeof id === 'string');
+    for (const key of ['attemptId', 'sourceAttemptId']) if (typeof input[key] === 'string') taskIds.push(String(this.attemptRow(input[key] as string).task_id));
+    for (const id of taskIds) if (this.taskRow(id).objective_id !== actor.objectiveId) throw new CommandFailure('outside_objective');
+    if (operation === 'task.done' && typeof input.taskId === 'string' && this.taskRow(input.taskId).kind === 'code') {
+      const accepted = this.db.prepare("SELECT * FROM events WHERE task_id = ? AND kind = 'candidate.accepted' ORDER BY seq DESC").all(input.taskId);
+      if (!accepted.some(row => {
+        const event = this.decodeEvent(row), candidate = object(event.payload.candidate);
+        const attempt = this.decodeAttempt(this.attemptRow(event.attemptId!));
+        if (attempt.candidate?.id !== candidate.id) return false;
+        try { this.requireSupervisorReview(actor, event.attemptId!); return event.payload.overrideReason === null; } catch { return false; }
+      })) throw new CommandFailure('policy_refused');
+    }
+  }
+
+  requireSupervisorReview(actor: TaskActor, attemptId: string, commit?: string): void {
+    if (actor.kind !== 'supervisor') return;
+    if (!this.db.isTransaction) return this.snapshot(() => this.requireSupervisorReview(actor, attemptId, commit));
+    const attempt = this.decodeAttempt(this.attemptRow(attemptId)), review = this.reviewEvidence(attemptId).current;
+    if (!review || commit !== undefined && commit !== attempt.candidate?.commit) throw new CommandFailure('review_missing');
+    if (review.payload.verdict !== 'passed') throw new CommandFailure('review_failed');
+  }
+
+  checkIntegrationAuthority(actor: TaskActor, attemptId: string): void {
+    if (!this.db.isTransaction) return this.snapshot(() => this.checkIntegrationAuthority(actor, attemptId));
+    this.checkAuthority(actor, 'attempt.accept', { attemptId });
+    if (actor.kind === 'supervisor' && !this.decodeObjective(this.objectiveRow(actor.objectiveId)).permissions.integrate) throw new CommandFailure('permission_denied');
+  }
+
+  private requestAuthority(request: StoredRequest): void {
+    if (request.parentId) return this.requestAuthority(this.decodeRequest(this.requestRow(request.parentId)));
+    if (request.caller.kind === 'supervisor') this.checkAuthority(request.caller as TaskActor, request.operation,
+      { ...request.input, ...(request.attemptId ? { attemptId: request.attemptId } : {}) });
+  }
+
+  checkRequestAuthority(requestId: string): void {
+    this.snapshot(() => this.requestAuthority(this.decodeRequest(this.requestRow(requestId))));
+  }
+
   private objectiveAuthority(objective: Objective, actor: TaskActor, creator = false): void {
     if (actor.kind === 'supervisor') {
       if (creator) throw new CommandFailure('creator_required');
@@ -586,6 +640,7 @@ export class Database {
     id: string; request: string; permissions: ObjectiveDefinition['permissions'] | null; budget: ObjectiveDefinition['budget'] | null;
   }, actor: TaskActor, command?: CommandInput): Promise<Objective> {
     taskActor(actor);
+    if (actor.kind !== 'person') throw new CommandFailure('person_required');
     if (!/^[A-Za-z0-9._-]+$/u.test(input.id)) throw new TypeError('Invalid objective ID');
     taskText(input.request);
     if ([...input.request].length > 65536) throw new TypeError('Objective request is too long');
@@ -662,6 +717,7 @@ export class Database {
     const value = JSON.parse(json(input)) as AddTaskInput;
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
+      this.checkAuthority(actor, 'task.add', { objectiveId: value.objectiveId ?? null, orderedTaskIds: value.blockerIds ?? [] });
       requireProfile(this.currentTaskConfiguration(), value.profile);
       this.openMembership(value.objectiveId ?? null);
       let id = value.id;
@@ -699,6 +755,7 @@ export class Database {
     actor = structuredClone(actor);
     command = structuredClone(command);
     return this.writeTask(command, () => {
+      this.checkAuthority(actor, 'attempt.review', { attemptId });
       const source = this.reviewSource(attemptId);
       if (source.candidate!.id !== target.candidateId || source.candidate!.commit !== target.commit
         || source.candidate!.outputRef !== target.outputRef || target.sourceAttemptId !== attemptId
@@ -707,21 +764,25 @@ export class Database {
       const id = `review-${randomUUID()}`;
       const instructions = 'Review the exact immutable target against every copied criterion. Inspect the recorded check results and run focused tests rather than the full suite again. Do not commit changes.';
       const position = Number(this.db.prepare('SELECT coalesce(max(position), 0) + 1 AS position FROM tasks').get()!.position);
-      this.db.prepare(`INSERT INTO tasks (id, title, instructions, criteria, kind, position, review_target, review_source_attempt_id)
-        VALUES (?, ?, ?, ?, 'review', ?, ?, ?)`).run(id, `Review ${source.taskId}`, instructions,
-        json(target.criteria), position, json(target), attemptId);
+      this.db.prepare(`INSERT INTO tasks (id, title, instructions, criteria, kind, position, review_target, review_source_attempt_id, objective_id)
+        VALUES (?, ?, ?, ?, 'review', ?, ?, ?, ?)`).run(id, `Review ${source.taskId}`, instructions,
+        json(target.criteria), position, json(target), attemptId, this.decodeTask(this.taskRow(source.taskId)).objectiveId);
       const task = this.decodeTask(this.taskRow(id));
       this.taskEvent('attempt.review', actor, id, { after: object(task) });
       return task;
     });
   }
 
-  reviewEvidence(attemptId: string) {
-    const source = this.attempt(attemptId);
-    const findings = this.events().filter(e => e.kind === 'review.recorded' && e.payload.sourceAttemptId === attemptId);
+  reviewEvidence(attemptId: string): { current: StoredEvent | null; findings: StoredEvent[]; tasks: Task[] } {
+    if (!this.db.isTransaction) return this.snapshot(() => this.reviewEvidence(attemptId));
+    const source = this.decodeAttempt(this.attemptRow(attemptId));
+    const findings = this.db.prepare("SELECT * FROM events WHERE kind = 'review.recorded' ORDER BY seq").all()
+      .map(row => this.decodeEvent(row)).filter(e => e.payload.sourceAttemptId === attemptId);
     const current = findings.findLast(e => e.payload.candidateId === source.candidate?.id
-      && e.payload.commit === source.candidate?.commit && json(e.payload.criteria) === json(this.task(source.taskId).criteria)) ?? null;
-    return { current, findings, tasks: this.tasks().filter(t => t.reviewTarget?.sourceAttemptId === attemptId) };
+      && e.payload.commit === source.candidate?.commit && json(e.payload.criteria) === json(this.decodeTask(this.taskRow(source.taskId)).criteria)) ?? null;
+    const tasks = this.db.prepare('SELECT * FROM tasks ORDER BY position').all().map(row => this.decodeTask(row))
+      .filter(t => t.reviewTarget?.sourceAttemptId === attemptId);
+    return { current, findings, tasks };
   }
 
   async updateTaskDefinition(id: string, patch: Partial<TaskDefinition>, actor: TaskActor, command?: CommandInput, expectedRevision?: number): Promise<Task> {
@@ -731,6 +792,7 @@ export class Database {
     const value = JSON.parse(json(patch)) as Partial<TaskDefinition>;
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
+      this.checkAuthority(actor, 'task.update', { taskId: id });
       const before = this.decodeTask(this.taskRow(id));
       if (expectedRevision !== undefined && before.definitionRevision !== expectedRevision) throw new StorageError('conflict', 'Task revision changed');
       if ((before.kind !== 'review' && value.kind === 'review') || (before.kind === 'review'
@@ -754,6 +816,7 @@ export class Database {
     taskText(taskId); taskText(blockerId); taskActor(actor);
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
+      this.checkAuthority(actor, 'task.block', { taskId, blockerId });
       const before = this.decodeTask(this.taskRow(taskId));
       this.insertBlocker(taskId, blockerId);
       return this.recordDependencyDecision('task.block', before, blockerId, person);
@@ -764,6 +827,7 @@ export class Database {
     taskText(taskId); taskText(blockerId); taskActor(actor);
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
+      this.checkAuthority(actor, 'task.unblock', { taskId, blockerId });
       const before = this.decodeTask(this.taskRow(taskId));
       this.taskRow(blockerId);
       const result = this.db.prepare('DELETE FROM dependencies WHERE task_id = ? AND blocker_id = ?').run(taskId, blockerId);
@@ -785,13 +849,15 @@ export class Database {
     const order = [...ids];
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
-      const before = this.db.prepare('SELECT id, position FROM tasks ORDER BY position').all();
+      this.checkAuthority(actor, 'task.reorder', { orderedTaskIds: order });
+      const before = this.db.prepare('SELECT id, position FROM tasks ORDER BY position').all()
+        .filter(row => actor.kind !== 'supervisor' || this.taskRow(String(row.id)).objective_id === actor.objectiveId);
       if (before.length !== order.length || before.some(row => !order.includes(String(row.id)))) {
         throw new StorageError('conflict', 'Reorder must name every task exactly once');
       }
       if (before.every((row, index) => row.id === order[index])) return before.map(row => this.decodeTask(this.taskRow(String(row.id))));
       // Move above the old range first, preserving positive unique positions throughout.
-      const offset = before.reduce((max, row) => Math.max(max, Number(row.position)), 0);
+      const offset = Number(this.db.prepare('SELECT coalesce(max(position), 0) AS position FROM tasks').get()!.position);
       if (!Number.isSafeInteger(offset + order.length)) throw new StorageError('conflict', 'Task position range exhausted');
       const move = this.db.prepare('UPDATE tasks SET position = ? WHERE id = ? AND position = ?');
       for (let index = 0; index < before.length; index++) {
@@ -800,7 +866,7 @@ export class Database {
       }
       for (let index = 0; index < order.length; index++) {
         const oldIndex = before.findIndex(row => row.id === order[index]);
-        this.changed(move.run(index + 1, order[index]!, offset + oldIndex + 1));
+        this.changed(move.run(Number(before[index]!.position), order[index]!, offset + oldIndex + 1));
       }
       this.taskEvent('task.reorder', person, undefined, { before: before.map(row => String(row.id)), after: order });
       return order.map(id => this.decodeTask(this.taskRow(id)));
@@ -811,6 +877,7 @@ export class Database {
     taskText(id); taskActor(actor);
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
+      this.checkAuthority(actor, `task.${operation}`, { taskId: id });
       const before = this.decodeTask(this.taskRow(id));
       const state = operation === 'done' ? 'done' : operation === 'reopen' ? 'queued' : before.state;
       const holdReason = operation === 'hold' ? reason! : operation === 'release' || operation === 'done' ? null : before.holdReason;
@@ -819,7 +886,7 @@ export class Database {
         WHERE id = ? AND state = ? AND decision_revision = ?`).run(state, holdReason, id, before.state, before.decisionRevision));
       const task = this.decodeTask(this.taskRow(id));
       this.taskEvent(`task.${operation}`, person, id, { before: object(before), after: object(task),
-        ...(operation === 'done' ? { judgement: 'person' } : {}) });
+        ...(operation === 'done' ? { judgement: actor.kind } : {}) });
       return task;
     });
   }
@@ -893,8 +960,10 @@ export class Database {
     const command: CommandInput = { requestKey: value.requestKey, operation: value.sourceAttemptId === undefined ? 'attempt.dispatch' : 'attempt.continue', caller: value.caller,
       input: logicalInput, fingerprint: createHash('sha256').update(json(logicalInput)).digest('hex') };
     const build = () => {
+      this.checkAuthority(value.caller, command.operation, logicalInput);
       const previous = this.duplicateRequest(command, 'command');
       if (previous) {
+        if (previous.attemptId) this.checkAuthority(value.caller, command.operation, { ...logicalInput, attemptId: previous.attemptId });
         if (!previous.attemptId) throw new StorageError('conflict', 'Dispatch request has no reservation');
         return { requestId: previous.id, replayed: true, skippedTasks: (previous.result?.skippedTasks ?? []) as { taskId: string; reason: string }[],
           attempt: this.decodeAttempt(this.attemptRow(previous.attemptId)) };
@@ -902,7 +971,6 @@ export class Database {
       taskActor(value.caller);
       reservationEvidence(value);
       if (value.sourceAttemptId !== undefined) {
-        if (value.caller.kind !== 'person') throw new CommandFailure('person_required');
         if (value.taskId === undefined || !value.handover) throw new StorageError('conflict', 'Continuation requires a named task and handover');
         const source = this.continuationSource(value.sourceAttemptId, value.taskId);
         if (value.handover.sourceRevision !== source.revision) throw new StorageError('conflict', 'Source revision changed');
@@ -925,6 +993,10 @@ export class Database {
       const skippedTasks: { taskId: string; reason: string }[] = [];
       for (const row of candidates) {
         const task = this.decodeTask(row);
+        if (value.caller.kind === 'supervisor' && task.objectiveId !== value.caller.objectiveId) {
+          if (value.taskId !== undefined) throw new CommandFailure('outside_objective');
+          continue;
+        }
         const problem = unknownProfile(resolved, task.profile);
         if (problem && value.taskId !== undefined) throw new UnknownProfileError(problem);
         const config = resolveReservationConfig(configEvent.payload, problem ? { ...task, profile: null } : task, value.profile);
@@ -995,6 +1067,7 @@ export class Database {
     text(attemptId); text(requestId); claimIdentity(executor); taskActor(caller);
     const expected = { ...executor }, actor = object(caller);
     return this.write(() => {
+      this.checkAuthority(caller, this.dispatchCommand(attemptId).operation, { attemptId });
       const attempt = this.attemptRow(attemptId), command = this.decodeRequest(this.requestRow(requestId));
       if (command.category !== 'command' || !['attempt.dispatch', 'attempt.continue'].includes(command.operation) || command.attemptId !== attemptId || json(command.caller) !== json(actor)) {
         throw new StorageError('conflict', 'Acquisition must match its reservation command and caller');
@@ -1075,6 +1148,7 @@ export class Database {
     text(attemptId); taskActor(caller);
     const actor = object(caller);
     return this.write(() => {
+      this.checkAuthority(caller, this.dispatchCommand(attemptId).operation, { attemptId });
       const attempt = this.attemptRow(attemptId), taskId = String(attempt.task_id);
       if (attempt.phase !== 'allocated' || attempt.launch_state !== 'pending' || attempt.lease_state !== 'held'
         || attempt.allocation === null) throw new StorageError('conflict', 'Attempt is not allocated');
@@ -1165,6 +1239,7 @@ export class Database {
     nonblank(attemptId); workerHost(host);
     const caller = object(host) as WorkerHost;
     return this.write(() => {
+      this.requestAuthority(this.dispatchCommand(attemptId));
       const attempt = this.attemptRow(attemptId);
       const existing = this.db.prepare('SELECT id FROM claims WHERE resource_key = ? AND released_at IS NULL')
         .get(`worker:${attemptId}`);
@@ -1236,6 +1311,7 @@ export class Database {
     const check = () => {
       const attempt = this.attemptRow(String(value.input.attemptId));
       taskActor(value.caller as TaskActor);
+      this.checkAuthority(value.caller as TaskActor, value.operation, value.input);
       this.duplicateRequest(value, 'command');
       return String(attempt.id);
     };
@@ -1251,6 +1327,7 @@ export class Database {
     workerHost(host); workerReference(reference);
     this.snapshot(() => {
       const effect = this.effect(effectId, 'claimed');
+      this.requestAuthority(effect);
       const claim = this.effectExecutor(effect, { claimId: effect.claimId!, generation: host.generation });
       this.workerClaim(effect.attemptId!, claim.id, host);
       const attempt = this.attemptRow(effect.attemptId!);
@@ -1371,6 +1448,7 @@ export class Database {
   }
 
   private checkWorkerEffectInTransaction(effect: StoredRequest, identity: ClaimIdentity): void {
+    this.requestAuthority(effect);
     const claim = this.effectExecutor(effect, identity);
     if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Executor heartbeat is not fresh');
     const blockers = this.readAdmissionBlockers(Date.now());
@@ -1628,6 +1706,7 @@ export class Database {
     taskActor(input.caller); text(input.attemptId);
     const value = JSON.parse(json(input)) as CheckRunInput;
     return this.write(() => {
+      this.checkAuthority(value.caller, 'checks.run', { attemptId: value.attemptId });
       const attempt = this.attemptRow(value.attemptId), spec = object(JSON.parse(String(attempt.specification)));
       const result = this.validatedResultInTransaction(value.attemptId);
       const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
@@ -1753,6 +1832,7 @@ export class Database {
   async authoriseRebase(attemptId: string, requestId: string, caller: TaskActor, plan: JsonObject): Promise<StoredEvent> {
     taskActor(caller);
     return this.write(() => {
+      this.checkAuthority(caller, 'attempt.rebase', { attemptId });
       const key = `rebase.authorised:${requestId}`;
       const existing = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
       if (existing) return this.decodeEvent(existing);
@@ -1772,6 +1852,7 @@ export class Database {
 
   async finishRebase(authorisation: StoredEvent, commit: string): Promise<Attempt> {
     return this.write(() => {
+      this.checkAuthority(authorisation.actor as TaskActor, 'attempt.rebase', { attemptId: authorisation.attemptId! });
       const key = `output.rebased:${authorisation.id}`;
       if (this.db.prepare('SELECT 1 FROM events WHERE source_key = ?').get(key)) return this.decodeAttempt(this.attemptRow(authorisation.attemptId!));
       const attemptId = authorisation.attemptId!, attempt = this.completionGuard(attemptId);
@@ -1794,6 +1875,7 @@ export class Database {
   async selectRetainedCandidate(attemptId: string, commit: string, outputRef: string, caller: TaskActor): Promise<Attempt> {
     taskActor(caller); text(commit); text(outputRef);
     return this.write(() => {
+      this.checkAuthority(caller, 'attempt.accept', { attemptId });
       const attempt = this.completionGuard(attemptId), spec = object(JSON.parse(String(attempt.specification)));
       if (object(spec.delivery).kind !== 'code' || outputRef !== spec.outputRef || commit === spec.startingCommit || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new StorageError('conflict', 'Candidate must name the retained output and move beyond the start');
       if (this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'candidate.accepted'").get(attemptId)) throw new StorageError('conflict', 'An accepted candidate cannot be replaced');
@@ -1824,6 +1906,9 @@ export class Database {
     const value = structuredClone(input), policy = object(plan);
     if (value.overrideReason !== undefined) nonblank(value.overrideReason);
     return this.write(() => {
+      this.checkAuthority(value.caller, 'attempt.accept', object(value));
+      this.requireSupervisorReview(value.caller, value.attemptId, value.commit);
+      if (value.caller.kind === 'supervisor' && plan.kind === 'local-merge') this.checkIntegrationAuthority(value.caller, value.attemptId);
       const attempt = this.completionGuard(value.attemptId), task = this.taskRow(String(attempt.task_id));
       const command = this.decodeRequest(this.requestRow(requestId));
       if (command.operation !== 'attempt.accept' || json(command.caller) !== json(value.caller)
@@ -1870,6 +1955,7 @@ export class Database {
     return this.write(() => {
       const stored = this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(acceptance.sourceKey)!);
       const attemptId = stored.attemptId!, attempt = this.completionGuard(attemptId), task = this.taskRow(String(attempt.task_id));
+      this.checkAuthority(stored.actor as TaskActor, 'attempt.accept', { attemptId });
       const candidate = object(stored.payload.candidate), plan = object(stored.payload.plan);
       if (json(candidate) !== json(JSON.parse(String(attempt.candidate)))) throw new StorageError('conflict', 'Accepted candidate changed');
       if (plan.kind === 'local-merge' && !this.db.prepare(`SELECT 1 FROM requests WHERE request_key = ? AND state = 'succeeded'`)
@@ -1892,6 +1978,7 @@ export class Database {
     const value = structuredClone(input);
     if (value.discard !== undefined) nonblank(value.discard.reason);
     return this.write(() => {
+      this.checkAuthority(value.caller, value.discard ? 'attempt.discard' : 'attempt.return', object(value));
       const raw = this.attemptRow(value.attemptId);
       const abandonedWithoutOutcome = value.discard !== undefined && raw.outcome === null;
       const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
@@ -1996,7 +2083,7 @@ export class Database {
 
   async authoriseDiagnostics(attemptId: string, root: string, manifest: JsonObject, caller: TaskActor, requestId: string): Promise<StoredEvent> {
     taskActor(caller);
-    if (caller.kind !== 'person') throw new StorageError('conflict', 'Person required');
+    if (caller.kind !== 'person') throw new CommandFailure('person_required');
     return this.write(() => {
       this.checkDiagnosticsEligible(attemptId, root);
       if (manifest.root !== root || !Array.isArray(manifest.entries)) throw new StorageError('conflict', 'Invalid diagnostic manifest');
@@ -2015,6 +2102,8 @@ export class Database {
       const storedRow = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(authorisation.sourceKey);
       if (!storedRow) throw new StorageError('conflict', 'Missing completion authorisation');
       const stored = this.decodeEvent(storedRow), attemptId = stored.attemptId!, attempt = this.completionGuard(attemptId);
+      this.requestAuthority(this.decodeRequest(this.requestRow(stored.requestId!)));
+      if (operation === 'integrate') this.checkIntegrationAuthority(stored.actor as TaskActor, attemptId);
       const rebasing = ['pin', 'rebase', 'move', 'attach'].includes(operation);
       const suffix = rebasing ? `:${stored.id}` : operation === 'integrate' ? `:${String(object(stored.payload.candidate).id)}` : '';
       const key = `${operation}:${attemptId}${suffix}`;
@@ -2077,6 +2166,8 @@ export class Database {
   }
 
   private checkCompletionEffectInTransaction(request: StoredRequest, executor: ClaimIdentity): void {
+    this.requestAuthority(request);
+    if (request.operation === 'completion.integrate') this.checkIntegrationAuthority(request.caller as TaskActor, request.attemptId!);
     const claim = this.effectExecutor(request, executor), attempt = this.completionGuard(request.attemptId!);
     if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Completion executor heartbeat is not fresh');
     if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND id <> ? AND state IN ('pending','claimed','uncertain')
@@ -2233,6 +2324,7 @@ export class Database {
 
   async resolveClaimByPerson(id: string, evidence: string, caller: TaskActor, command: CommandInput): Promise<Claim> {
     taskActor(caller); nonblank(evidence);
+    if (caller.kind !== 'person') throw new CommandFailure('person_required');
     return this.writeTask(command, () => {
       const claim = this.decodeClaim(this.claimRow(id));
       if (claim.releasedAt) return claim;
@@ -2269,6 +2361,7 @@ export class Database {
 
   async resolveEffectByPerson(id: string, happened: boolean, evidence: string, caller: TaskActor, command: CommandInput): Promise<StoredRequest> {
     taskActor(caller); nonblank(evidence);
+    if (caller.kind !== 'person') throw new CommandFailure('person_required');
     return this.writeTask(command, () => {
       const request = this.decodeRequest(this.requestRow(id));
       if (request.category !== 'effect' || !['claimed', 'uncertain'].includes(request.state)) throw new StorageError('conflict', 'Effect is not unresolved');
@@ -2395,6 +2488,7 @@ export class Database {
   private recordCommandInTransaction(input: CommandInput, attemptId?: string): StoredRequest {
     commandInput(input);
     const value: CommandInput = { ...JSON.parse(json(input)) as CommandInput, caller: object(input.caller), input: object(input.input) };
+    if (value.caller.kind === 'supervisor') this.checkAuthority(value.caller as TaskActor, value.operation, value.input);
     const previous = this.duplicateRequest(value, 'command');
     if (previous) return previous;
     const objectiveId = attemptId === undefined ? null : this.attemptObjectiveScope(attemptId).objectiveId ?? null;
@@ -2451,6 +2545,10 @@ export class Database {
     effectInput(input);
     const value = JSON.parse(json(input)) as EffectInput;
     value.caller = object(input.caller); value.input = object(input.input); value.target.reference = object(input.target.reference);
+    // Safety fencing remains available after revocation; it grants no new work.
+    if (!['worker.fence', 'worker.emergency-stop'].includes(value.operation)) {
+      this.requestAuthority(this.decodeRequest(this.requestRow(value.parentId)));
+    }
     const previous = this.duplicateRequest(value, 'effect');
     if (previous) {
       const claim = this.decodeClaim(this.claimRow(previous.claimId!));

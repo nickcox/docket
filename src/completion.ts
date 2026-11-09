@@ -158,6 +158,8 @@ export async function effect(db: Database, authorisation: StoredEvent, operation
 
 export async function planCandidateAcceptance(db: Database, input: AcceptInput, services: CompletionServices, selecting = false) {
   taskActor(input.caller);
+  db.checkAuthority(input.caller, 'attempt.accept', JSON.parse(JSON.stringify(input)) as JsonObject);
+  db.requireSupervisorReview(input.caller, input.attemptId, input.commit);
   const attempt = db.attempt(input.attemptId);
   if (selecting) await inspectCandidateSelection(db, input, services);
   else exactCandidate(db, input);
@@ -168,6 +170,7 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
   await retainedOutput(db, attempt.id, services);
   const policy = await planAcceptance(db, input, services);
+  if (policy.kind === 'local-merge') db.checkIntegrationAuthority(input.caller, input.attemptId);
   const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['claimed', 'uncertain'].includes(r.state));
   // Interrupted integration is reconciled by the executor, not reissued by a plan.
   if (unresolved?.operation === 'checks.run') throw acceptanceCheckFailure(attempt.id, input.commit, unresolved, db.claims(), db.requests());
@@ -202,6 +205,8 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
   input = structuredClone(input);
   services = { ...services, profile: structuredClone(services.profile) };
   taskActor(input.caller);
+  db.checkAuthority(input.caller, 'attempt.accept', JSON.parse(JSON.stringify(input)) as JsonObject);
+  db.requireSupervisorReview(input.caller, input.attemptId, input.commit);
   exactCandidate(db, input);
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
   const command = await db.recordCommand({ requestKey: input.requestKey, operation: 'attempt.accept', caller: input.caller,
@@ -250,6 +255,7 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
 /** Return and discard share the same conditional lease effect and safety checks. */
 export async function planAttemptReturn(db: Database, input: ReturnInput, services: CompletionServices) {
   taskActor(input.caller);
+  db.checkAuthority(input.caller, input.discard ? 'attempt.discard' : 'attempt.return', JSON.parse(JSON.stringify(input)) as JsonObject);
   const attempt = db.attempt(input.attemptId), allocation = attempt.allocation;
   if (!allocation || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) throw new StorageError('conflict', 'Return requires a stopped terminal worker and allocation');
   if (input.discard && (input.discard.leaseId !== allocation.leaseId || input.discard.confirmed !== true || !input.discard.reason.trim())) refuse('Person discard confirmations must name the exact lease');
@@ -324,7 +330,7 @@ export async function leaseReturnReason(db: Database, attemptId: string, caller:
   const attempt = db.attempt(attemptId);
   if (attempt.leaseState === 'returned' || !attempt.allocation) return null;
   try {
-    await planAttemptReturn(db, { requestKey: `return-status:${attemptId}`, attemptId, caller }, services);
+    await planAttemptReturn(db, { requestKey: `return-status:${attemptId}`, attemptId, caller, automatic: true }, services);
     return 'Lease is ready to return.';
   } catch (error) {
     return error instanceof Error ? error.message : String(error);

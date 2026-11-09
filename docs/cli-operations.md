@@ -33,7 +33,7 @@ Lists use `page:{"after":null,"limit":100}` initially and return the next cursor
 
 `budget:null` selects unlimited usage: `{"maxCost":null,"currency":null,"maxTokens":null,"maxWorkerTimeMs":null}`. A budget object must contain exactly those four fields. Limits are nonnegative, tokens and worker time are integers, and a finite cost requires a nonblank currency. Unlimited cost can retain a reporting currency. `deadline` is null or an ISO timestamp with an explicit offset, such as `2026-12-01T17:00:00+11:00`.
 
-Budgets and deadlines are validated and stored as supplied, but **are not yet enforced**, including at dispatch. Objective completion (statements and evidence matching), usage accounting and supervisors remain later work. Permissions are stored for supervisor authority; they do not restrict a person's task operations.
+Budgets and deadlines are validated and stored as supplied, but **are not yet enforced**, including at dispatch. Objective completion (statements and evidence matching), usage accounting and supervisor hosts remain later work. The trusted supervisor binding enforces permissions for the available operations; permissions do not restrict a person's task operations.
 
 `objective.show` takes `objectiveId` and returns the current definition, revision, state and closure. `objective.update` takes `objectiveId`, `expectedRevision`, `criteria`, `scope`, `constraints`, `permissions`, `budget` and `deadline`. It replaces these fields; only the creator can change criteria, permissions, budget or deadline. Another person can change scope and constraints without changing protected fields. Supervisors cannot use this operation.
 
@@ -42,6 +42,16 @@ Budgets and deadlines are validated and stored as supplied, but **are not yet en
 Link a task when adding it by supplying `objectiveId`. `task.move` takes `taskId`, `expectedRevision` (the task's definition revision) and `objectiveId`, with null unlinking the task. It is person-only and increments the definition revision when membership changes. Both the source and destination objectives must be open before changing membership. `task.update` cannot change membership. Objective-linked tasks can be dispatched; attempts retain the objective they started under even if their task later moves.
 
 These objective operations and `task.move` use command replay records. Their contracts do not take `dryRun`; dispatch remains planable with the same linked-task prerequisites in planning and execution.
+
+## Trusted supervisor binding
+
+Trusted host code creates `createBinding(caller, selector, options)` from `src/binding.ts`. A supervisor caller contains `kind:"supervisor"`, `id`, `objectiveId` and `sessionId`. These are host inputs, not operation arguments, task text, results or message metadata. The ordinary CLI remains person-bound. This binding does not start a supervisor host or claim that an unrestricted conversation is restricted.
+
+The binding's `catalogue` is generated from the core definitions for its role. Its `execute(name, args, requestId)` validates that role's strict schema, then supplies fixed fields. Supervisor tools omit bound `objectiveId` fields and person-only operations. Continuation's `sourceCommit` and acceptance's `overrideReason` must be null for supervisors; they cannot name a person's chosen commit or approval. Person, supervisor, worker and host catalogues contain only operations currently implemented for that role.
+
+Task management and review creation require `manageTasks`; dispatch, continuation, steering, stopping, acceptance and rebase require their corresponding objective permissions. Explicit checks require `acceptOutput`. Local integration also requires `integrate`. Marking code work done requires `completeTasks` and an already accepted candidate with check and passing review evidence. Protected objective changes, task movement, profile clearing, return, discard, effect/claim resolution and overrides remain person-only. Automatic safe return is a mechanical action, not a supervisor tool or discard approval.
+
+Scoped reads omit other objectives' tasks and attempts. Supervisor reorder names every task in its objective exactly once, preserving other tasks' positions. Current membership and permissions are checked inside mutation transactions and immediately before external effects, including after a plan or permission revocation. Incurred results and terminal observations can still be recorded; safety fencing remains possible after revocation. Review tasks inherit their source task's current objective.
 
 ## Standalone Pi dispatch
 
@@ -99,7 +109,7 @@ Dispatch the returned task ID normally. `profileByKind.review` selects its defau
 
 A completed review reports every criterion and includes exactly one work reference of shape `{"kind":"reviewed-output","name":"review","target":<the exact reviewTarget object>}`. Retained artefact references are also allowed. Every criterion met records `passed`; any not met records `failed`. The verdict, attempt outcome and review task completion commit together. Missing, malformed, interrupted or wrong-target results give no verdict. Replay does not duplicate findings. If the source candidate changes before completion, the review result remains readable but records no verdict for that replacement. After recording a completed, held or failed review outcome, Docket automatically returns the lease when the ordinary safe-return checks pass, whether or not it recorded a verdict. Uncommitted or untracked review work keeps the lease; `status.show` gives the reason and a next action.
 
-`attempt.show` and each `status.show` attempt include `review`: `current` is the latest matching `review.recorded` event (or null), `findings` retains earlier events, and `tasks` lists linked review tasks. Current evidence matches the candidate and the source task's current criteria. A new commit needs a new review. Person acceptance does not require a review; supervisor acceptance will require a passing review when supervisors are implemented.
+`attempt.show` and each `status.show` attempt include `review`: `current` is the latest matching `review.recorded` event (or null), `findings` retains earlier events, and `tasks` lists linked review tasks. Current evidence matches the candidate and the source task's current criteria. A new commit needs a new review. Person acceptance does not require a review. Supervisor acceptance requires a passing review of the exact candidate and current criteria: absent or stale evidence refuses with `review_missing`, and a failing verdict refuses with `review_failed`, including in dry runs.
 
 ## Acceptance and return
 

@@ -72,6 +72,7 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
             status = 'failed'; commands.push({ kind, name: check.name, status: 'not_run', reason: 'Workspace changed before command' });
             continue;
           }
+          db.checkRequestAuthority(admission.request.id);
           const result = await run(check, workspace);
           if (result.status === 'uncertain') clearInterval(timer);
           const unchanged = await clean();
@@ -108,6 +109,7 @@ export async function runChecks(db: Database, input: RunChecksInput, caller: Tas
   services: CheckServices) {
   input = structuredClone(input);
   caller = structuredClone(caller);
+  db.checkAuthority(caller, 'checks.run', { attemptId: input.attemptId });
   services = { ...services, profile: structuredClone(services.profile) };
   const previous = db.requests().find(request => request.requestKey === requestKey);
   if (previous) {

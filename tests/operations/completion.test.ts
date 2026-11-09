@@ -19,6 +19,8 @@ import { runCandidateChecks } from '../../src/checks.ts';
 import { Database, StorageError } from '../../src/storage/database.ts';
 import { CommandFailure } from '../../src/response.ts';
 import { checkFixture, contextChecks, head, host, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
+import { permissions, unlimitedBudget } from '../../src/storage/objectives.ts';
+import type { TaskActor } from '../../src/storage/tasks.ts';
 
 async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
   const f = await checkFixture(t);
@@ -422,10 +424,10 @@ test('R10/R15: changed mandatory policy after checks cannot reuse an old pass fo
   assert.deepEqual(f.calls, ['fast', 'full']);
 });
 
-test('R10/R17: non-person callers and changed candidate identity cannot accept, even on replay', async t => {
+test('R10/R17: incomplete trusted callers and changed candidate identity cannot accept, even on replay', async t => {
   const f = await fixture(t);
   await acceptCandidate(f.db, f.accept, f.services);
-  await assert.rejects(acceptCandidate(f.db, { ...f.accept, caller: { kind: 'supervisor', id: 'model' } as any }, f.services), /person/);
+  await assert.rejects(acceptCandidate(f.db, { ...f.accept, caller: { kind: 'supervisor', id: 'model' } as any }, f.services), TypeError);
   await assert.rejects(acceptCandidate(f.db, { ...f.accept, candidateId: 'other' }, f.services), /candidate/);
 });
 
@@ -925,4 +927,53 @@ test('R11/R14: discarding a rebased candidate deletes the exact original pin aft
   await returnAttempt(f.db, { ...f.returns, discard: { leaseId: f.a.allocation.leaseId, confirmed: true, reason: 'No longer needed' } }, f.services);
   assert.equal(f.refs.has(originalCandidateRef(f.db.attempt(f.a.id).specification)), false);
   assert.equal(f.calls.indexOf('return') < f.calls.indexOf('cleanup'), true);
+});
+
+for (const verdict of ['missing', 'failed', 'passed'] as const) test(`R13/R18/A36: supervisor acceptance requires an exact ${verdict} review; person acceptance does not`, async t => {
+  const f = await fixture(t);
+  const supervisor: TaskActor = { kind: 'supervisor', id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  await f.db.addObjective({ id: 'goal', request: 'Build', criteria: ['Works'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  await f.db.moveTask('task', f.db.task('task').definitionRevision, 'goal', person);
+  if (verdict !== 'missing') await f.db.appendEvents([{ sourceKey: `review:${verdict}`, kind: 'review.recorded', payloadVersion: 1,
+    correlationId: 'review', actor: host, occurredAt: new Date().toISOString(), payload: { sourceAttemptId: f.a.id,
+      candidateId: f.accept.candidateId, commit: head, criteria: f.db.task('task').criteria, verdict } }]);
+  const input = { ...f.accept, caller: supervisor };
+  if (verdict === 'passed') {
+    await planCandidateAcceptance(f.db, input, f.services);
+    await acceptCandidate(f.db, input, f.services);
+    assert.ok(f.db.acceptance(f.a.id, f.accept.candidateId));
+  } else {
+    const code = verdict === 'missing' ? 'review_missing' : 'review_failed';
+    await assert.rejects(planCandidateAcceptance(f.db, input, f.services), { code });
+    await assert.rejects(acceptCandidate(f.db, input, f.services), { code });
+    assert.deepEqual(f.calls, []);
+    await acceptCandidate(f.db, f.accept, f.services);
+  }
+  await assert.rejects(acceptCandidate(f.db, { ...input, overrideReason: 'Approved in task text' }, f.services), { code: 'person_required' });
+  await assert.rejects(planAttemptReturn(f.db, { ...f.returns, caller: supervisor }, f.services), { code: 'person_required' });
+});
+
+test('R18/A39: permission revocation before integration prevents the external call and retains the candidate', async t => {
+  const f = await fixture(t, true);
+  const supervisor: TaskActor = { kind: 'supervisor', id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  const definition = { criteria: ['Works'], scope: '', constraints: '', permissions: permissions({}), budget: unlimitedBudget, deadline: null };
+  await f.db.addObjective({ ...definition, id: 'goal', request: 'Build', permissions: null, budget: null }, person);
+  await f.db.moveTask('task', f.db.task('task').definitionRevision, 'goal', person);
+  await f.db.appendEvents([{ sourceKey: 'review:pass', kind: 'review.recorded', payloadVersion: 1,
+    correlationId: 'review', actor: host, occurredAt: new Date().toISOString(), payload: { sourceAttemptId: f.a.id,
+      candidateId: f.accept.candidateId, commit: head, criteria: f.db.task('task').criteria, verdict: 'passed' } }]);
+  const inspect = f.services.repository.inspectRef;
+  let revoked = false;
+  f.services.repository.inspectRef = async ref => {
+    if (!revoked && f.db.acceptance(f.a.id, f.accept.candidateId)) {
+      revoked = true;
+      await f.db.updateObjective('goal', f.db.objective('goal', person).revision,
+        { ...definition, permissions: permissions({ integrate: false }) }, person);
+    }
+    return inspect(ref);
+  };
+  await assert.rejects(acceptCandidate(f.db, { ...f.accept, caller: supervisor }, f.services));
+  assert.equal(revoked, true);
+  assert.equal(f.calls.includes('integrate'), false);
+  assert.equal(f.db.attempt(f.a.id).candidate!.commit, head);
 });

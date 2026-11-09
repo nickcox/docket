@@ -108,7 +108,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.dispatch', 'Dispatch a ready task and wait in the foreground through completion and checks.', { taskId: nullable(id), profile: nullable(string), dryRun: bool }),
   operation('attempt.continue', 'Continue a terminal settled source in a new attempt without accepting its work.', {
     sourceAttemptId: uuid, sourceCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }),
-    profile: nullable(string), note: nullable(string), dryRun: bool }, true, ['person']),
+    profile: nullable(string), note: nullable(string), dryRun: bool }),
   operation('attempt.review', 'Create an independent review task for an exact retained candidate.', planAttempt),
   operation('attempt.show', 'Read full attempt identity and evidence.', attempt, false),
   operation('checks.run', 'Run checks for a recorded candidate of a terminal attempt, reusing matching passing evidence.', {
@@ -116,7 +116,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.stop', 'Request that the owning dispatch fence the worker; terminal evidence remains separate.', planAttempt),
   operation('attempt.steer', 'Deliver a message only when the launcher supports the requested mode.', { ...planAttempt, message: string, mode: { enum: ['active', 'after_turn'] } }),
   operation('attempt.accept', 'Accept an exact retained candidate and apply finalisation policy.', { ...planAttempt, candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), overrideReason: nullable(string) }),
-  operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt, true, ['person']),
+  operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt),
   operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),
   operation('attempt.discard', 'Discard output and return the exact lease after scoped confirmations.', { ...planAttempt, confirmDiscard: bool, reason: string }, true, ['person']),
   operation('diagnostics.clean', 'Remove only unreferenced diagnostics of a terminal attempt with a returned lease.', { ...attempt, noProcesses: bool, dryRun: bool }, true, ['person']),

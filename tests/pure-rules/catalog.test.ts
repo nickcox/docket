@@ -33,7 +33,7 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
     assert.ok(operation.roles.includes('person'));
-    if (['context.init', 'context.configure', 'attempt.continue', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'diagnostics.clean'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
+    if (['context.init', 'context.configure', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'diagnostics.clean'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
     assert.deepEqual(operation.bindingDerivedFields, ['task.add', 'objective.show', 'objective.update', 'objective.abandon', 'objective.reopen'].includes(operation.name) ? ['objectiveId'] : []);
     assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show', 'request.show', 'objective.show'].includes(operation.name));
     assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'diagnostics.clean'].includes(operation.name));

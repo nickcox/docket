@@ -85,9 +85,10 @@ export function addTaskInput(value: AddTaskInput): void {
 }
 
 export function taskActor(value: TaskActor): void {
-  if (value === null || typeof value !== 'object' || value.kind !== 'person' ||
-    Object.keys(value).some(key => !['kind', 'id'].includes(key))) throw new TypeError('Task changes require a person actor');
+  if (value === null || typeof value !== 'object' || !['person', 'supervisor'].includes(value.kind) ||
+    Object.keys(value).some(key => !(value.kind === 'supervisor' ? ['kind', 'id', 'objectiveId', 'sessionId'] : ['kind', 'id']).includes(key))) throw new TypeError('Invalid trusted caller');
   taskText(value.id);
+  if (value.kind === 'supervisor') { taskText(value.objectiveId); taskText(value.sessionId); }
 }
 
 export function taskSlug(title: string): string {

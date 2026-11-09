@@ -60,6 +60,19 @@ async function fixture(t: Parameters<typeof checkFixture>[0]) {
   return { ...f, source, target, review, command, worker };
 }
 
+test('R17/R18/A36: supervisor review creation checks current source membership and gives the review that objective', async t => {
+  const f = await fixture(t);
+  await f.db.addObjective({ id: 'goal', request: 'Review', criteria: ['Works'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  const caller = { kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  const command = { ...f.command('supervisor-review'), caller };
+  await assert.rejects(f.db.createReview(f.source.id, f.target, caller, command), { code: 'outside_objective' });
+  await f.db.moveTask('source', f.db.task('source').definitionRevision, 'goal', person);
+  const review = await f.db.createReview(f.source.id, f.target, caller, command);
+  assert.equal(review.objectiveId, 'goal');
+  assert.equal(f.db.task(review.id).objectiveId, 'goal');
+  assert.deepEqual(review.reviewTarget, f.target);
+});
+
 test('R13/A28: only attempt.review creates immutable copied targets; creation replays without reopening source launch', async t => {
   const f = await fixture(t);
   assert.equal(f.review.kind, 'review');
@@ -97,6 +110,10 @@ for (const status of ['met', 'not_met']) test(`R13/A28: retained ${status} revie
   await f.db.completeWorker(worker.id, host, retention);
   assert.equal(f.db.task(f.review.id).state, 'done');
   assert.equal(f.db.reviewEvidence(f.source.id).current!.payload.verdict, status === 'met' ? 'passed' : 'failed');
+  const caller = { kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  if (status === 'met') f.db.requireSupervisorReview(caller, f.source.id, head);
+  else assert.throws(() => f.db.requireSupervisorReview(caller, f.source.id, head), { code: 'review_failed' });
+  assert.throws(() => f.db.requireSupervisorReview(caller, f.source.id, start), { code: 'review_missing' });
   assert.equal(f.db.acceptance(f.source.id, String(f.target.candidateId)), null);
   await f.db.completeWorker(worker.id, host, retention);
   assert.equal(f.db.reviewEvidence(f.source.id).findings.length, 1);

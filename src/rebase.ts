@@ -60,6 +60,7 @@ async function prerequisites(db: Database, input: RebaseInput, services: Complet
 const stages = ['pin', 'rebase', 'move', 'attach'] as const;
 export async function planAttemptRebase(db: Database, input: RebaseInput, services: CompletionServices) {
   taskActor(input.caller);
+  db.checkAuthority(input.caller, 'attempt.rebase', { attemptId: input.attemptId });
   const authorised = progress(db, input);
   if (authorised && db.events().some(e => e.sourceKey === `output.rebased:${authorised.id}`)) return { steps: [] };
   const rebasing = authorised && db.requests().find(r => r.requestKey === `rebase:${input.attemptId}:${authorised.id}`);
