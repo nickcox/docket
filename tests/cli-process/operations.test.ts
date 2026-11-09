@@ -89,7 +89,7 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
 }
 const definition = { title: 'Implement feature', instructions: 'Implement the feature', criteria: ['Works'], kind: 'code', profile: null };
 
-test('R07/R08/R09/R31/R35: a separate CLI stops the live dispatch owner; Pi steering refuses without delivery', { timeout: 20000 }, async t => {
+test('R07/R08/R09/R31/R35: a separate CLI stops the live dispatch owner; Pi steering refuses without delivery', { timeout: 120000 }, async t => {
   const f = await fixture(t, 'running');
   assert.equal(f.invoke('task.add', { id: 'feature', definition, objectiveId: null }).status, 0);
   const child = spawn(process.execPath, [entry, 'attempt', 'dispatch', '--config', f.file, '--stdin', '--json', '--request-id', 'live-dispatch'], {
@@ -102,7 +102,8 @@ test('R07/R08/R09/R31/R35: a separate CLI stops the live dispatch owner; Pi stee
   child.stderr.on('data', chunk => { stderr += chunk; });
   const exited = once(child, 'exit');
   child.stdin.end(JSON.stringify({ taskId: 'feature', profile: null, dryRun: false }));
-  const until = Date.now() + 10000;
+  // Reaching worker.wait takes several process starts, which are slow on Windows runners.
+  const until = Date.now() + 60000;
   while (!stderr.includes('worker.wait') && Date.now() < until && child.exitCode === null) await delay(20);
   assert.ok(stderr.includes('worker.wait'), stderr + stdout);
   const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } });
