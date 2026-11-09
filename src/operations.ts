@@ -11,7 +11,7 @@ import type { CommandInput } from './storage/requests.ts';
 import { createRuntime } from './runtime.ts';
 import type { Runtime } from './runtime.ts';
 import { dispatch } from './dispatch.ts';
-import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, OwnerReadError } from './completion.ts';
+import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason, OwnerReadError } from './completion.ts';
 import { CommandFailure } from './response.ts';
 import { rebaseAttempt, planAttemptRebase } from './rebase.ts';
 import { known } from './operation-utils.ts';
@@ -97,21 +97,26 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
               : ready ? action('attempt.dispatch', { taskId: t.id, profile: null, dryRun: true }, 'Plan dispatch of the ready task.') : null };
         }).filter(t => !args.attentionOnly || t.reason !== null);
         const requests = db.requests();
-        const attentionAttempts = attempts.map(a => {
+        const attentionAttempts = (await Promise.all(attempts.map(async a => {
           const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
           const checksState = String(checks?.result?.status ?? checks?.state ?? 'missing');
           const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
-          const reason = ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
+          const currentReturnReason = a.allocation && a.leaseState !== 'returned'
+            ? await leaseReturnReason(db, a.id, caller, (await services()).completion) : null;
+          const returnReason = currentReturnReason === 'Lease is ready to return.' && a.candidate && !accepted
+            ? null : currentReturnReason;
+          const reason = returnReason ?? (['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
             : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
             : a.leaseState === 'held' ? 'Lease is held.'
-            : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null;
+            : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null);
           const nextAction = reason === null ? null
+            : returnReason ? action('attempt.return', { attemptId: a.id, dryRun: true }, `Resolve the return condition (${returnReason}), then plan returning the lease.`)
             : checksState === 'failed' || checksState === 'uncertain' ? action('attempt.show', { attemptId: a.id }, 'Inspect check evidence before retrying or resolving uncertainty.')
             : a.candidate && !accepted ? action('attempt.accept', { attemptId: a.id, candidateCommit: a.candidate.commit, overrideReason: null, dryRun: true }, 'Inspect the acceptance plan for this candidate.')
             : action('attempt.show', { attemptId: a.id }, 'Inspect the attempt and lease before continuing or returning it.');
           return { id: a.id, taskId: a.taskId, number: a.number, phase: a.phase, outcome: a.outcome,
             leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, checksState, reason, nextAction };
-        }).filter(a => !args.attentionOnly || a.reason !== null);
+        }))).filter(a => !args.attentionOnly || a.reason !== null);
         const blockers = db.admissionBlockers();
         const claims = db.claims().filter(c => !c.releasedAt).map(c => {
           if (!args.attentionOnly) return c;
@@ -176,19 +181,24 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           accept.candidateId = String(selected.candidate!.id);
         }
         for (const entry of plan.steps) progress(entry.operation);
-        return { attempt: await acceptCandidate(db, accept, runtime.completion), ...plan };
+        await acceptCandidate(db, accept, runtime.completion);
+        const leaseReturn = await automaticReturn(db, attemptId, caller, runtime.completion);
+        return { attempt: leaseReturn.attempt, leaseReturn: { state: leaseReturn.state, reason: leaseReturn.reason }, ...plan };
       }
       case 'attempt.return': case 'attempt.discard': {
         const attemptId = String(args.attemptId), allocation = db.attempt(attemptId).allocation;
-        if (!args.noProcesses) throw new CommandFailure('process_confirmation_required', { attemptId, leaseId: allocation?.leaseId });
         if (operation.name === 'attempt.discard' && !args.confirmDiscard) throw new CommandFailure('discard_confirmation_required', { attemptId, leaseId: allocation?.leaseId });
         if (!allocation) throw new CommandFailure('policy_refused', { attemptId });
-        const returns = { requestKey, attemptId, caller, noProcesses: { leaseId: allocation.leaseId },
+        const returns = { requestKey, attemptId, caller,
           ...(operation.name === 'attempt.discard' ? { discard: { leaseId: allocation.leaseId, confirmed: true as const, reason: String(args.reason) } } : {}) };
         const completion = (await services()).completion;
+        if (returns.discard && !args.dryRun) {
+          const leaseReturn = await automaticReturn(db, attemptId, caller, completion, returns.discard);
+          return { attempt: leaseReturn.attempt, leaseReturn: { state: leaseReturn.state, reason: leaseReturn.reason } };
+        }
         const plan = await planAttemptReturn(db, returns, completion);
         if (args.dryRun) return plan;
-        return { attempt: await returnAttempt(db, returns, completion), ...plan };
+        return { attempt: await returnAttempt(db, returns, completion), leaseReturn: { state: 'returned', reason: null }, ...plan };
       }
       case 'claim.resolve': {
         if (!args.confirmStopped) throw new CommandFailure('process_confirmation_required');

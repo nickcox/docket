@@ -236,12 +236,11 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
   return db.finishAcceptance(accepted);
 }
 
-/** Return and discard share the same conditional lease effect; neither acceptance nor discard returns it implicitly. */
+/** Return and discard share the same conditional lease effect and safety checks. */
 export async function planAttemptReturn(db: Database, input: ReturnInput, services: CompletionServices) {
   taskActor(input.caller);
   const attempt = db.attempt(input.attemptId), allocation = attempt.allocation;
   if (!allocation || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) throw new StorageError('conflict', 'Return requires a stopped terminal worker and allocation');
-  if (input.noProcesses?.leaseId !== allocation.leaseId) refuse('Person confirmations must name the exact lease');
   if (input.discard && (input.discard.leaseId !== allocation.leaseId || input.discard.confirmed !== true || !input.discard.reason.trim())) refuse('Person discard confirmations must name the exact lease');
   if (attempt.leaseState === 'returned') return { steps: [] };
   if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
@@ -253,16 +252,15 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
     if (known(await services.workspace.inspect(allocation)).state !== 'absent') refuse('Interrupted effect remains unresolved; it will not be repeated');
     return { steps: [step('return.reconcile', allocation.leaseId, ['owner_confirms_return'])] };
   }
-  if (attempt.outcome && !authorisation?.payload.abandonedWithoutOutcome) await retainedOutput(db, attempt.id, services);
+  if (attempt.outcome && !input.discard && !authorisation?.payload.discard) await retainedOutput(db, attempt.id, services);
   if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
   if (!known(await services.repository.inspectWorkspace(allocation.path)).clean) refuse('Workspace has uncommitted or untracked work');
-  return { steps: [step(input.discard ? 'attempt.discard' : 'attempt.return', allocation.leaseId, ['terminal', 'no_processes', 'matching_allocation', 'clean_workspace'])] };
+  return { steps: [step(input.discard ? 'attempt.discard' : 'attempt.return', allocation.leaseId, ['terminal', 'matching_allocation', 'clean_workspace', 'retained_output'])] };
 }
 
 export async function returnAttempt(db: Database, input: ReturnInput, services: CompletionServices) {
   input = structuredClone(input);
   taskActor(input.caller);
-  if (input.discard && db.attempt(input.attemptId).outcome === null) await planAttemptReturn(db, input, services);
   const command = await db.recordCommand({ requestKey: input.requestKey, operation: input.discard ? 'attempt.discard' : 'attempt.return',
     caller: input.caller, fingerprint: canonicalJson(input), input: JSON.parse(JSON.stringify(input)) as JsonObject });
   const authorisation = await db.authoriseReturn(input, command.id);
@@ -272,7 +270,7 @@ export async function returnAttempt(db: Database, input: ReturnInput, services: 
     const previous = db.requests().find(request => request.requestKey === `return:${input.attemptId}`);
     let retention: RetentionRequest | undefined;
     if (!previous || previous.state === 'pending') {
-      retention = authorisation.payload.abandonedWithoutOutcome
+      retention = authorisation.payload.discard
         ? { references: [], artefacts: [], recyclableRoots: [allocation.pool] }
         : await retainedOutput(db, input.attemptId, services);
       if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
@@ -281,11 +279,39 @@ export async function returnAttempt(db: Database, input: ReturnInput, services: 
     }
     await effect(db, authorisation, 'return', { allocation }, async () =>
       known(await services.workspace.inspect(allocation)).state === 'absent' ? { leaseId: allocation.leaseId, returned: true } : null,
-    () => services.workspace.returnLease(allocation, { authorised: true, requestId: `return:${input.attemptId}`, retention: retention! }));
+    () => services.workspace.returnLease(allocation, { authorised: true, requestId: `return:${input.attemptId}`, retention: retention! }),
+    async () => { await planAttemptReturn(db, input, services); });
     await db.finishReturn(authorisation);
   }
   await cleanupOutput(db, authorisation, services);
   return db.attempt(input.attemptId);
+}
+
+export async function automaticReturn(db: Database, attemptId: string, caller: ReturnInput['caller'], services: CompletionServices,
+  discard?: ReturnInput['discard'], requestKey = `automatic-return:${attemptId}`) {
+  const input: ReturnInput = { requestKey, attemptId, caller,
+    ...(discard ? { discard } : { automatic: true }) };
+  try {
+    if (!discard) await planAttemptReturn(db, input, services);
+    const attempt = await returnAttempt(db, input, services);
+    return { state: 'returned' as const, reason: null, attempt };
+  } catch (error) {
+    const attempt = db.attempt(attemptId);
+    if (attempt.leaseState === 'returned') return { state: 'returned' as const, reason: null, attempt };
+    return { state: 'kept' as const, reason: error instanceof Error ? error.message : String(error), attempt };
+  }
+}
+
+/** Read the current owners rather than relying on an old failed return check. */
+export async function leaseReturnReason(db: Database, attemptId: string, caller: ReturnInput['caller'], services: CompletionServices) {
+  const attempt = db.attempt(attemptId);
+  if (attempt.leaseState === 'returned' || !attempt.allocation) return null;
+  try {
+    await planAttemptReturn(db, { requestKey: `return-status:${attemptId}`, attemptId, caller }, services);
+    return 'Lease is ready to return.';
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 async function cleanupOutput(db: Database, authorisation: StoredEvent, services: CompletionServices): Promise<void> {

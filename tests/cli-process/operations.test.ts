@@ -149,15 +149,59 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
   assert.deepEqual(accepted.data.steps, acceptancePlan.data.steps);
   assert.equal(f.git('rev-parse', 'main'), attempt.candidate.commit);
-  const held = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.attempts.items[0];
-  assert.equal(held.reason, 'Lease is held.', 'R27: accepted output still requires lease attention');
-  assert.equal(held.nextAction.operation, 'attempt.show');
-  const returned = f.invoke('attempt.return', { attemptId: attempt.id, noProcesses: true, dryRun: false }, 'return');
+  assert.equal(accepted.data.leaseReturn.state, 'returned', 'A21: local-merge automatically returns a safe lease');
+  assert.equal(accepted.data.attempt.leaseState, 'returned');
+  assert.equal(f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.attempts.items.length, 0);
+  const returned = f.invoke('attempt.return', { attemptId: attempt.id, dryRun: false }, 'return');
   assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
   assert.equal(returned.data.attempt.leaseState, 'returned');
   assert.equal(f.invoke('task.show', { taskId: 'feature' }).data.task.state, 'done');
   const records = (await readFile(join(f.home, 'peer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.equal(records.filter(r => r.type === 'prompt').length, 1);
+});
+
+test('R11: held and failed dispatches automatically return clean leases with retained output', async t => {
+  for (const outcome of ['held', 'failed']) {
+    const f = await fixture(t, `${outcome}-result`);
+    f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+    const result = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+    assert.equal(result.status, 0, JSON.stringify(result.envelope));
+    assert.equal(result.data.attempt.outcome, outcome);
+    assert.equal(result.data.attempt.leaseState, 'returned');
+    assert.equal(result.data.leaseReturn.state, 'returned');
+    const detail = f.invoke('attempt.show', { attemptId: result.data.attempt.id }).data;
+    assert.equal(f.git('rev-parse', result.data.attempt.specification.outputRef), detail.result.content.workReferences[0].commit);
+  }
+});
+
+test('A21: acceptance keeps untracked work and attention status gives the reason and next action', async t => {
+  const f = await fixture(t);
+  f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+  const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false });
+  const attempt = dispatched.data.attempt;
+  await writeFile(join(attempt.allocation.path, 'untracked'), 'Keep this work');
+  const accepted = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false });
+  assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
+  assert.equal(accepted.data.leaseReturn.state, 'kept');
+  assert.equal(accepted.data.attempt.leaseState, 'held');
+  const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  const attention = status.data.attempts.items.find((item: any) => item.id === attempt.id);
+  assert.match(attention.reason, /uncommitted or untracked/);
+  assert.equal(attention.nextAction.operation, 'attempt.return');
+  assert.ok(attention.nextAction.description);
+});
+
+test('R28/A52: return and discard reject the removed noProcesses field', async t => {
+  const f = await fixture(t);
+  const attemptId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  for (const [operation, args] of [
+    ['attempt.return', { attemptId, dryRun: false }],
+    ['attempt.discard', { attemptId, dryRun: false, confirmDiscard: true, reason: 'Not needed' }],
+  ] as const) {
+    assert.equal(validateSchema(findOperation(operation)!.inputSchema, args), null);
+    assert.notEqual(validateSchema(findOperation(operation)!.inputSchema, { ...args, noProcesses: true }), null);
+    assert.equal(f.invoke(operation, { ...args, noProcesses: true }).envelope.code, 'invalid_input');
+  }
 });
 
 test('R27/R30: moved targets name exact commits and rebase action; target restrictions remain policy_refused', async t => {
@@ -206,7 +250,7 @@ test('R27/R30: moved targets name exact commits and rebase action; target restri
   const accepted = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false }, 'accept-rebased');
   assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
   assert.equal(f.git('rev-parse', 'main'), commit);
-  const returned = f.invoke('attempt.return', { attemptId: attempt.id, noProcesses: true, dryRun: false }, 'return-rebased');
+  const returned = f.invoke('attempt.return', { attemptId: attempt.id, dryRun: false }, 'return-rebased');
   assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
   assert.equal(returned.data.attempt.leaseState, 'returned');
 });
@@ -239,11 +283,13 @@ test('R11: CLI discards terminal missing/invalid output, refuses dirty work and 
     assert.ok(attemptId);
     const before = f.invoke('attempt.show', { attemptId }).data;
     assert.equal(before.outcome, null); assert.equal(before.executionOpen, true);
-    const discard = { attemptId, confirmDiscard: true, noProcesses: true, reason: 'Result is unusable', dryRun: false };
+    const discard = { attemptId, confirmDiscard: true, reason: 'Result is unusable', dryRun: false };
     const dirty = join(before.allocation.path, 'untracked');
     await writeFile(dirty, 'Keep this work');
-    assert.equal(f.invoke('attempt.discard', discard).envelope.code, 'workspace_dirty');
-    assert.equal(f.invoke('attempt.show', { attemptId }).data.outcome, null);
+    const kept = f.invoke('attempt.discard', discard);
+    assert.equal(kept.data.leaseReturn.state, 'kept');
+    assert.match(kept.data.leaseReturn.reason, /uncommitted or untracked/);
+    assert.equal(f.invoke('attempt.show', { attemptId }).data.outcome, 'failed');
     await rm(dirty);
     const returned = f.invoke('attempt.discard', discard, 'discard');
     assert.equal(returned.status, 0, JSON.stringify(returned.envelope));

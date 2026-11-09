@@ -1476,8 +1476,9 @@ export class Database {
       const command = this.decodeRequest(this.requestRow(requestId));
       if (command.operation !== (value.discard ? 'attempt.discard' : 'attempt.return') || json(command.caller) !== json(value.caller)
         || json(command.input) !== json(value)) throw new StorageError('conflict', 'Return must match its person command');
-      if (value.noProcesses?.leaseId !== allocation.leaseId || (value.discard !== undefined
-        && (value.discard.leaseId !== allocation.leaseId || value.discard.confirmed !== true))) {
+      if (value.automatic && value.discard) throw new StorageError('conflict', 'Automatic return cannot confirm discard');
+      if (value.discard !== undefined
+        && (value.discard.leaseId !== allocation.leaseId || value.discard.confirmed !== true)) {
         throw new StorageError('conflict', 'Person confirmations must name the exact lease');
       }
       const key = `return.authorised:${value.attemptId}`;
@@ -1496,8 +1497,11 @@ export class Database {
         this.completionEvent(`attempt.discard_failed:${value.attemptId}`, 'attempt.completed', value.attemptId,
           value.caller, { outcome: 'failed', reason: value.discard!.reason, discardedWithoutResult: true }, requestId);
       }
+      if (value.discard && this.taskRow(String(attempt.task_id)).state !== 'done') {
+        this.db.prepare("UPDATE tasks SET state = 'queued', hold_reason = 'discarded' WHERE id = ?").run(String(attempt.task_id));
+      }
       this.completionEvent(key, 'return.authorised', value.attemptId, value.caller,
-        { allocation, discard: Boolean(value.discard), abandonedWithoutOutcome, discardReason: value.discard?.reason ?? null, noProcesses: value.noProcesses, decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
+        { allocation, discard: Boolean(value.discard), abandonedWithoutOutcome, discardReason: value.discard?.reason ?? null, automatic: Boolean(value.automatic), decisionRevision: Number(this.taskRow(String(attempt.task_id)).decision_revision) }, requestId);
       return this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key)!);
     });
   }
@@ -1516,7 +1520,7 @@ export class Database {
           this.db.prepare("UPDATE tasks SET state = 'queued', hold_reason = 'discarded' WHERE id = ?").run(String(attempt.task_id));
         }
         this.completionEvent(`lease.returned:${attemptId}`, 'lease.returned', attemptId, stored.actor as TaskActor,
-          { discard: stored.payload.discard!, allocation: stored.payload.allocation! }, stored.requestId!);
+          { discard: stored.payload.discard!, automatic: stored.payload.automatic!, allocation: stored.payload.allocation! }, stored.requestId!);
       }
       return this.decodeAttempt(this.attemptRow(attemptId));
     });

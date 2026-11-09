@@ -13,7 +13,7 @@ export interface ReturnInput {
   requestKey: string;
   attemptId: string;
   caller: TaskActor;
-  noProcesses: { leaseId: string };
+  automatic?: true;
   discard?: { leaseId: string; confirmed: true; reason: string };
 }
 export interface FinalisationPlan extends JsonObject {

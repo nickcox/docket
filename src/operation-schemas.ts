@@ -15,6 +15,7 @@ const definition = (review: boolean) => object({ title: string, instructions: { 
 const attempt = { attemptId: uuid };
 const planAttempt = { ...attempt, dryRun: bool };
 const view = { type: 'object' };
+const leaseReturn = object({ state: { enum: ['returned', 'kept'] }, reason: nullable(string) });
 const steps = { type: 'array', items: object({ operation: string, target: string, requires: { type: 'array', items: string }, conditional: bool }) };
 const paginated = (items: JsonSchema) => object({ items: { type: 'array', items }, next: nullable(string), total: { type: 'integer', minimum: 0 } });
 const attention = { reason: nullable(string), nextAction: nullable(object({ operation: string, args: view, description: string })) };
@@ -35,7 +36,10 @@ function outputSchema(name: string): JsonSchema {
   const variants: JsonSchema[] = [object({ steps })];
   if (name === 'attempt.dispatch') {
     const skippedTasks = { type: 'array', items: object({ taskId: id, reason: string }) };
-    variants.push(object({ taskId: id, skippedTasks, steps }), object({ attempt: view, skippedTasks, steps }), object({ attempt: view, replayed: bool, skippedTasks, steps }));
+    variants.push(object({ taskId: id, skippedTasks, steps }), object({ attempt: view, leaseReturn, skippedTasks, steps }), object({ attempt: view, replayed: bool, skippedTasks, steps }));
+  }
+  else if (['attempt.accept', 'attempt.return', 'attempt.discard'].includes(name)) {
+    variants.push(object({ attempt: view, leaseReturn, steps }), object({ attempt: view, leaseReturn }));
   }
   else if (name.startsWith('attempt.')) variants.push(object({ attempt: view, steps }));
   else if (name === 'claim.resolve') variants.push(object({ steps, scope: view }), object({ claim: view, steps, scope: view }));
@@ -63,8 +67,8 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.show', 'Read full attempt identity and evidence.', attempt, false),
   operation('attempt.accept', 'Accept an exact retained candidate and apply finalisation policy.', { ...planAttempt, candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), overrideReason: nullable(string) }),
   operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt, true, ['person']),
-  operation('attempt.return', 'Return the exact lease after confirming no processes remain.', { ...planAttempt, noProcesses: bool }, true, ['person']),
-  operation('attempt.discard', 'Discard output and return the exact lease after scoped confirmations.', { ...planAttempt, confirmDiscard: bool, noProcesses: bool, reason: string }, true, ['person']),
+  operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),
+  operation('attempt.discard', 'Discard output and return the exact lease after scoped confirmations.', { ...planAttempt, confirmDiscard: bool, reason: string }, true, ['person']),
   operation('claim.resolve', 'Resolve exact owner scope with stopped-owner confirmation and evidence, never age alone.', { claimId: uuid, confirmStopped: bool, evidence: string, dryRun: bool }, true, ['person']),
   operation('effect.resolve', 'Resolve an uncertain effect with owner evidence and stopped-owner confirmation.', { effectId: uuid, outcome: { enum: ['happened', 'not_happened'] }, evidence: string, confirmStopped: bool, dryRun: bool }, true, ['person']),
 ];

@@ -12,6 +12,7 @@ import { runCandidateChecks } from './checks.ts';
 import { CommandFailure } from './response.ts';
 import { step } from './plans.ts';
 import { known } from './operation-utils.ts';
+import { automaticReturn } from './completion.ts';
 
 export async function dispatch(db: Database, args: { taskId: string | null; profile: string | null; dryRun: boolean },
   caller: TaskActor, requestKey: string, runtime: Runtime, progress: (message: string) => void) {
@@ -150,7 +151,12 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       }
       if (checks.state === 'uncertain' || checks.state === 'claimed') throw new CommandFailure('effect_uncertain', { attemptId: id, checksRequestId: checks.id });
     }
-    return { attempt: db.attempt(id), skippedTasks: reservation.skippedTasks, steps };
+    const attempt = db.attempt(id);
+    const leaseReturn = ['held', 'failed'].includes(attempt.outcome ?? '')
+      ? await automaticReturn(db, id, caller, runtime.completion) : null;
+    return { attempt: leaseReturn?.attempt ?? attempt,
+      leaseReturn: leaseReturn ? { state: leaseReturn.state, reason: leaseReturn.reason } : { state: 'kept', reason: 'Candidate is awaiting acceptance.' },
+      skippedTasks: reservation.skippedTasks, steps };
   } finally {
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
     // A failed preparation can still own a non-acting child. Stop it using its

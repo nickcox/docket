@@ -47,13 +47,17 @@ Create a person-controlled `~/.config/docket/execution-profiles.json`, not writa
 
 The context worker profile selects `launcher:"pi"` and `executionProfile:"pi-worker-v1"`. Its check configuration selects the check profile ID. For an approved RPC executable, use `executable` with an optional absolute `entrypoint` instead of `sdkModule` and `agentFiles`. Credential references belong only in these host settings, not task records.
 
-Plan dispatch with `{"taskId":"notes","profile":null,"dryRun":true}`. Change only `dryRun` to false to execute. Dispatch reserves, acquires, starts, prepares, binds, permits and activates one worker, waits for its turn, fences it and observes direct-child exit, validates its result, records completion and runs the trusted checks. It does not accept output or return the lease. A replay inspects progress and never launches another worker.
+Plan dispatch with `{"taskId":"notes","profile":null,"dryRun":true}`. Change only `dryRun` to false to execute. Dispatch reserves, acquires, starts, prepares, binds, permits and activates one worker, waits for its turn, fences it and observes direct-child exit, validates its result, records completion and runs the trusted checks. It does not accept output. After recording a held or failed outcome it checks whether the lease can be returned automatically. A replay inspects progress and never launches another worker.
 
 ## Acceptance and return
 
 Plan acceptance with `{"attemptId":"<UUID>","candidateCommit":null,"overrideReason":null,"dryRun":true}`. The ordered steps include missing checks and conditional acceptance. Execution rechecks the evidence and policy before effects. `local-merge` fast-forwards the configured target; manual acceptance retains the branch without claiming integration. An explicit candidate commit is checked and planned before selection. A person's nonblank override reason can waive checks, but never identity, retention or terminal evidence.
 
-Only a person can return or discard. `attempt.return` requires `noProcesses:true` for the exact attempt's immutable lease. `attempt.discard` also requires `confirmDiscard:true` and a reason. A terminal attempt with no recorded outcome can be discarded without a result file: the discard authorisation atomically records `failed`. The workspace must still be clean and match its allocation, and no effect may be unresolved. Running workers cannot be discarded.
+After acceptance (manual or `local-merge`), discard, or a dispatch with a held or failed outcome, Docket checks whether no work could be lost and returns the lease automatically when safe. The response's `leaseReturn` gives `state:"returned"` or `state:"kept"` and a reason. Automatic returns use the recorded return effect and conditional output-ref clean-up; manually accepted branches remain retained.
+
+A person can explicitly request the same checks with `attempt.return`: `{"attemptId":"<UUID>","dryRun":false}`. Only a person can discard, using `attempt.discard` with `confirmDiscard:true` and a nonblank `reason`. Neither operation accepts `noProcesses`. A terminal attempt with no recorded outcome can be discarded without a result file: the discard authorisation atomically records `failed`. The worker must be stopped and terminal, the workspace must be clean and match its allocation and pool, no effect may be unresolved, and required output must be retained unless discarded. Running workers cannot be discarded. Docket does not try to prove that every process the worker started has stopped.
+
+When return is unsafe the lease is kept. `status.show` with `attentionOnly:true` lists the attempt's current return condition and a next action. Preserve or commit uncommitted and untracked work, retain output, or resolve uncertain effects before requesting a return.
 
 ## Resolving uncertainty
 

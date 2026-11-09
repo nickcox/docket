@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { writeFile, unlink } from 'node:fs/promises';
-import { acceptCandidate, returnAttempt, selectCandidate, planCandidateAcceptance, planAttemptReturn } from '../../src/completion.ts';
+import { acceptCandidate, returnAttempt, selectCandidate, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason } from '../../src/completion.ts';
 import { rebaseAttempt, planAttemptRebase } from '../../src/rebase.ts';
 import { originalCandidateRef } from '../../src/storage/rebase.ts';
 import type { CompletionServices } from '../../src/completion.ts';
@@ -63,7 +63,7 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
     },
   };
   const accept = { requestKey: 'accept', attemptId: a.id, candidateId: String(candidate.id), commit: head, caller: person };
-  const returns = { requestKey: 'return', attemptId: a.id, caller: person, noProcesses: { leaseId: a.allocation.leaseId } };
+  const returns = { requestKey: 'return', attemptId: a.id, caller: person };
   return { ...f, a, services, refs, calls, accept, returns,
     dirty: () => { clean = false; }, cleanWorkspace: () => { clean = true; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
     loseRetention: () => { retained = false; } };
@@ -78,13 +78,12 @@ test('R11: person discards terminal missing/invalid results without retention an
     if (invalid) await writeFile(a.binding.resultPath, 'invalid');
     else await unlink(a.binding.resultPath);
     const input = { requestKey: `discard-${invalid}`, attemptId: a.id, caller: person,
-      noProcesses: { leaseId: a.allocation.leaseId },
       discard: { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Result unavailable' } };
     await assert.rejects(returnAttempt(f.db, input, f.services), /terminal/);
     await f.db.recordWorkerObservation(a.observation('terminal', 2), host);
     f.dirty();
     await assert.rejects(returnAttempt(f.db, input, f.services), /uncommitted/);
-    assert.equal(f.db.attempt(a.id).outcome, null, 'dirty discard cannot settle the outcome');
+    assert.equal(f.db.attempt(a.id).outcome, 'failed', 'discard settles the outcome but keeps dirty work');
     assert.equal(f.db.attempt(a.id).leaseState, 'held');
     f.cleanWorkspace();
     f.services.repository.verifyRetention = async () => { throw new Error('Must not require retained output'); };
@@ -95,6 +94,42 @@ test('R11: person discards terminal missing/invalid results without retention an
     assert.equal(f.db.attempt(a.id).leaseState, 'returned');
     assert.equal(f.db.task(a.binding.identity.taskId as string).holdReason, 'discarded');
     assert.equal(f.db.events().filter(e => e.sourceKey === `attempt.discard_failed:${a.id}`).length, 1);
+  }
+});
+
+test('A21/R11: automatic return records its origin, cleans integrated refs and keeps manual output', async t => {
+  for (const local of [true, false]) {
+    const f = await fixture(t, local);
+    await acceptCandidate(f.db, f.accept, f.services);
+    const returned = await automaticReturn(f.db, f.a.id, person, f.services);
+    assert.equal(returned.state, 'returned');
+    assert.equal(returned.attempt.leaseState, 'returned');
+    assert.equal(f.refs.has(f.a.binding.outputRef), !local);
+    const event = f.db.events().find(e => e.kind === 'return.authorised')!;
+    assert.equal(event.payload.automatic, true);
+    assert.equal('noProcesses' in event.payload, false);
+    assert.equal((await automaticReturn(f.db, f.a.id, person, f.services)).state, 'returned');
+    assert.equal(f.calls.filter(call => call === 'return').length, 1);
+  }
+});
+
+test('A21/R11: automatic return keeps dirty, unretained, mismatched and unresolved work with current reasons', async t => {
+  for (const failure of ['dirty', 'retention', 'allocation', 'effect']) {
+    const f = await fixture(t);
+    await acceptCandidate(f.db, { ...f.accept, overrideReason: 'Independently verified' }, f.services);
+    if (failure === 'dirty') f.dirty();
+    if (failure === 'retention') f.loseRetention();
+    if (failure === 'allocation') f.services.workspace.inspect = async () => confirmed({ state: 'mismatch' });
+    if (failure === 'effect') {
+      f.services.run = async () => ({ status: 'uncertain', exitCode: null, timedOut: false, stdout: '', stderr: '', truncated: false });
+      await runCandidateChecks(f.db, f.a.id, person, f.services, 'uncertain-check');
+    }
+    const kept = await automaticReturn(f.db, f.a.id, person, f.services);
+    assert.equal(kept.state, 'kept', failure);
+    assert.equal(kept.attempt.leaseState, 'held');
+    assert.match(kept.reason!, /uncommitted|retained|match|unresolved/);
+    assert.equal(await leaseReturnReason(f.db, f.a.id, person, f.services), kept.reason);
+    assert.equal(f.calls.includes('return'), false);
   }
 });
 
@@ -315,13 +350,11 @@ test('R10: a person decision after claiming but immediately before the owner cal
   assert.equal(f.db.task('task').holdReason, 'Stop before owner call');
 });
 
-test('R11: return refuses dirty work, missing or wrong confirmations, mismatched allocation and missing retention', async t => {
-  for (const failure of ['dirty', 'missing', 'wrong', 'mismatch', 'retention', 'discard']) {
+test('R11: return refuses dirty work, mismatched allocation, missing retention and invalid discard confirmation', async t => {
+  for (const failure of ['dirty', 'mismatch', 'retention', 'discard']) {
     const f = await fixture(t);
     let input: any = f.returns;
     if (failure === 'dirty') f.dirty();
-    if (failure === 'missing') input = { ...input, noProcesses: undefined };
-    if (failure === 'wrong') input = { ...input, noProcesses: { leaseId: 'other' } };
     if (failure === 'mismatch') f.services.workspace.inspect = async () => confirmed({ state: 'mismatch' });
     if (failure === 'retention') f.loseRetention();
     if (failure === 'discard') input = { ...input, discard: { leaseId: f.a.allocation.leaseId, confirmed: false } };
@@ -335,7 +368,7 @@ test('R11: a non-terminal worker and unresolved check effect refuse return, incl
   const f = await fixture(t);
   const running = await f.attempt('running', ['Criterion'], undefined, head, start, policyContent, 'validated');
   await assert.rejects(returnAttempt(f.db, { ...f.returns, requestKey: 'running-return', attemptId: running.id,
-    noProcesses: { leaseId: running.allocation.leaseId } }, f.services), /stopped terminal/);
+    }, f.services), /stopped terminal/);
   f.services.run = async () => ({ status: 'uncertain', exitCode: null, timedOut: false, stdout: '', stderr: '', truncated: false });
   await assert.rejects(acceptCandidate(f.db, f.accept, f.services));
   await assert.rejects(returnAttempt(f.db, f.returns, f.services), /unresolved effect/);
