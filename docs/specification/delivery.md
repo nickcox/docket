@@ -38,6 +38,7 @@ The first release supports the following capabilities before it is ready for eve
 | Claude Code supervisor host and Claude ACP launcher | Outside the first release |
 | Pull-request publication and forge merge tracking | Integration supports manual and local fast-forward policies |
 | Independent background dispatcher, mailbox, scheduler and external-event service | Hosts provide transport and scheduling; core requests execute explicitly authorised work |
+| Automatic fallback to another profile when a profile is limited | Dispatch on a limited profile refuses with provider_limited; a person or supervisor names another profile, and a person clears the limit with profile.clear |
 | Proof that every process a worker started has stopped | Automatic lease return depends on committed, retained work, not on process state |
 | Event-history compaction, request-key expiry and permanent-identity deletion | Domain identities and evidence remain available |
 | Worker-requested full checks | Workers run fast checks; Docket runs the full checks once the worker stops |
