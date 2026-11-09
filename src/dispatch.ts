@@ -168,6 +168,16 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
           await db.claimEffect(stop.id, identity);
           const result = await runtime.launcher.fence(reference, stop.id);
           await db.recordEffectOutcome(stop.id, identity, result.status === 'confirmed' ? 'succeeded' : 'uncertain', JSON.parse(JSON.stringify(result)));
+          // A confirmed exit of the direct child is terminal evidence (R07); record it so the
+          // attempt can be settled or discarded instead of staying open behind a stale claim.
+          if (result.status === 'confirmed' && (result.value as JsonObject).terminal === true) {
+            try {
+              await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: ++sequence, attemptId: id, workerRef: reference,
+                observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
+                payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
+              terminal = true;
+            } catch { /* Leave the claim unreleased; a person can resolve it from the recorded stop. */ }
+          }
         }
       }
     }

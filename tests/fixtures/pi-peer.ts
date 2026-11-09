@@ -51,6 +51,11 @@ function receive(line: string) {
     active = true;
     emit({ type: 'agent_start' });
     if (mode !== 'lost-ack') respond({ disposition: 'started' });
+    if (mode === 'model-error') {
+      // As when the provider refuses, for example at a usage limit: the turn fails and the child stays alive.
+      emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'The usage limit has been reached' } });
+      return;
+    }
     if (mode === 'invalid-result') {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       writeFileSync(protocol.resultPath, 'invalid JSON');

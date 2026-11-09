@@ -1741,11 +1741,34 @@ export class Database {
       const claim = this.decodeClaim(this.claimRow(id));
       if (claim.releasedAt) return claim;
       const proof = { claimId: id, generation: claim.generation, ownerRef: claim.ownerRef, evidence, confirmStopped: true };
+      if (claim.role === 'worker_owner' && claim.attemptId !== undefined) this.recordConfirmedStopInTransaction(claim.attemptId, caller);
       this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
         .run(new Date().toISOString(), json(proof), id);
       this.storageEvent('claim.resolved', caller, proof);
       return this.decodeClaim(this.claimRow(id));
     });
+  }
+
+  /** A succeeded stop or fence that confirmed the direct child's exit is terminal evidence (R07). */
+  private recordConfirmedStopInTransaction(attemptId: string, caller: TaskActor): void {
+    const attempt = this.attemptRow(attemptId);
+    if (attempt.runtime_ref === null) return;
+    const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
+      AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(attemptId);
+    if (terminal) return;
+    const stop = this.db.prepare(`SELECT * FROM requests WHERE attempt_id = ? AND category = 'effect'
+      AND operation IN ('worker.emergency-stop', 'worker.fence') AND state = 'succeeded' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(attemptId);
+    if (!stop) return;
+    const request = this.decodeRequest(stop), result = request.result;
+    if (!result || result.status !== 'confirmed' || object(result.value).terminal !== true) return;
+    const workerRef = object(JSON.parse(String(attempt.runtime_ref))) as WorkerReference;
+    const observation: WorkerObservation = { sourceId: `stop:${request.id}`, sourceSequence: 0, attemptId, workerRef,
+      observedAt: request.claimedAt ?? request.createdAt, kind: 'terminal', payloadVersion: 1,
+      payload: workerRef.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } };
+    workerObservation(observation);
+    this.insertEvent({ sourceKey: `worker.observation:${json([attemptId, observation.sourceId, 0])}`, kind: 'worker.observed',
+      payloadVersion: 1, correlationId: attemptId, actor: object(caller), occurredAt: observation.observedAt,
+      attemptId, taskId: String(attempt.task_id), requestId: request.id, payload: observation });
   }
 
   async resolveEffectByPerson(id: string, happened: boolean, evidence: string, caller: TaskActor, command: CommandInput): Promise<StoredRequest> {

@@ -254,6 +254,25 @@ test('R11: CLI discards terminal missing/invalid output, refuses dirty work and 
   }
 });
 
+test('R07/R08/R11: a failed model turn leaves a confirmed terminal stop, a released owner claim and a discardable attempt', async t => {
+  const f = await fixture(t, 'model-error');
+  f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+  const failed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+  assert.notEqual(failed.status, 0);
+  const attemptId = failed.data.attemptId;
+  assert.ok(attemptId, JSON.stringify(failed.envelope));
+  const shown = f.invoke('attempt.show', { attemptId }).data;
+  assert.ok(shown.terminalEvidence.length > 0, JSON.stringify(shown.terminalEvidence));
+  const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data;
+  assert.deepEqual(status.blockers, []);
+  assert.equal(status.claims.length, 0);
+  const discarded = f.invoke('attempt.discard', { attemptId, confirmDiscard: true, noProcesses: true, reason: 'Provider refused the turn', dryRun: false }, 'discard');
+  assert.equal(discarded.status, 0, JSON.stringify(discarded.envelope));
+  assert.equal(discarded.data.attempt.outcome, 'failed');
+  assert.equal(discarded.data.attempt.leaseState, 'returned');
+  assert.equal(f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data.capacity.used, 0);
+});
+
 test('A16/A49/R30: stale claim and uncertain effect block dispatch until scoped person resolutions; plans do not write', async t => {
   const f = await fixture(t);
   f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
