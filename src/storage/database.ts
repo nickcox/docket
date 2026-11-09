@@ -14,7 +14,7 @@ import { questionInput } from './questions.ts';
 import type { Question, QuestionCaller, QuestionInput } from './questions.ts';
 import { supervisorPermissions } from '../authority.ts';
 import { objectiveDefinition, permissions, unlimitedBudget } from './objectives.ts';
-import type { Objective, ObjectiveDefinition } from './objectives.ts';
+import type { CompletionStatement, CompletionReference, Objective, ObjectiveDefinition } from './objectives.ts';
 import { workerReference, workerHost } from './launch.ts';
 import type { WorkerReference, InitialPromptAdmission, LaunchDecision, WorkerHost } from './launch.ts';
 import { readWorkerResult, workerObservation } from './results.ts';
@@ -672,7 +672,7 @@ export class Database {
     const objective = this.decodeObjective(this.objectiveRow(actor.objectiveId));
     const permission = supervisorPermissions[operation];
     if (permission && !objective.permissions[permission]) throw new CommandFailure('permission_denied');
-    if (permission && objective.state !== 'open' && operation !== 'objective.reopen') throw new CommandFailure('policy_refused');
+    if (permission && objective.state !== 'open' && operation !== 'objective.reopen' && operation !== 'objective.complete') throw new CommandFailure('policy_refused');
     if (input.objectiveId !== undefined && input.objectiveId !== actor.objectiveId) throw new CommandFailure('outside_objective');
     if (operation === 'question.answer' && typeof input.questionId === 'string') {
       const question = this.questions().find(q => q.id === input.questionId);
@@ -798,6 +798,59 @@ export class Database {
       this.objectiveEvent(`objective.${action}`, actor, before, result, reason);
       return result;
     });
+  }
+
+  async completeObjective(id: string, statements: CompletionStatement[], actor: TaskActor, command?: CommandInput): Promise<Objective> {
+    taskActor(actor);
+    statements = structuredClone(statements);
+    return this.writeTask(command, () => {
+      this.checkAuthority(actor, 'objective.complete', { objectiveId: id });
+      const before = this.decodeObjective(this.objectiveRow(id));
+      if (before.state !== 'open') throw new CommandFailure('policy_refused');
+      if (!Array.isArray(statements) || statements.length !== before.criteria.length
+        || new Set(statements.map(item => item.position)).size !== statements.length) throw new TypeError('Expected one statement per criterion');
+      for (const item of statements) {
+        if (!Number.isSafeInteger(item.position) || item.position < 1 || item.position > before.criteria.length
+          || typeof item.statement !== 'string' || !item.statement.trim() || [...item.statement].length > 65536
+          || !Array.isArray(item.references) || !item.references.length) throw new TypeError('Invalid completion statement');
+        for (const reference of item.references) this.completionReference(id, reference);
+      }
+      this.changed(this.db.prepare(`UPDATE objectives SET state = 'completed', completion = ?, closed_at = ?, revision = revision + 1
+        WHERE id = ? AND revision = ?`).run(json(statements), new Date().toISOString(), id, before.revision));
+      const result = this.decodeObjective(this.objectiveRow(id));
+      this.objectiveEvent('objective.complete', actor, before, result);
+      return result;
+    });
+  }
+
+  private completionReference(objectiveId: string, reference: CompletionReference): void {
+    const refuse = (): never => { throw new CommandFailure('policy_refused'); };
+    const row = this.db.prepare('SELECT * FROM events WHERE id = ?').get(reference.evidenceEventId);
+    if (!row) refuse();
+    const evidence = this.decodeEvent(row!);
+    const attempt = this.decodeAttempt(this.attemptRow(reference.attemptId));
+    if (this.taskRow(attempt.taskId).objective_id !== objectiveId) refuse();
+    const result = this.validatedResultInTransaction(attempt.id);
+    if (!result || !Array.isArray(reference.artefactDigests)) refuse();
+    const digests = result!.artefacts.map(item => String(item.digest)).sort();
+    if (canonicalJson([...reference.artefactDigests].sort()) !== canonicalJson(digests)) refuse();
+    if (reference.kind === 'review') {
+      const review = reference.reviewAttemptId ? this.decodeAttempt(this.attemptRow(reference.reviewAttemptId)) : null;
+      if (!review || evidence.kind !== 'review.recorded' || evidence.attemptId !== review.id
+        || evidence.payload.reviewAttemptId !== review.id || evidence.payload.sourceAttemptId !== attempt.id
+        || evidence.payload.candidateId !== reference.candidateId || evidence.payload.commit !== reference.candidateCommit
+        || reference.candidateCommit === null || !this.validatedResultInTransaction(review.id)) refuse();
+      const target = object(review!.specification.reviewTarget);
+      if (target.sourceAttemptId !== attempt.id || target.candidateId !== reference.candidateId || target.commit !== reference.candidateCommit) refuse();
+    } else if (reference.kind === 'accepted_output') {
+      if (reference.reviewAttemptId !== null || evidence.attemptId !== attempt.id) refuse();
+      const candidate = object(evidence.payload.candidate);
+      if (candidate.id !== reference.candidateId || candidate.commit !== reference.candidateCommit || candidate.resultDigest !== result!.digest) refuse();
+      if (reference.candidateCommit === null) {
+        if (evidence.kind !== 'attempt.completed' || evidence.payload.outcome !== 'completed'
+          || object(attempt.specification.delivery).kind !== 'report' || !digests.length) refuse();
+      } else if (evidence.kind !== 'candidate.accepted') refuse();
+    } else refuse();
   }
 
   private openMembership(id: string | null): void {
@@ -1804,7 +1857,10 @@ export class Database {
           .run(done ? 'done' : 'queued', done ? null : candidate ? 'awaiting_acceptance' : `worker_${outcome}`,
             taskId, Number(task.decision_revision)));
       }
-      this.launchEvent(attemptId, taskId, actor, 'attempt.completed', { outcome, candidate, resultDigest: result.digest });
+      // Reports have an immutable evidence candidate, but no Git candidate for acceptance or rebase.
+      const evidenceCandidate = outcome === 'completed' && delivery.kind === 'report'
+        ? { id: randomUUID(), commit: null, resultDigest: result.digest } : candidate;
+      this.launchEvent(attemptId, taskId, actor, 'attempt.completed', { outcome, candidate: evidenceCandidate, resultDigest: result.digest });
       return this.decodeAttempt(this.attemptRow(attemptId));
     });
   }

@@ -79,6 +79,55 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
     loseRetention: () => { retained = false; } };
 }
 
+test('R19/A38: exact accepted-output statements close only the objective, refuse bad evidence atomically and replay safely', async t => {
+  const f = await fixture(t), db = f.db;
+  const definition = { id: 'goal', request: 'Finish', criteria: ['Works', 'Explained'], scope: '', constraints: '', permissions: null, budget: null, deadline: null };
+  await db.addObjective(definition, person);
+  await db.addObjective({ ...definition, id: 'other' }, person);
+  await db.moveTask('task', db.task('task').definitionRevision, 'goal', person);
+  await acceptCandidate(db, f.accept, f.services);
+  const accepted = db.acceptance(f.a.id, f.accept.candidateId)!;
+  const reference = { kind: 'accepted_output' as const, attemptId: f.a.id, candidateId: f.accept.candidateId,
+    candidateCommit: head, artefactDigests: [], evidenceEventId: accepted.id, reviewAttemptId: null };
+  const statements = [1, 2].map(position => ({ position, statement: 'Verified', references: [reference] }));
+  const snapshot = () => ({ objectives: db.objectives(), tasks: db.tasks(), attempts: db.attempt(f.a.id), events: db.events(), requests: db.requests(), claims: db.claims() });
+  for (const invalid of [[], statements.slice(0, 1), [...statements, statements[0]!],
+    statements.map(item => ({ ...item, position: 1 })), statements.map(item => ({ ...item, position: 3 })),
+    statements.map(item => ({ ...item, statement: '  ' })), statements.map(item => ({ ...item, references: [] })),
+    ...[{ evidenceEventId: 'invented' }, { attemptId: 'invented' }, { candidateId: 'invented' }, { candidateCommit: start },
+      { artefactDigests: ['invented'] }, { reviewAttemptId: f.a.id }, { kind: 'review' as const }].map(patch =>
+      statements.map(item => ({ ...item, references: [{ ...reference, ...patch }] })))]) {
+    const before = snapshot();
+    await assert.rejects(db.completeObjective('goal', invalid, person));
+    assert.deepEqual(snapshot(), before);
+  }
+  const before = snapshot();
+  await assert.rejects(db.completeObjective('other', statements, person));
+  assert.deepEqual(snapshot(), before);
+  const caller = { kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
+  const goal = db.objective('goal', person);
+  await db.updateObjective('goal', goal.revision, { ...goal, permissions: { ...goal.permissions, completeObjective: false } }, person);
+  await assert.rejects(db.completeObjective('goal', statements, caller), { code: 'permission_denied' });
+  await db.updateObjective('goal', goal.revision + 1, { ...goal, permissions: { ...goal.permissions, manageTasks: false } }, person);
+  const mechanical = { attempt: db.attempt(f.a.id), tasks: db.tasks(), claims: db.claims(), calls: [...f.calls] };
+  const command = { requestKey: 'complete', caller, operation: 'objective.complete', input: {}, fingerprint: 'complete' };
+  const internals = db as unknown as { insertEvent: (event: { kind: string }) => unknown };
+  const original = internals.insertEvent;
+  internals.insertEvent = function (event) { const result = original.call(db, event); if (event.kind === 'request.succeeded') throw new Error('last-event failure'); return result; };
+  const rollback = snapshot();
+  try { await assert.rejects(db.completeObjective('goal', statements, caller, command), /last-event failure/u); }
+  finally { internals.insertEvent = original; }
+  assert.deepEqual(snapshot(), rollback);
+  const completed = await db.completeObjective('goal', statements, caller, command);
+  assert.equal(completed.state, 'completed');
+  assert.deepEqual(completed.completion, statements);
+  assert.deepEqual(await db.completeObjective('goal', statements, caller, command), completed);
+  assert.deepEqual({ attempt: db.attempt(f.a.id), tasks: db.tasks(), claims: db.claims(), calls: f.calls }, mechanical);
+  await db.closeOrReopenObjective('goal', 'reopen', 'More work', person);
+  assert.deepEqual(db.objective('goal', person).completion, []);
+  assert.deepEqual((db.events().find(e => e.kind === 'objective.complete')!.payload.after as any).completion, statements);
+});
+
 async function diagnosticFixture(t: Parameters<typeof checkFixture>[0]) {
   const f = await fixture(t);
   for (const claim of f.db.claims().filter(c => c.attemptId === f.a.id && !c.releasedAt)) {

@@ -41,11 +41,11 @@ export async function checkFixture(t: TestContext, maximum = 1) {
   const [claim] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch-1', ownerRef: person,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
   const executor = { claimId: claim!.id, generation: claim!.generation };
-  async function attempt(name: string, criteria = ['Criterion'], workspacePath?: string, candidate = head, initial = start, recordedPolicy = policyContent, stage: 'prepared' | 'validated' | 'completed' = 'completed') {
-    await db.addTask({ id: name, title: name, kind: 'code', criteria }, person);
+  async function attempt(name: string, criteria = ['Criterion'], workspacePath?: string, candidate = head, initial = start, recordedPolicy = policyContent, stage: 'prepared' | 'validated' | 'completed' = 'completed', kind: 'code' | 'report' = 'code') {
+    await db.addTask({ id: name, title: name, kind, criteria }, person);
     const reservation = await db.reserveAttempt({ requestKey: `dispatch:${name}`, taskId: name, caller: person, startingCommit: initial,
       checks: parseCheckPolicy(initial, recordedPolicy, contextChecks),
-      delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+      delivery: { kind, acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
     const id = reservation.attempt.id;
     const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, person);
     const input = acquisition.effect.input, workspace = input.workspace as JsonObject;
@@ -61,8 +61,13 @@ export async function checkFixture(t: TestContext, maximum = 1) {
     const result = { version: 1, identity: binding.identity, startingCommit: initial, outputRef: binding.outputRef,
       outcome: 'completed', summary: 'Implemented', reason: null,
       criteriaReport: criteria.map((criterion, index) => ({ position: index + 1, criterion, status: 'met', evidence: 'Tested' })),
-      evidence: [], workReferences: [{ kind: 'git', name: 'code', branch: binding.outputRef, commit: candidate }] };
+      evidence: [], workReferences: kind === 'code' ? [{ kind: 'git', name: 'code', branch: binding.outputRef, commit: candidate }]
+        : [{ kind: 'artefact', name: 'report', path: join('artefacts', 'report.txt'), description: 'Retained report' }] };
     await mkdir(dirname(binding.resultPath), { recursive: true });
+    if (kind === 'report') {
+      await mkdir(join(dirname(binding.resultPath), 'artefacts'), { recursive: true });
+      await writeFile(join(dirname(binding.resultPath), 'artefacts', 'report.txt'), 'Report evidence');
+    }
     await writeFile(binding.resultPath, JSON.stringify(result));
     const observation = (kind: 'terminal' | 'result_available', sequence: number) => ({ sourceId: name, sourceSequence: sequence,
       attemptId: id, workerRef: reference, observedAt: new Date().toISOString(), kind, payloadVersion: 1 as const,

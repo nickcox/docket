@@ -181,6 +181,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'objective.add': return { objective: await db.addObjective(args as unknown as Parameters<Database['addObjective']>[0], caller, command) };
       case 'objective.show': return { objective: db.objective(String(args.objectiveId), caller) };
       case 'objective.update': return { objective: await db.updateObjective(String(args.objectiveId), Number(args.expectedRevision), args as unknown as ObjectiveDefinition, caller, command) };
+      case 'objective.complete': return { objective: await db.completeObjective(String(args.objectiveId),
+        args.statements as unknown as Parameters<Database['completeObjective']>[1], caller, command) };
       case 'objective.abandon': case 'objective.reopen': return { objective: await db.closeOrReopenObjective(String(args.objectiveId),
         operation.name === 'objective.abandon' ? 'abandon' : 'reopen', String(args.reason), caller, command) };
       case 'task.move': return { task: await db.moveTask(id, Number(args.expectedRevision), args.objectiveId as string | null, caller, command) };

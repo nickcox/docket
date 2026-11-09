@@ -119,6 +119,29 @@ for (const status of ['met', 'not_met']) test(`R13/A28: retained ${status} revie
   assert.equal(f.db.reviewEvidence(f.source.id).findings.length, 1);
 });
 
+for (const status of ['met', 'not_met']) test(`R19/A38: ${status} exact review supports explanation, never source acceptance`, async t => {
+  const f = await fixture(t), worker = await f.worker(), db = f.db;
+  worker.content.criteriaReport[1]!.status = status;
+  await worker.save(); await worker.terminal();
+  await db.completeWorker(worker.id, host, retention);
+  await db.addObjective({ id: 'goal', request: 'Explain', criteria: ['Explained'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  await db.moveTask('source', db.task('source').definitionRevision, 'goal', person);
+  const event = db.reviewEvidence(f.source.id).current!;
+  const reference = { kind: 'review' as const, attemptId: f.source.id, candidateId: String(f.target.candidateId), candidateCommit: head,
+    artefactDigests: [], evidenceEventId: event.id, reviewAttemptId: worker.id };
+  const statements = [{ position: 1, statement: 'Review explains the remaining work', references: [reference] }];
+  for (const patch of [{ reviewAttemptId: f.source.id }, { reviewAttemptId: null }, { candidateCommit: start },
+    { candidateId: worker.id }, { evidenceEventId: db.events().find(e => e.kind === 'attempt.completed')!.id }]) {
+    const before = db.events();
+    await assert.rejects(db.completeObjective('goal', [{ ...statements[0]!, references: [{ ...reference, ...patch }] }], person));
+    assert.deepEqual(db.events(), before);
+  }
+  const before = { source: db.attempt(f.source.id), review: db.attempt(worker.id), tasks: db.tasks(), claims: db.claims() };
+  assert.equal((await db.completeObjective('goal', statements, person)).state, 'completed');
+  assert.deepEqual({ source: db.attempt(f.source.id), review: db.attempt(worker.id), tasks: db.tasks(), claims: db.claims() }, before);
+  assert.equal(db.acceptance(f.source.id, String(f.target.candidateId)), null);
+});
+
 for (const invalid of ['wrong-target', 'missing-target', 'duplicate-target', 'missing-criterion', 'interrupted'] as const) {
   test(`R13/A19/A29: ${invalid} produces no verdict`, async t => {
     const f = await fixture(t), worker = await f.worker();

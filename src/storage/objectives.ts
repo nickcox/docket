@@ -11,6 +11,11 @@ export interface Objective extends ObjectiveDefinition {
   id: string; revision: number; request: string; creator: string; permissions: Permissions; state: 'open' | 'completed' | 'abandoned';
   completion: JsonObject[]; createdAt: string; closedAt: string | null;
 }
+export interface CompletionReference {
+  kind: 'accepted_output' | 'review'; attemptId: string; candidateId: string; candidateCommit: string | null;
+  artefactDigests: string[]; evidenceEventId: string; reviewAttemptId: string | null;
+}
+export interface CompletionStatement { position: number; statement: string; references: CompletionReference[] }
 export const unlimitedBudget: Budget = { maxCost: null, currency: null, maxTokens: null, maxWorkerTimeMs: null };
 
 export function permissions(value: unknown): Permissions {
