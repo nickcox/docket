@@ -32,11 +32,12 @@ function receive(line: string) {
     thinkingLevel: arg('--thinking') ?? 'off', isStreaming: active, isCompacting: false, pendingMessageCount: 0 });
   else if (request.type === 'set_auto_retry') respond();
   else if (request.type === 'get_session_stats') {
+    if (mode === 'running-no-usage') return;
     if (mode === 'unsupported-usage') emit({ type: 'response', command: request.type, id: request.id, success: false, error: 'Unknown command: get_session_stats' });
     else {
       statsReads++;
       const zero = mode === 'zero-usage' || (mode === 'regressing-usage' && statsReads > 1);
-      respond(mode === 'missing-usage' ? {} : { tokens: { total: zero ? 0 : 123 }, cost: zero ? 0 : 0.004 });
+      respond(mode === 'missing-usage' ? {} : { tokens: { input: zero ? 0 : 100, output: zero ? 0 : 23, total: zero ? 0 : 123 }, cost: zero ? 0 : 0.004 });
     }
   } else if (request.type === 'prompt') {
     if (mode === 'malformed-with-result') {
@@ -87,7 +88,7 @@ function receive(line: string) {
         workReferences: protocol.reviewTarget ? [{ kind: 'reviewed-output', name: 'review', target: protocol.reviewTarget }]
           : [{ kind: 'git', name: 'code', branch: protocol.outputRef, commit }] }));
     }
-    if (mode !== 'running') {
+    if (mode !== 'running' && mode !== 'running-no-usage') {
       active = false;
       emit({ type: 'agent_end' });
       emit({ type: 'agent_settled', aborted: false });

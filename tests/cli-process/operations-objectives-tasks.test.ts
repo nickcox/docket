@@ -15,7 +15,7 @@ test('R18/R19/R28: objective operations replay atomically, validate budgets and 
     permissions: {}, budget: { ...add.budget, currency: null }, deadline: null });
   assert.equal(bad.envelope.code, 'invalid_input');
   assert.deepEqual(await snapshot(f.home), recorded);
-  const update = { objectiveId: 'goal', expectedRevision: 1, criteria: ['Works'], scope: 'Repository', constraints: '', permissions: {}, budget: add.budget, deadline: add.deadline };
+  const update = { objectiveId: 'goal', expectedRevision: 1, criteria: ['Works'], scope: 'Repository', constraints: '', permissions: {}, budget: { maxCost: null, currency: 'USD', maxTokens: 10000, maxWorkerTimeMs: 60000 }, deadline: null };
   const updated = f.invoke('objective.update', update, 'update-goal');
   assert.equal(updated.status, 0, JSON.stringify(updated.envelope));
   assert.deepEqual(f.invoke('objective.update', update, 'update-goal').data, updated.data);
@@ -26,7 +26,7 @@ test('R18/R19/R28: objective operations replay atomically, validate budgets and 
   const plan = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: true });
   assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
   assert.deepEqual(await snapshot(f.home), stable);
-  // Budgets and deadlines are stored but not yet enforced; persons are not restricted by supervisor permissions.
+  // Persons are not restricted by supervisor permissions, but budgets apply to every dispatch.
   const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch-goal');
   assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope));
   assert.equal(dispatched.data.attempt.specification.objectiveId, 'goal');

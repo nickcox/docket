@@ -27,7 +27,7 @@ import { validateSchema } from './operation-schemas.ts';
 export interface OperationOptions extends ContextOptions {
   runtime?: typeof createRuntime;
   /** Trusted host input only. Never read from operation args. */
-  caller?: import('./storage/questions.ts').QuestionCaller;
+  caller?: import('./storage/questions.ts').QuestionCaller | { kind: 'host'; id: string };
 }
 type Page = { after: string | null; limit: number };
 function paginate<T>(items: T[], page: Page, key: (value: T) => string) {
@@ -92,6 +92,15 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   const bound = structuredClone(options.caller ?? { kind: 'person' as const, id: String(userInfo().uid) });
   if (!operation.roles.includes(bound.kind)) throw new CommandFailure('person_required');
   if (bound.kind === 'worker' && operation.name !== 'question.ask') throw new CommandFailure('person_required');
+  if (bound.kind === 'host') {
+    if (operation.name !== 'host.usage') throw new CommandFailure('person_required');
+    const context = await openContext(selector, { ...options, readOnly: false });
+    try {
+      await context.database.recordUsage(args.report as import('./usage.ts').UsageReport, bound);
+      return { recorded: true };
+    } catch (error) { mapStorage(error, context.database, requestKey); }
+    finally { context.database.close(); }
+  }
   const caller = bound as TaskActor;
   if (operation.name === 'context.init') return initialiseContext(selector, { ...options, caller });
   if (operation.name === 'context.configure') return configureContext(selector, { ...options, caller, dryRun: args.dryRun === true });
@@ -172,14 +181,16 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             nextAction: b.kind === 'claim'
               ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
-          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor'
+          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId)
+            .map(o => ({ ...o, usage: db.objectiveUsage(o.id) })), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor'
             || q.scope.objectiveId === caller.objectiveId && (q.scope.taskId === null || visibleTask(db.task(q.scope.taskId))))).map(q => ({ ...q,
             reason: q.waiting ? 'The asker is waiting for an answer.' : 'Question is unanswered.',
             nextAction: action('question.answer', { questionId: q.id, text: '<answer>' }, 'Answer this question; only a person may answer a question addressed to a person.') })) };
       }
       case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));
       case 'objective.add': return { objective: await db.addObjective(args as unknown as Parameters<Database['addObjective']>[0], caller, command) };
-      case 'objective.show': return { objective: db.objective(String(args.objectiveId), caller) };
+      case 'objective.show': return { objective: { ...db.objective(String(args.objectiveId), caller), usage: db.objectiveUsage(String(args.objectiveId)) } };
+      case 'objective.confirm-usage': return { objective: await db.confirmUsage(String(args.objectiveId), args.sessionGaps as import('./usage.ts').UsageGap[], String(args.reason), caller, command) };
       case 'objective.update': return { objective: await db.updateObjective(String(args.objectiveId), Number(args.expectedRevision), args as unknown as ObjectiveDefinition, caller, command) };
       case 'objective.complete': return { objective: await db.completeObjective(String(args.objectiveId),
         args.statements as unknown as Parameters<Database['completeObjective']>[1], caller, command) };

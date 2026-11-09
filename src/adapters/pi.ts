@@ -41,7 +41,7 @@ type Worker = {
 };
 const capabilities: LauncherCapabilities = {
   preparation: 'non_acting', admission: true, activeSteering: false, afterTurnMessage: false,
-  stopTurn: false, terminalFence: true, usageMetrics: ['tokens', 'cost'],
+  stopTurn: false, terminalFence: true, usageMetrics: ['tokens', 'cost', 'workerTimeMs'],
   resourceIsolation: ['private_home', 'no_project_settings', 'no_extensions', 'no_mcp', 'no_skills', 'no_context_files', 'environment_allowlist'],
   observationSources: ['direct_child', 'pi_rpc'],
 };
@@ -83,29 +83,31 @@ export class PiLauncher implements Launcher {
   }
   async prepare(input: WorkerBinding, effectId: string): Promise<Result<WorkerReference>> {
     const binding = structuredClone(input);
+    // Every rejection below precedes child creation; later failures remain uncertain.
+    const notStarted = (reason: string) => rejected(reason, { neverStarted: true, currency: 'USD' });
     const previous = this.preparations.get(effectId);
     if (previous || this.attemptedPreparations.has(effectId) || this.attemptedSessions.has(binding.sessionId)) {
       return uncertain('Pi preparation already attempted', previous ? structuredClone(previous.reference) : { sessionId: binding.sessionId, effectId });
     }
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(binding.sessionId)) return rejected('Invalid Pi session UUID');
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(binding.sessionId)) return notStarted('Invalid Pi session UUID');
     const profile = binding.specification.profile;
     if (!object(profile) || profile.launcher !== 'pi' || typeof profile.executionProfile !== 'string'
       || typeof profile.provider !== 'string' || !profile.provider || profile.provider.startsWith('-')
       || typeof profile.model !== 'string' || !profile.model || profile.model.startsWith('-')
       || (profile.reasoning !== null && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(String(profile.reasoning)))) {
-      return rejected('Invalid Pi worker profile');
+      return notStarted('Invalid Pi worker profile');
     }
     const execution = Object.hasOwn(this.options.profiles, profile.executionProfile) ? this.options.profiles[profile.executionProfile] : undefined;
-    if (!execution) return rejected('Unknown Pi execution profile');
+    if (!execution) return notStarted('Unknown Pi execution profile');
     this.attemptedPreparations.add(effectId);
     this.attemptedSessions.add(binding.sessionId);
     let worker: Worker | undefined;
     try {
       const cwd = await realpath(binding.allocation.path);
-      if (cwd !== binding.allocation.path) return rejected('Pi cwd is not canonical');
+      if (cwd !== binding.allocation.path) return notStarted('Pi cwd is not canonical');
       await mkdir(this.options.stateDirectory, { recursive: true, mode: 0o700 });
       const root = await realpath(this.options.stateDirectory);
-      if (!outside(cwd, root)) return rejected('Pi state must be outside the leased workspace');
+      if (!outside(cwd, root)) return notStarted('Pi state must be outside the leased workspace');
       const directory = join(root, randomUUID());
       await mkdir(directory, { mode: 0o700 });
       if (process.platform === 'win32') await (this.options.windowsSecurePrivateDirectory ?? windowsSecurePrivateDirectory)(directory);
@@ -113,7 +115,7 @@ export class PiLauncher implements Launcher {
       await mkdir(join(home, '.pi', 'agent'), { recursive: true, mode: 0o700 });
       await mkdir(sessions, { mode: 0o700 });
       if (!isAbsolute(binding.resultPath) || binding.specification.resultPath !== binding.resultPath
-        || !outside(cwd, binding.resultPath)) return rejected('Invalid Pi retained result path');
+        || !outside(cwd, binding.resultPath)) return notStarted('Invalid Pi retained result path');
       const resultDirectory = dirname(binding.resultPath);
       await mkdir(resultDirectory, { recursive: true, mode: 0o700 });
       await mkdir(join(resultDirectory, 'questions'), { recursive: true, mode: 0o700 });
@@ -145,7 +147,7 @@ export class PiLauncher implements Launcher {
         const agentFiles: Record<string, string> = {};
         for (const [key, path] of Object.entries(execution.agentFiles ?? {})) {
           const canonical = await realpath(path);
-          if (!(await lstat(canonical)).isFile()) return rejected('Pi agent reference is not a regular file');
+          if (!(await lstat(canonical)).isFile()) return notStarted('Pi agent reference is not a regular file');
           agentFiles[key] = canonical;
         }
         const configPath = join(directory, 'sdk.json');
@@ -222,11 +224,12 @@ export class PiLauncher implements Launcher {
       if (!object(stats) || !object(stats.tokens) || !nonnegative(stats.tokens.total) || !Number.isSafeInteger(stats.tokens.total) || !nonnegative(stats.cost)) {
         return { status: 'unknown', reason: 'Pi session usage metrics are missing or invalid' };
       }
-      const metrics = { tokens: stats.tokens.total, cost: stats.cost };
-      if (worker.usage?.status === 'reported' && (metrics.tokens < worker.usage.metrics.tokens! || metrics.cost < worker.usage.metrics.cost!)) {
-        return { status: 'unknown', reason: 'Pi cumulative usage moved backwards' };
+      if (!nonnegative(stats.tokens.input) || !Number.isSafeInteger(stats.tokens.input)
+        || !nonnegative(stats.tokens.output) || !Number.isSafeInteger(stats.tokens.output)) {
+        return { status: 'unknown', reason: 'Pi input/output usage metrics are missing or invalid' };
       }
-      worker.usage = { status: 'reported', sourceId: String(reference.ownerId), sequence: ++worker.sequence, metrics };
+      const metrics = { tokens: stats.tokens.total, input: stats.tokens.input, output: stats.tokens.output, cost: stats.cost };
+      worker.usage = { status: 'reported', sourceId: String(reference.ownerId), sequence: ++worker.sequence, metrics, currency: 'USD' };
       return structuredClone(worker.usage);
     } catch (error) {
       return error instanceof PiRpcRejection && error.unsupported

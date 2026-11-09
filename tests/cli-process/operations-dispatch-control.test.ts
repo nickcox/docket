@@ -26,15 +26,17 @@ test('R07/R08/R09/R31/R35: a separate CLI stops the live dispatch owner; Pi stee
   assert.ok(stderr.includes('worker.wait'), stderr + stdout);
   const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } });
   const attemptId = status.data.attempts.items[0].id;
-  const before = await snapshot(f.home);
+  // The live owner polls usage independently of these read-only/refused controls.
+  const controlSnapshot = async () => Object.fromEntries(Object.entries(await snapshot(f.home)).filter(([path]) => path !== join(f.home, 'peer.jsonl')));
+  const before = await controlSnapshot();
   for (const mode of ['active', 'after_turn']) for (const dryRun of [true, false]) {
     const steer = f.invoke('attempt.steer', { attemptId, message: 'Change direction', mode, dryRun });
     assert.equal(steer.envelope.code, 'capability_missing');
   }
-  assert.deepEqual(await snapshot(f.home), before);
+  assert.deepEqual(await controlSnapshot(), before);
   const planned = f.invoke('attempt.stop', { attemptId, dryRun: true });
   assert.equal(planned.status, 0);
-  assert.deepEqual(await snapshot(f.home), before);
+  assert.deepEqual(await controlSnapshot(), before);
   const stopped = f.invoke('attempt.stop', { attemptId, dryRun: false }, 'stop');
   assert.equal(stopped.status, 0, JSON.stringify(stopped.envelope));
   assert.deepEqual(stopped.data.steps, planned.data.steps);

@@ -31,7 +31,7 @@ export type WorkerObservation =
   | { status: 'known'; sourceId: string; sequence: number; worker: 'prepared' | 'active' | 'stopped'; turn: 'idle' | 'running' | 'ended'; terminal: boolean; capabilities: LauncherCapabilities; exit?: { code: number | null; signal: string | null }; failure?: string; turnFailure?: TurnFailure }
   | { status: 'absent' }
   | { status: 'unknown'; reason: string };
-export type Usage = { status: 'reported'; sourceId: string; sequence: number; metrics: Record<string, number> }
+export type Usage = { status: 'reported'; sourceId: string; sequence: number; metrics: Record<string, number>; currency?: string }
   | { status: 'unknown' | 'unsupported'; reason: string };
 export type MessageMode = 'active_steering' | 'after_turn';
 

@@ -15,6 +15,8 @@ import type { Question, QuestionCaller, QuestionInput } from './questions.ts';
 import { supervisorPermissions } from '../authority.ts';
 import { objectiveDefinition, permissions, unlimitedBudget } from './objectives.ts';
 import type { CompletionStatement, CompletionReference, Objective, ObjectiveDefinition } from './objectives.ts';
+import { usageSummary, validateReport, enforceBudget, budgetReason, metrics } from '../usage.ts';
+import type { UsageReport, UsageGap, Session } from '../usage.ts';
 import { workerReference, workerHost } from './launch.ts';
 import type { WorkerReference, InitialPromptAdmission, LaunchDecision, WorkerHost } from './launch.ts';
 import { readWorkerResult, workerObservation } from './results.ts';
@@ -740,6 +742,101 @@ export class Database {
     return this.snapshot(() => this.db.prepare('SELECT * FROM objectives ORDER BY created_at, id').all().map(row => this.decodeObjective(row)));
   }
 
+  private usageEvents(): StoredEvent[] {
+    return this.db.prepare('SELECT * FROM events ORDER BY seq').all().map(row => this.decodeEvent(row));
+  }
+
+  objectiveUsage(id: string) {
+    return this.snapshot(() => usageSummary(this.decodeObjective(this.objectiveRow(id)), this.usageEvents()));
+  }
+
+  checkBudget(id: string | null, capabilities?: readonly string[]): void {
+    if (id === null) return;
+    const check = () => enforceBudget(this.decodeObjective(this.objectiveRow(id)), this.usageEvents(), capabilities);
+    if (this.db.isTransaction) check(); else this.snapshot(check);
+  }
+
+  runningBudgetReason(attemptId: string): string | null {
+    return this.snapshot(() => {
+      const session = this.usageEvents().find(e => e.kind === 'session.registered' && e.attemptId === attemptId);
+      const id = session?.payload.objectiveId;
+      return typeof id === 'string' ? budgetReason(this.decodeObjective(this.objectiveRow(id)), this.usageEvents(), undefined, Date.now(), true) : null;
+    });
+  }
+
+  async registerSession(session: Session, actor: JsonObject): Promise<void> {
+    if (actor.kind !== 'host') throw new CommandFailure('person_required');
+    session = structuredClone(session);
+    actor = object(actor);
+    nonblank(session.sessionId);
+    if (!['worker', 'supervisor'].includes(session.kind) || !Number.isFinite(Date.parse(session.registeredAt))) throw new TypeError('Invalid session');
+    await this.write(() => {
+      if (session.objectiveId !== null) this.objectiveRow(session.objectiveId);
+      this.insertEvent({ sourceKey: `session:${session.sessionId}`, kind: 'session.registered', payloadVersion: 1,
+        correlationId: session.sessionId, actor, occurredAt: session.registeredAt,
+        ...(session.objectiveId === null ? {} : { objectiveId: session.objectiveId }),
+        ...(session.attemptId === null ? {} : { attemptId: session.attemptId }), payload: object(session) });
+    });
+  }
+
+  async recordUsage(report: UsageReport, actor: JsonObject): Promise<void> {
+    if (actor.kind !== 'host') throw new CommandFailure('person_required');
+    report = structuredClone(report);
+    validateReport(report);
+    const value = object(report);
+    await this.write(() => {
+      const registered = this.usageEvents().find(e => e.kind === 'session.registered' && e.payload.sessionId === report.sessionId);
+      if (!registered) throw new StorageError('conflict', 'Usage session is not registered');
+      if (registered.payload.kind === 'supervisor' && report.workerTimeMs.availability !== 'unsupported') throw new TypeError('Supervisor time is unsupported');
+      this.insertEvent({ sourceKey: `usage:${report.sessionId}:${report.sourceSequence}`, kind: 'usage.observed', payloadVersion: 1,
+        correlationId: report.sessionId, actor, occurredAt: report.observedAt,
+        ...(registered.objectiveId ? { objectiveId: registered.objectiveId } : {}),
+        ...(registered.attemptId ? { attemptId: registered.attemptId } : {}), payload: value });
+    });
+  }
+
+  /** Only explicit launcher evidence that preparation never started can establish zero usage. */
+  async recordUnstartedSession(attemptId: string, host: WorkerHost): Promise<void> {
+    workerHost(host);
+    await this.write(() => {
+      const row = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.prepare'").get(attemptId);
+      const request = row ? this.decodeRequest(row) : null;
+      this.workerClaim(attemptId, String(request?.claimId), host);
+      const proof = request?.result?.evidence as JsonObject | undefined;
+      if (request?.state !== 'rejected' || proof?.neverStarted !== true || typeof proof.currency !== 'string') {
+        throw new StorageError('conflict', 'Preparation has no proof that the worker never started');
+      }
+      const sessionId = String(request.input.sessionId), now = new Date().toISOString();
+      const session = this.usageEvents().find(e => e.kind === 'session.registered' && e.payload.sessionId === sessionId)!;
+      const scope = session.objectiveId ? { objectiveId: session.objectiveId } : {};
+      const report: UsageReport = { sessionId, sourceSequence: 0, observedAt: now,
+        cost: { availability: 'reported', value: 0, currency: session.objectiveId
+          ? this.decodeObjective(this.objectiveRow(session.objectiveId)).budget.currency ?? proof.currency : proof.currency },
+        tokens: { availability: 'reported', input: 0, output: 0, total: 0 }, workerTimeMs: { availability: 'reported', value: 0 } };
+      this.insertEvent({ sourceKey: `usage:${sessionId}:0`, kind: 'usage.observed', payloadVersion: 1,
+        correlationId: sessionId, actor: host, occurredAt: now, attemptId, ...scope, payload: object(report) });
+      this.insertEvent({ sourceKey: `session.finished:${sessionId}`, kind: 'session.finished', payloadVersion: 1,
+        correlationId: sessionId, actor: host, occurredAt: now, attemptId, ...scope, payload: { sessionId, neverStarted: true, preparationRequestId: request.id } });
+    });
+  }
+
+  async confirmUsage(id: string, sessionGaps: UsageGap[], reason: string, actor: TaskActor, command?: CommandInput): Promise<Objective> {
+    nonblank(reason);
+    return this.writeTask(command, () => {
+      const objective = this.decodeObjective(this.objectiveRow(id));
+      if (actor.kind !== 'person' || actor.id !== objective.creator) throw new CommandFailure('creator_required');
+      const current = usageSummary(objective, this.usageEvents()).gaps;
+      if (!sessionGaps.length || sessionGaps.some(g => !g.metrics.length || new Set(g.metrics).size !== g.metrics.length
+        || g.metrics.some(m => !metrics.includes(m) || !current.some(c => c.finished && c.sessionId === g.sessionId && c.metrics.includes(m))))) {
+        throw new TypeError('Confirmation requires exact finished session gaps');
+      }
+      const eventId = randomUUID();
+      this.insertEvent({ sourceKey: `usage-confirmed:${eventId}`, kind: 'objective.usage-confirmed', payloadVersion: 1,
+        correlationId: eventId, objectiveId: id, actor, occurredAt: new Date().toISOString(), payload: { sessionGaps: object({ gaps: sessionGaps }).gaps!, reason } });
+      return objective;
+    });
+  }
+
   private objectiveEvent(operation: string, actor: TaskActor, before: Objective | null, after: Objective, reason: string | null = null): void {
     const id = randomUUID();
     this.insertEvent({ sourceKey: `objective:${id}`, kind: operation, payloadVersion: 1, correlationId: id,
@@ -1191,6 +1288,7 @@ export class Database {
         if (Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE execution_open = 1').get()!.count) >= config.maxAttempts) {
           throw new StorageError('conflict', 'Context attempt capacity reached');
         }
+        this.checkBudget(task.objectiveId, value.usageMetrics);
         const id = randomUUID(), now = new Date().toISOString();
         const number = Number(this.db.prepare('SELECT coalesce(max(number), 0) + 1 AS number FROM attempts WHERE task_id = ?').get(task.id)!.number);
         if (!Number.isSafeInteger(number)) throw new StorageError('conflict', 'Attempt number range exhausted');
@@ -1363,7 +1461,7 @@ export class Database {
   }
 
   /** Existing intent is inspection evidence, never permission to prepare twice. */
-  async beginWorkerPreparation(attemptId: string, claimId: string, host: WorkerHost): Promise<{ effect: StoredRequest; claimed: boolean }> {
+  async beginWorkerPreparation(attemptId: string, claimId: string, host: WorkerHost, capabilities: readonly string[] = []): Promise<{ effect: StoredRequest; claimed: boolean }> {
     text(attemptId); text(claimId); workerHost(host);
     const owner = object(host) as WorkerHost;
     return this.write(() => {
@@ -1379,6 +1477,12 @@ export class Database {
         specification: spec, allocation: JSON.parse(String(attempt.allocation)), sessionId: randomUUID(), resultPath: spec.resultPath!,
         profileDigest: createHash('sha256').update(json(spec.profile)).digest('hex'),
         owner: { claimId, generation: owner.generation } };
+      const objectiveId = this.decodeTask(this.taskRow(String(attempt.task_id))).objectiveId;
+      this.checkBudget(objectiveId);
+      this.insertEvent({ sourceKey: `session:${input.sessionId}`, kind: 'session.registered', payloadVersion: 1,
+        correlationId: input.sessionId, actor: owner, occurredAt: new Date().toISOString(), attemptId,
+        ...(objectiveId === null ? {} : { objectiveId }), payload: { sessionId: input.sessionId, kind: 'worker', objectiveId,
+          attemptId, registeredAt: new Date().toISOString(), capabilities: [...capabilities], workerRef: null, restricted: true } });
       const effect = this.workerEffect(attemptId, claimId, owner.generation, 'worker.prepare', input, { launcher: object(spec.profile).launcher! });
       return { effect: this.claimEffectInTransaction(effect.id, { claimId, generation: owner.generation }), claimed: true };
     });
@@ -1464,9 +1568,24 @@ export class Database {
     });
   }
 
+  async requestBudgetStop(attemptId: string, host: WorkerHost): Promise<void> {
+    workerHost(host);
+    await this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
+      const events = this.usageEvents();
+      const session = events.find(e => e.kind === 'session.registered' && e.attemptId === attemptId);
+      const id = session?.payload.objectiveId;
+      const reason = typeof id === 'string' ? budgetReason(this.decodeObjective(this.objectiveRow(id)), events, undefined, Date.now(), true) : null;
+      if (!reason) throw new StorageError('conflict', 'No running budget limit exceeded');
+      this.launchEvent(attemptId, String(attempt.task_id), host, 'worker.budget-stop-requested', { reason });
+    });
+  }
+
   /** Recorded commands are noticed by the owning dispatch, never executed by another process. */
   workerStopRequested(attemptId: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND category = 'command' AND operation = 'attempt.stop' LIMIT 1").get(attemptId);
+    return !!this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND category = 'command' AND operation = 'attempt.stop' LIMIT 1").get(attemptId)
+      || !!this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.budget-stop-requested' LIMIT 1").get(attemptId);
   }
 
   async requestWorkerControl(command: CommandInput, dryRun = false): Promise<void> {
@@ -1515,11 +1634,13 @@ export class Database {
         throw new StorageError('conflict', 'Interruption requires a stop request and terminal evidence');
       }
       if (attempt.outcome !== null) return this.decodeAttempt(attempt);
-      this.changed(this.db.prepare(`UPDATE attempts SET outcome = 'interrupted', phase = 'settled', execution_open = 0,
-        settled_at = ?, revision = revision + 1 WHERE id = ? AND outcome IS NULL`).run(new Date().toISOString(), attemptId));
-      this.db.prepare(`UPDATE tasks SET state = 'queued', hold_reason = 'worker_interrupted'
-        WHERE id = ? AND decision_revision = ?`).run(String(attempt.task_id), Number(attempt.started_decision_revision));
-      this.launchEvent(attemptId, String(attempt.task_id), host, 'attempt.interrupted', {});
+      const budgetStop = !!this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.budget-stop-requested'").get(attemptId);
+      const outcome = budgetStop ? 'over_budget' : 'interrupted';
+      this.changed(this.db.prepare(`UPDATE attempts SET outcome = ?, phase = 'settled', execution_open = 0,
+        settled_at = ?, revision = revision + 1 WHERE id = ? AND outcome IS NULL`).run(outcome, new Date().toISOString(), attemptId));
+      this.db.prepare(`UPDATE tasks SET state = 'queued', hold_reason = ?
+        WHERE id = ? AND decision_revision = ?`).run(budgetStop ? 'over_budget' : 'worker_interrupted', String(attempt.task_id), Number(attempt.started_decision_revision));
+      this.launchEvent(attemptId, String(attempt.task_id), host, `attempt.${outcome}`, {});
       return this.decodeAttempt(this.attemptRow(attemptId));
     });
   }

@@ -112,6 +112,28 @@ test('R18/R21/A43: question status follows current task membership without chang
   assert.deepEqual(f.db.questions()[0]!.recipient, question.recipient);
 });
 
+test('R20/R28: only a trusted host binding records session usage, including after objective closure', async t => {
+  const f = await fixture(t);
+  const host = { kind: 'host' as const, id: 'backend' };
+  await f.db.registerSession({ sessionId: 'registered', kind: 'supervisor', objectiveId: 'goal', attemptId: null,
+    registeredAt: new Date().toISOString(), capabilities: ['cost', 'tokens'] }, host);
+  await f.db.closeOrReopenObjective('goal', 'abandon', 'Done', person);
+  const binding = createBinding(host, { config: f.file }, { home: f.home });
+  const args = { report: { sessionId: 'registered', sourceSequence: 1, observedAt: new Date().toISOString(),
+    cost: { availability: 'reported', value: 0, currency: 'USD' }, tokens: { availability: 'reported', input: 0, output: 0, total: 0 },
+    workerTimeMs: { availability: 'unsupported', value: null } } };
+  assert.deepEqual(await binding.execute('host.usage', args, 'host-usage'), { recorded: true });
+  assert.deepEqual(await binding.execute('host.usage', args, 'host-usage'), { recorded: true });
+  assert.equal(f.db.objectiveUsage('goal').totals.tokens, 0);
+  assert.equal(f.db.events().filter(e => e.kind === 'usage.observed').length, 1);
+  for (const caller of [person, supervisor]) {
+    const restricted = createBinding(caller, { config: f.file }, { home: f.home });
+    await assert.rejects(restricted.execute('host.usage', args), code('person_required'));
+  }
+  await assert.rejects(binding.execute('host.usage', { report: { ...args.report,
+    cost: { availability: 'unknown', value: 0, currency: null } } }), code('invalid_input'));
+});
+
 test('R18/A36: every admitted operation checks its permission and current membership, including plans', async t => {
   const f = await fixture(t);
   await f.db.addTask({ id: 'inside', title: 'Inside', objectiveId: 'goal' }, person);

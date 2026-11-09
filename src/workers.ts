@@ -89,7 +89,7 @@ export async function prepareWorker(db: Database, attemptId: string, host: Worke
     throw new StorageError('conflict', 'Launcher does not support protected preparation and admission');
   }
   const claimId = await db.registerWorkerOwner(attemptId, host);
-  const intent = await db.beginWorkerPreparation(attemptId, claimId, host);
+  const intent = await db.beginWorkerPreparation(attemptId, claimId, host, capabilities.usageMetrics);
   if (!intent.claimed) return intent.effect;
   const executor = { claimId, generation: host.generation };
   let prepared: Result<WorkerReference> | undefined;
@@ -101,7 +101,10 @@ export async function prepareWorker(db: Database, attemptId: string, host: Worke
       await db.bindWorkerReference(attemptId, claimId, result.value, host);
       return db.request(effect.id);
     }
-    return await db.recordEffectOutcome(effect.id, executor, result.status === 'rejected' ? 'rejected' : 'uncertain', evidence(result));
+    const recorded = await db.recordEffectOutcome(effect.id, executor, result.status === 'rejected' ? 'rejected' : 'uncertain', evidence(result));
+    if (result.status === 'rejected' && result.evidence !== null && typeof result.evidence === 'object'
+      && (result.evidence as JsonObject).neverStarted === true) await db.recordUnstartedSession(attemptId, host);
+    return recorded;
   } catch (error) {
     // Even a failure before the call is conservatively uncertain once intent was committed.
     if (db.request(intent.effect.id).state === 'claimed') {

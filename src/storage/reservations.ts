@@ -29,6 +29,7 @@ export interface ReservationInput {
   startingCommit: string;
   checks: TrustedChecks;
   delivery: { kind: 'code' | 'report'; acceptance: 'review_or_integration'; requiredEvidence: string[]; requiredDeliverables: string[] };
+  usageMetrics?: string[];
   expectedDefinitionRevision?: number;
   expectedDecisionRevision?: number;
   expectedConfigRevision?: number;
@@ -89,7 +90,8 @@ export function commit(value: unknown): void {
 }
 export function reservationInput(value: ReservationInput): void {
   fields(value, ['requestKey', 'caller', 'taskId', 'profile', 'note', 'sourceAttemptId', 'sourceCommit', 'handover', 'startingCommit', 'checks', 'delivery',
-    'expectedDefinitionRevision', 'expectedDecisionRevision', 'expectedConfigRevision', 'expectedConfigDigest']);
+    'expectedDefinitionRevision', 'expectedDecisionRevision', 'expectedConfigRevision', 'expectedConfigDigest', 'usageMetrics']);
+  if (value.usageMetrics !== undefined && (!Array.isArray(value.usageMetrics) || value.usageMetrics.some(m => typeof m !== 'string'))) throw new TypeError('Invalid usage capabilities');
   text(value.requestKey);
   for (const name of ['taskId', 'profile', 'note', 'sourceAttemptId', 'expectedConfigDigest'] as const) {
     if (value[name] !== undefined) text(value[name]);

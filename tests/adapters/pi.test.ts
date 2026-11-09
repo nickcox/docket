@@ -290,20 +290,20 @@ test('R20/R31: usage is session cumulative and remains available after exit', as
   const first = await f.launcher.usage(f.reference), second = await f.launcher.usage(f.reference);
   assert.equal(first.status, 'reported'); assert.equal(second.status, 'reported');
   if (first.status === 'reported' && second.status === 'reported') {
-    assert.deepEqual(second.metrics, { tokens: 123, cost: 0.004 }); assert.ok(second.sequence > first.sequence);
+    assert.deepEqual(second.metrics, { tokens: 123, input: 100, output: 23, cost: 0.004 }); assert.ok(second.sequence > first.sequence);
     assert.equal(second.sourceId, f.reference.ownerId);
   }
   await f.launcher.stop(f.reference, 'stop');
   assert.deepEqual(await f.launcher.usage(f.reference), second);
 });
-test('R20: zero usage is reported, while regressing cumulative usage is unknown', async t => {
+test('R20: zero and lower cumulative usage are reported for the accounting high-water fold', async t => {
   const zero = await fixture(t, 'zero-usage');
   const report = await zero.launcher.usage(zero.reference);
   assert.equal(report.status, 'reported');
-  if (report.status === 'reported') assert.deepEqual(report.metrics, { tokens: 0, cost: 0 });
+  if (report.status === 'reported') assert.deepEqual(report.metrics, { tokens: 0, input: 0, output: 0, cost: 0 });
   const regressing = await fixture(t, 'regressing-usage');
   assert.equal((await regressing.launcher.usage(regressing.reference)).status, 'reported');
-  assert.equal((await regressing.launcher.usage(regressing.reference)).status, 'unknown');
+  assert.equal((await regressing.launcher.usage(regressing.reference)).status, 'reported');
 });
 for (const mode of ['missing-usage', 'unsupported-usage']) test(`R20: ${mode} is never reported as zero`, async t => {
   const f = await fixture(t, mode);

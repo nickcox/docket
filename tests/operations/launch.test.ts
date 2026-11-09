@@ -66,6 +66,48 @@ async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
   return { db, root, path, options, allocated, started, prepared };
 }
 
+for (const proven of [true, false]) test(`R20/A40: failed preparation records zero only with never-started proof (${proven})`, async t => {
+  const { db, started } = await fixture(t);
+  await db.addObjective({ id: 'goal', request: 'Work', criteria: [], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  const value = await started();
+  await db.moveTask('task', db.task('task').definitionRevision, 'goal', person);
+  const launcher = new FakeLauncher();
+  launcher.beforePrepare = async () => proven ? rejected('No worker started', { neverStarted: true, currency: 'USD' }) : uncertain('Lost preparation');
+  await prepareWorker(db, value.attemptId, host, launcher);
+  const usage = db.objectiveUsage('goal');
+  if (proven) {
+    assert.deepEqual(usage.totals, { cost: 0, tokens: 0, workerTimeMs: 0 });
+    assert.deepEqual(usage.gaps, []);
+  } else {
+    assert.equal(usage.totals.cost, null);
+    assert.equal(usage.totals.tokens, null);
+    assert.ok(usage.gaps.length);
+  }
+});
+
+test('R20/A39: preparation registers its session before the launcher call and fixes current objective membership', async t => {
+  const { db, started } = await fixture(t);
+  await db.addObjective({ id: 'goal', request: 'Work', criteria: [], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  const value = await started();
+  await db.moveTask('task', db.task('task').definitionRevision, 'goal', person);
+  const launcher = new FakeLauncher();
+  const original = launcher.prepare.bind(launcher);
+  launcher.prepare = async (binding, effectId) => {
+    const session = db.events().find(e => e.kind === 'session.registered' && e.payload.sessionId === binding.sessionId)!;
+    assert.equal(session.payload.objectiveId, 'goal');
+    assert.equal(session.payload.kind, 'worker');
+    return original(binding, effectId);
+  };
+  const prepared = await prepareWorker(db, value.attemptId, host, launcher);
+  await db.moveTask('task', db.task('task').definitionRevision, null, person);
+  await db.closeOrReopenObjective('goal', 'abandon', 'Finished', person);
+  await db.recordUsage({ sessionId: String(prepared.input.sessionId), sourceSequence: 1, observedAt: new Date().toISOString(),
+    cost: { availability: 'reported', value: 0, currency: 'USD' }, tokens: { availability: 'reported', input: 1, output: 2, total: 3 },
+    workerTimeMs: { availability: 'reported', value: 1 } }, host);
+  assert.equal(db.objectiveUsage('goal').totals.tokens, 3);
+  assert.equal(db.events().filter(e => e.kind === 'session.registered').length, 1);
+});
+
 test('R06/R07/R08/R09: another connection records stop; only the owner fences, replay is inert and terminal evidence settles', async t => {
   const { db, path, options, prepared } = await fixture(t);
   const value = await prepared();

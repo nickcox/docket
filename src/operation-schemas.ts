@@ -18,6 +18,14 @@ const permissions = { ...object(Object.fromEntries(permissionNames.map(name => [
 const budget = object({ maxCost: nullable({ type: 'number', minimum: 0 }), currency: nullable(string),
   maxTokens: nullable({ type: 'integer', minimum: 0 }), maxWorkerTimeMs: nullable({ type: 'integer', minimum: 0 }) });
 const deadline = nullable({ type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$' });
+const availability = { enum: ['reported', 'unknown', 'unsupported'] };
+const usageNumber = nullable({ type: 'number', minimum: 0 });
+const usageInteger = nullable({ type: 'integer', minimum: 0 });
+const usageReport = object({ sessionId: string, sourceSequence: { type: 'integer', minimum: 0 }, observedAt: string,
+  cost: object({ availability, value: usageNumber, currency: nullable(string) }),
+  tokens: object({ availability, input: usageInteger, output: usageInteger, total: usageInteger }),
+  workerTimeMs: object({ availability, value: usageInteger }) });
+const usageGap = object({ sessionId: string, metrics: { type: 'array', minItems: 1, uniqueItems: true, items: { enum: ['cost', 'tokens', 'workerTimeMs'] } } });
 const objectiveFields = { criteria, scope: { type: 'string' }, constraints: { type: 'string' }, permissions, budget, deadline };
 const attempt = { attemptId: uuid };
 const planAttempt = { ...attempt, dryRun: bool };
@@ -49,6 +57,7 @@ function outputSchema(name: string): JsonSchema {
       input: view, result: nullable(view), effects: { type: 'array', maxItems: 20, items: object(identity) },
       effectsTotal: { type: 'integer', minimum: 0 } });
   }
+  if (name === 'host.usage') return object({ recorded: bool });
   if (name.startsWith('objective.')) return object({ objective: view });
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
@@ -103,6 +112,9 @@ export const coreOperations: OperationDefinition[] = [
   ...['done', 'reopen'].map(action => operation(`task.${action}`, `Record a ${action} judgement without inventing acceptance evidence.`, { taskId: id, note: nullable(string) })),
   operation('objective.add', 'Create an open objective; null permissions and budget select all permissions and unlimited usage.',
     { id, request: string, ...objectiveFields, permissions: nullable(permissions), budget: nullable(budget) }, true, ['person']),
+  operation('host.usage', 'Record cumulative usage for a registered session.', { report: usageReport }, true, ['host']),
+  operation('objective.confirm-usage', 'Confirm exact finished session usage gaps without inventing zero values.',
+    { objectiveId: id, sessionGaps: { type: 'array', minItems: 1, items: usageGap }, reason: string }, true, ['person']),
   operation('objective.show', 'Read an objective and its current closure.', { objectiveId: id }, false),
   operation('objective.update', 'Replace objective fields at the expected revision; protected fields require the creator.',
     { objectiveId: id, expectedRevision: { type: 'integer', minimum: 0 }, ...objectiveFields }, true, ['person']),

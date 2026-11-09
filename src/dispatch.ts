@@ -64,6 +64,8 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   const profile = preview.attempt.specification.profile as JsonObject;
   const capabilities = runtime.launcher.capabilities(profile);
   if (capabilities.preparation === 'unsupported' || !capabilities.admission) throw new CommandFailure('policy_refused');
+  db.checkBudget(task.objectiveId, capabilities.usageMetrics);
+  input.usageMetrics = [...capabilities.usageMetrics];
   // Recorded acquisition uncertainty is checked by the same reservation builder.
   // Treehouse status initialises owner metadata on an empty pool, so it is not a
   // read-only prerequisite. Acquisition itself verifies the live pool identity.
@@ -93,7 +95,35 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     schemaFamily: applicationId, schemaVersion, configRevision: config.revision, heartbeatAt: new Date().toISOString() }], caller);
   const executor = { claimId: claim!.id, generation };
   let reference: WorkerReference | undefined;
-  let terminal = false, sequence = 0, stopRequested = false;
+  let terminal = false, sequence = 0, stopRequested = false, usageSequence = 0;
+  let stoppedAt: number | null = null;
+  let lastUsage: Pick<import('./usage.ts').UsageReport, 'cost' | 'tokens'> = {
+    cost: { availability: 'unknown', value: null, currency: null },
+    tokens: { availability: 'unknown', input: null, output: null, total: null },
+  };
+  const observeUsage = async () => {
+    if (!reference) return;
+    const session = db.events().find(e => e.kind === 'session.registered' && e.attemptId === id);
+    if (!session) return;
+    // Usage reads are best effort. Clock and deadline enforcement never depends on them.
+    let usage: Awaited<ReturnType<typeof runtime.launcher.usage>>;
+    try { usage = await runtime.launcher.usage(reference); } catch { usage = { status: 'unknown', reason: 'Usage read failed' }; }
+    const values = usage.status === 'reported' ? usage.metrics : {};
+    const cost = values.cost !== undefined && usage.status === 'reported' && usage.currency
+      ? { availability: 'reported' as const, value: values.cost, currency: usage.currency }
+      : { availability: usage.status === 'unsupported' || !capabilities.usageMetrics.includes('cost') ? 'unsupported' as const : 'unknown' as const, value: null, currency: null };
+    const tokens = values.tokens !== undefined && values.input !== undefined && values.output !== undefined
+      ? { availability: 'reported' as const, input: values.input, output: values.output, total: values.tokens }
+      : { availability: usage.status === 'unsupported' || !capabilities.usageMetrics.includes('tokens') ? 'unsupported' as const : 'unknown' as const, input: null, output: null, total: null };
+    lastUsage = { cost, tokens };
+    await db.recordUsage({ sessionId: String(session.payload.sessionId), sourceSequence: ++usageSequence,
+      observedAt: new Date().toISOString(), cost, tokens,
+      workerTimeMs: { availability: 'reported', value: Math.max(0, (stoppedAt ?? Date.now()) - Date.parse(String(session.payload.registeredAt))) } }, host);
+  };
+  let usageRead: Promise<void> | undefined;
+  const pollUsage = () => {
+    if (!usageRead) usageRead = observeUsage().catch(error => progress(`usage: ${String(error)}`)).finally(() => { usageRead = undefined; });
+  };
   const interrupt = () => { stopRequested = true; };
   process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
   const refresh = async () => {
@@ -110,6 +140,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
           delay(5000, undefined, { signal: timer.signal }).then(() => ({ kind: 'pulse' as const }))]);
         if (result.kind === 'result') return result.value;
         await refresh();
+        if (reference && !terminal && db.runningBudgetReason(id)) { await db.requestBudgetStop(id, host); await fence(); throw new CommandFailure('policy_refused', { budgetReason: db.runningBudgetReason(id) }); }
       } finally { timer.abort(); }
     }
   };
@@ -126,6 +157,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     known(result);
   };
   const recheck = async () => {
+    db.checkBudget(db.task(task.id).objectiveId, capabilities.usageMetrics);
     db.checkAuthority(caller, args.sourceAttemptId ? 'attempt.continue' : 'attempt.dispatch', { taskId: task.id, sourceCommit: args.sourceCommit ?? null });
     if (args.sourceAttemptId) await continuationEvidence(db, args.sourceAttemptId, task.id, runtime, args.sourceCommit ?? null, id, starting.commit);
   };
@@ -191,20 +223,25 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     if (activation?.state !== 'succeeded' && !db.workerStopRequested(id)) throw new CommandFailure('effect_uncertain', { attemptId: id });
     progress('worker.wait');
     const deadline = Date.now() + Number(profile.runMs);
-    let refreshed = Date.now();
+    let refreshed = Date.now(), usagePolled = 0;
     let turnFailure: TurnFailure | undefined;
     while (true) {
       await consumeQuestionFiles(db, id);
       await deliverAnswers(db, id, reference, host, runtime.launcher);
+      if (Date.now() - usagePolled >= 1000) { pollUsage(); usagePolled = Date.now(); }
+      if (db.runningBudgetReason(id)) { await db.requestBudgetStop(id, host); stopRequested = true; break; }
       await controlWorker(db, id, reference, host, runtime.launcher);
       const observation = await runtime.launcher.inspect(reference);
       if (observation.status !== 'known') throw new CommandFailure('owner_unknown', { attemptId: id });
       turnFailure = observation.turnFailure;
-      if (observation.terminal) { terminal = true; break; }
+      if (observation.terminal) { terminal = true; stoppedAt = Date.now(); break; }
       if (observation.turn === 'ended' || Date.now() >= deadline || stopRequested) break;
       if (Date.now() - refreshed >= 5000) { await refresh(); refreshed = Date.now(); }
       await delay(50);
     }
+    // Read once at turn end before fencing, while Pi can still supply terminal usage.
+    pollUsage();
+    if (usageRead && !stopRequested) await withHeartbeat(usageRead);
     progress('worker.fence');
     if (!terminal) { await refresh(); await fence(); }
     const observed = await runtime.launcher.inspect(reference);
@@ -212,6 +249,12 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     terminal = true;
     await consumeQuestionFiles(db, id);
     await deliverAnswers(db, id, reference, host, runtime.launcher);
+    stoppedAt ??= Date.now();
+    // Record elapsed worker time even if the provider usage call is still unavailable.
+    const session = db.events().find(e => e.kind === 'session.registered' && e.attemptId === id)!;
+    await db.recordUsage({ sessionId: String(session.payload.sessionId), sourceSequence: ++usageSequence, observedAt: new Date().toISOString(),
+      ...lastUsage,
+      workerTimeMs: { availability: 'reported', value: Math.max(0, stoppedAt - Date.parse(String(session.payload.registeredAt))) } }, host);
     await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: ++sequence, attemptId: id, workerRef: reference,
       observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
       payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
@@ -274,11 +317,13 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
                 observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
                 payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
               terminal = true;
+              stoppedAt ??= Date.now();
             } catch { /* Leave the claim unreleased; a person can resolve it from the recorded stop. */ }
           }
         }
       }
     }
+    if (usageRead) await usageRead;
     await db.releaseClaim(executor, { stopped: true, attemptId: id }, caller);
     if (terminal) {
       const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);
