@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
@@ -21,12 +22,12 @@ const code = (expected: string) => (error: unknown) => error instanceof CommandF
 
 async function fixture(t: test.TestContext) {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-supervisor-')));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  defer(t, () => rm(home, { recursive: true, force: true }));
   const file = join(home, 'docket.json');
   await writeFile(file, JSON.stringify(configuration(home)));
   await initialiseContext({ config: file }, { home, recyclableRoots: [], caller: person });
   const context = await openContext({ config: file }, { home, readOnly: false });
-  t.after(() => context.database.close());
+  defer(t, () => context.database.close());
   const db = context.database;
   await db.addObjective({ ...definition, id: 'goal', request: 'Build', permissions: null, budget: null }, person);
   await db.addObjective({ ...definition, id: 'other', request: 'Other', permissions: null, budget: null }, person);
