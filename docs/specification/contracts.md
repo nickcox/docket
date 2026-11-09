@@ -177,14 +177,16 @@ worker_failed provider_limited
 effect_uncertain claim_unresolved launch_fenced
 result_invalid result_identity_mismatch result_discrepancy
 candidate_missing candidate_moved not_retained workspace_dirty
-check_missing check_failed check_definition_changed review_missing review_failed
+check_missing checks_waiting check_failed check_definition_changed review_missing review_failed
 not_fast_forward rebase_conflict policy_refused protected_target
 question_answered recipient_mismatch objective_closed completion_invalid
 budget_reached usage_unknown metric_unsupported deadline_reached
 process_confirmation_required discard_confirmation_required
 ~~~
 
-expected refusal data names the blocking identity/evidence and next action. Unknown reads before effects can be retried; after intent they produce effect_uncertain, not a generic retry suggestion. Internal failure must expose any known committed request/attempt, never assert that nothing changed.
+Acceptance blocked by pending or claimed checks refuses with checks_waiting, naming the check request, its state and the current check-slot holders, with retrying acceptance as the next action. check_failed means a recorded check result failed; missing evidence uses check_missing and uncertain checks use effect_uncertain.
+
+Expected refusal data names the blocking identity/evidence and next action. Unknown reads before effects can be retried; after intent they produce effect_uncertain, not a generic retry suggestion. Internal failure must expose any known committed request/attempt, never assert that nothing changed.
 
 ## Configuration
 

@@ -63,7 +63,6 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
   if (/revision changed/iu.test(message)) throw new CommandFailure('task_changed', data);
   if (/eligible|ready/iu.test(message)) throw new CommandFailure('not_ready', data);
   if (/uncommitted|untracked|clean/iu.test(message)) throw new CommandFailure('workspace_dirty', data);
-  if (/passing checks/iu.test(message)) throw new CommandFailure('check_failed', data);
   if (/unresolved|Interrupted effect/iu.test(message)) throw new CommandFailure('effect_uncertain', data);
   if (/retained|output changed/iu.test(message)) throw new CommandFailure('not_retained', data);
   if (/candidate/iu.test(message)) throw new CommandFailure('candidate_missing', data);

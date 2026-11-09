@@ -7,7 +7,8 @@ import { rebaseAttempt, planAttemptRebase } from '../../src/rebase.ts';
 import { originalCandidateRef } from '../../src/storage/rebase.ts';
 import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
-import { parseCheckPolicy } from '../../src/check-policy.ts';
+import { mandatoryChecks, parseCheckPolicy } from '../../src/check-policy.ts';
+import type { TrustedChecks } from '../../src/storage/reservations.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
 import { Database } from '../../src/storage/database.ts';
 import { CommandFailure } from '../../src/response.ts';
@@ -203,7 +204,8 @@ test('R10: acceptance runs fast/full checks once, records the exact candidate an
 test('R10: failed and missing checks require a nonblank person reason scoped to the exact candidate', async t => {
   const f = await fixture(t);
   f.services.run = async () => ({ status: 'failed', exitCode: 1, timedOut: false, stdout: '', stderr: 'failure', truncated: false });
-  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /passing checks/);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'check_failed' });
+  await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), { code: 'check_failed' });
   await assert.rejects(acceptCandidate(f.db, { ...f.accept, overrideReason: '  ' }, f.services), /nonblank/);
   await assert.rejects(acceptCandidate(f.db, { ...f.accept, requestKey: 'override-wrong', commit: start, overrideReason: 'Known failure' }, f.services), /candidate/);
   await acceptCandidate(f.db, { ...f.accept, requestKey: 'override', overrideReason: 'Known unrelated failure' }, f.services);
@@ -216,12 +218,66 @@ test('R10: failed and missing checks require a nonblank person reason scoped to 
 test('R10: acceptance reuses an explicit successful retry after the automatic check request failed', async t => {
   const f = await fixture(t), run = f.services.run;
   f.services.run = async () => ({ status: 'failed', exitCode: 1, timedOut: false, stdout: '', stderr: '', truncated: false });
-  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /passing checks/);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'check_failed' });
   f.services.run = run;
   await runCandidateChecks(f.db, f.a.id, person, f.services, 'explicit-check-retry');
   await acceptCandidate(f.db, f.accept, f.services);
   assert.deepEqual(f.calls, ['fast', 'full']);
   assert.equal(f.db.task('task').state, 'done');
+});
+
+test('R16/R27: acceptance names waiting checks and their slot holder, then retries the pending run and accepts', async t => {
+  const f = await fixture(t), other = await f.attempt('slot-holder', ['Other criterion']);
+  const checks = mandatoryChecks(f.db.attempt(other.id).specification.checks as TrustedChecks,
+    parseCheckPolicy(start, policyContent, contextChecks));
+  const holder = await f.db.beginChecks({ attemptId: other.id, commit: head, checks, profile, caller: person });
+  const assertWaiting = (error: unknown) => {
+    assert.ok(error instanceof CommandFailure);
+    assert.equal(error.code, 'checks_waiting');
+    const waiting = f.db.requests().find(r => r.attemptId === f.a.id && r.operation === 'checks.run')!;
+    assert.deepEqual(error.data.checkRequest, { id: waiting.id, requestId: waiting.requestKey,
+      state: 'pending', status: null, evidenceKey: waiting.input.evidenceKey });
+    assert.deepEqual(error.data.slotHolders, [{ claimId: holder.executor!.claimId, attemptId: other.id,
+      ownerRef: person, checkRequestId: holder.request.id, requestId: holder.request.requestKey, state: 'claimed' }]);
+    assert.equal(error.nextAction?.operation, 'attempt.accept');
+    assert.deepEqual(error.nextAction?.args, { attemptId: f.a.id, candidateCommit: head, overrideReason: null, dryRun: false });
+    return true;
+  };
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), assertWaiting);
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), assertWaiting);
+  assert.equal(f.db.attempt(f.a.id).phase, 'awaiting_checks');
+  assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+  assert.deepEqual(f.calls, []);
+  assert.ok((await planCandidateAcceptance(f.db, f.accept, f.services)).steps.some(s => s.operation === 'checks.run'));
+  const waiting = f.db.requests().find(r => r.attemptId === f.a.id && r.operation === 'checks.run')!;
+  await f.db.finishChecks(holder.request.id, holder.executor!, { status: 'failed',
+    evidenceKey: String(holder.request.input.evidenceKey), commands: [] });
+  await acceptCandidate(f.db, f.accept, f.services);
+  assert.equal(f.db.request(waiting.id).state, 'succeeded');
+  assert.deepEqual(f.calls, ['fast', 'full']);
+  assert.equal(f.db.task('task').state, 'done');
+});
+
+test('R16/R27: claimed and uncertain checks report their actual state in acceptance and planning', async t => {
+  for (const state of ['claimed', 'uncertain'] as const) {
+    const f = await fixture(t);
+    const admission = await f.db.beginChecks({ attemptId: f.a.id, commit: head,
+      checks: mandatoryChecks(f.db.attempt(f.a.id).specification.checks as TrustedChecks,
+        parseCheckPolicy(start, policyContent, contextChecks)), profile, caller: person });
+    if (state === 'uncertain') await f.db.finishChecks(admission.request.id, admission.executor!, {
+      status: 'uncertain', evidenceKey: String(admission.request.input.evidenceKey), commands: [] });
+    const inspect = (error: unknown) => {
+      assert.ok(error instanceof CommandFailure);
+      assert.equal(error.code, state === 'claimed' ? 'checks_waiting' : 'effect_uncertain');
+      assert.equal((error.data.checkRequest as any).state, state);
+      assert.equal((error.data.checkRequest as any).requestId, admission.request.requestKey);
+      return true;
+    };
+    await assert.rejects(acceptCandidate(f.db, f.accept, f.services), inspect);
+    await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), inspect);
+    assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+    assert.deepEqual(f.calls, []);
+  }
 });
 
 test('R10: a person can override checks waiting for a slot without leaving an authorised check behind', async t => {

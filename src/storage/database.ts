@@ -16,6 +16,7 @@ import type { ResultBinding, ValidatedResult, WorkerObservation } from './result
 import type { GitRepository } from '../adapters/repository.ts';
 import { checkEvidenceKey } from '../check-policy.ts';
 import type { CheckAdmission, CheckRunInput, CheckRunResult } from './checks.ts';
+import { acceptanceCheckFailure } from './checks.ts';
 import type { AcceptInput, ReturnInput, FinalisationPlan } from './completion.ts';
 import type { ContextChecks } from '../check-policy.ts';
 import type { AddTaskInput, Task, TaskActor, TaskDefinition, TaskKind, TaskState } from './tasks.ts';
@@ -1502,7 +1503,9 @@ export class Database {
       const check = checks === null ? null : this.decodeRequest(this.requestRow(checks.id));
       if (!value.overrideReason && (!check || check.operation !== 'checks.run' || check.attemptId !== value.attemptId
         || check.input.commit !== value.commit || check.state !== 'succeeded' || check.result?.status !== 'passed')) {
-        throw new StorageError('conflict', 'Acceptance requires passing checks or a person override reason');
+        const claims = this.db.prepare('SELECT * FROM claims WHERE released_at IS NULL').all().map(row => this.decodeClaim(row));
+        const requests = this.db.prepare("SELECT * FROM requests WHERE operation = 'checks.run'").all().map(row => this.decodeRequest(row));
+        throw acceptanceCheckFailure(value.attemptId, value.commit, check, claims, requests);
       }
       if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) {

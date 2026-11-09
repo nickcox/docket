@@ -34,6 +34,7 @@ const failures = {
   context_mismatch: { exit: 1, message: "Context identity or storage does not match.", retryable: false },
   config_changed: { exit: 1, message: "Configuration differs from the recorded digest or revision. Restore the file or explicitly configure the context.", retryable: false },
   storage_busy: { exit: 1, message: "Context storage is busy.", retryable: true },
+  checks_waiting: { exit: 1, message: "Checks are waiting for a slot or an active run to finish.", retryable: true },
   not_initialised: { exit: 1, message: "The context is not initialised.", retryable: false },
   invalid_input: { exit: 2, message: "Invalid arguments or input at $. Use catalog show --json to inspect the supported operations.", retryable: false },
   unknown_operation: { exit: 2, message: "Unknown operation. Use catalog show --json to inspect the supported operations.", retryable: false },

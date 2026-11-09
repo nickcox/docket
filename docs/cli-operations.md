@@ -61,6 +61,8 @@ Plan dispatch with `{"taskId":"notes","profile":null,"dryRun":true}`. Change onl
 
 ## Acceptance and return
 
+If acceptance needs checks but their slot is occupied, it refuses with `checks_waiting`, not `check_failed`. Data includes `checkRequest` (its internal `id`, public `requestId`, state and evidence key) and `slotHolders` (claim, attempt, check request and owner identities). A claimed run also reports `checks_waiting` with its actual state. Follow `nextAction` to retry acceptance after the slot is free; the pending checks then run and acceptance continues if they pass. `check_failed` means a recorded result failed; missing checks report `check_missing` and uncertain checks report `effect_uncertain` with the request to inspect.
+
 Plan acceptance with `{"attemptId":"<UUID>","candidateCommit":null,"overrideReason":null,"dryRun":true}`. The ordered steps include missing checks and conditional acceptance. Execution rechecks the evidence and policy before effects. `local-merge` fast-forwards the configured target; manual acceptance retains the branch without claiming integration. An explicit candidate commit is checked and planned before selection. A person's nonblank override reason can waive checks, but never identity, retention or terminal evidence.
 
 After acceptance (manual or `local-merge`), discard, or a dispatch with a held or failed outcome, Docket checks whether no work could be lost and returns the lease automatically when safe. The response's `leaseReturn` gives `state:"returned"` or `state:"kept"` and a reason. Automatic returns use the recorded return effect and conditional output-ref clean-up; manually accepted branches remain retained.

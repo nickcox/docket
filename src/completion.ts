@@ -10,6 +10,7 @@ import type { JsonObject, StoredEvent } from './storage/database.ts';
 import type { AcceptInput, ReturnInput, FinalisationPlan } from './storage/completion.ts';
 import type { Allocation } from './storage/reservations.ts';
 import type { StoredRequest } from './storage/requests.ts';
+import { acceptanceCheckFailure } from './storage/checks.ts';
 import { readWorkerResult } from './storage/results.ts';
 import { taskActor } from './storage/tasks.ts';
 import type { GitRepository, RetentionRequest } from './adapters/repository.ts';
@@ -168,6 +169,7 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
   const policy = await planAcceptance(db, input, services);
   const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['claimed', 'uncertain'].includes(r.state));
   // Interrupted integration is reconciled by the executor, not reissued by a plan.
+  if (unresolved?.operation === 'checks.run') throw acceptanceCheckFailure(attempt.id, input.commit, unresolved, db.claims(), db.requests());
   if (unresolved && !unresolved.operation.startsWith('completion.')) refuse('Attempt has an unresolved effect');
   const steps = selecting ? [step('candidate.select', attempt.id, ['terminal', 'exact_retained_commit'])] : [];
   if (!accepted) {
@@ -179,7 +181,7 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
         attempt.specification.criteria as string[], checks, services.profile);
       const result = db.requests().findLast(r => r.operation === 'checks.run' && r.attemptId === attempt.id && r.input.evidenceKey === key);
       if (result && result.state === 'succeeded' && result.result?.status === 'passed') { /* Reuse exact evidence. */ }
-      else if (result && result.state !== 'pending') refuse('Acceptance requires passing checks or a person override reason');
+      else if (result && result.state !== 'pending') throw acceptanceCheckFailure(attempt.id, input.commit, result, db.claims(), db.requests());
       else {
         const workspace = known(await services.repository.inspectWorkspace(attempt.allocation!.path));
         if (!workspace.clean || workspace.head !== input.commit) refuse('Workspace has uncommitted or untracked work or candidate moved');
