@@ -162,7 +162,7 @@ export async function readWorkerResult(binding: ResultBinding): Promise<Validate
       validatedAt: new Date().toISOString(), artefacts };
   } catch (error) {
     if (error instanceof StorageError) throw error;
-    invalid(`Cannot read retained result: ${error instanceof Error ? error.message : String(error)}`);
+    invalid('Cannot read retained result');
   }
 }
 

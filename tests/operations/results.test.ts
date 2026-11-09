@@ -145,8 +145,52 @@ test('R07/A17: file existence, idle and turn-end alone do not validate or comple
   assert.equal(f.db.attempt(f.attemptId).outcome, null);
   assert.equal(f.db.attempt(f.attemptId).executionOpen, true);
   await assert.rejects(f.observe('result_available'), refuses('result_invalid', /Cannot read/));
+  assert.equal(f.db.attempt(f.attemptId).outcome, 'held');
+  assert.equal(f.db.attempt(f.attemptId).executionOpen, false);
   await f.save();
-  assert.equal((await f.observe('result_available')).outcome, 'completed');
+  await assert.rejects(f.observe('result_available'), refuses('result_invalid', /Cannot read/));
+  assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
+});
+
+test('R10/R11/A19: invalid artefact directories settle atomically after terminal evidence in either order', async t => {
+  for (const terminalFirst of [true, false]) {
+    const f = await fixture(t);
+    await mkdir(join(dirname(f.binding.resultPath), 'artefacts'));
+    const result = clone(f.result);
+    (result.workReferences as JsonObject[]).push({ kind: 'artefact', name: 'report', path: 'artefacts', description: 'Not a file' });
+    await f.save(result);
+    if (terminalFirst) await f.observe('terminal');
+    await assert.rejects(f.observe('result_available'), refuses('result_invalid', /regular file/));
+    if (!terminalFirst) {
+      assert.equal(f.db.attempt(f.attemptId).executionOpen, true);
+      await assert.rejects(f.observe('terminal'), refuses('result_invalid', /regular file/));
+    }
+    const attempt = f.db.attempt(f.attemptId);
+    assert.equal(attempt.outcome, 'held');
+    assert.equal(attempt.phase, 'settled');
+    assert.equal(attempt.executionOpen, false);
+    assert.equal(attempt.candidate, null);
+    assert.equal(attempt.leaseState, 'held');
+    assert.equal(f.db.task('task').holdReason, 'worker_held');
+    const invalid = f.db.events().find(e => e.kind === 'attempt.result_invalid')!;
+    const completed = f.db.events().find(e => e.kind === 'attempt.completed')!;
+    assert.equal(completed.seq, invalid.seq + 1);
+    assert.equal(completed.payload.message, 'Result must be a regular file without links');
+    await assert.rejects(f.observe('result_available'), refuses('result_invalid'));
+    assert.equal(f.db.events().filter(e => e.kind === 'attempt.completed').length, 1);
+  }
+});
+
+test('R03/A19: invalid-result settlement preserves a newer person decision and bounds diagnostics', async t => {
+  const f = await fixture(t);
+  await f.db.holdTask('task', 'Person decision', person);
+  await f.save({ ...f.result, criteriaReport: [] });
+  await f.observe('terminal');
+  await assert.rejects(f.observe('result_available'), refuses('result_invalid', /every criterion/));
+  assert.equal(f.db.attempt(f.attemptId).outcome, 'held');
+  assert.equal(f.db.task('task').holdReason, 'Person decision');
+  assert.ok(f.db.invalidWorkerResult(f.attemptId)!.message.length <= 1024);
+  assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
 });
 
 test('R11/A17: oversized, linked, non-regular and malformed result files are refused without validation evidence', async t => {

@@ -18,7 +18,8 @@ export async function observeWorker(db: Database, observation: WorkerObservation
   await db.recordWorkerObservation(observation, host);
   if (observation.kind === 'result_available') await db.validateWorkerResult(observation.attemptId, host, repository);
   // Turn-end and idle are not completion evidence. They may reconcile facts already recorded.
-  if (db.validatedWorkerResult(observation.attemptId)) {
+  if (db.validatedWorkerResult(observation.attemptId) || observation.kind === 'terminal'
+    && db.events().some(event => event.attemptId === observation.attemptId && event.kind === 'worker.observed' && event.payload.kind === 'result_available')) {
     const attempt = await db.completeWorker(observation.attemptId, host, repository);
     if (attempt.candidate && checks) {
       await runCandidateChecks(db, attempt.id, checks.caller, checks.services);

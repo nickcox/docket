@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { checkFixture, person, head, start, host } from '../helpers/check-attempt.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
@@ -13,9 +14,16 @@ import { parseCheckPolicy } from '../../src/check-policy.ts';
 import type { Runtime } from '../../src/runtime.ts';
 import type { Allocation } from '../../src/storage/reservations.ts';
 
-async function fixture(t: Parameters<typeof checkFixture>[0], candidate = true) {
+async function fixture(t: Parameters<typeof checkFixture>[0], candidate = true, invalid = false) {
   const f = await checkFixture(t);
-  const source = await f.attempt('task');
+  const source = invalid
+    ? await f.attempt('task', ['Criterion'], undefined, head, start, undefined, 'prepared')
+    : await f.attempt('task');
+  if (invalid) {
+    await writeFile(source.binding.resultPath, '{');
+    await f.db.recordWorkerObservation(source.observation('terminal', 1), host);
+    await assert.rejects(f.db.completeWorker(source.id, host), { code: 'result_invalid' });
+  }
   using sql = new DatabaseSync(f.path);
   // This fixture records terminal evidence directly, without activating a worker.
   sql.prepare("UPDATE requests SET state = 'succeeded', result = '{}' WHERE attempt_id = ? AND operation = 'worker.activate'").run(source.id);
@@ -95,6 +103,7 @@ for (const [candidate, chosen] of [[true, false], [false, false], [false, true]]
   const prompt = piWorkerPrompt(binding);
   assert.ok(prompt.includes(JSON.stringify(next.specification.handover)));
   assert.match(prompt, /rather than trusting it/);
+  assert.match(prompt, /Artefact references must name files inside artefactsDirectory, not directories/);
   assert.notEqual(binding.sessionId, f.source.binding.identity.sessionId);
   const sourceBefore = f.db.attempt(f.source.id);
   const replay = await dispatch(f.db, f.args, person, 'continue', f.runtime, () => {});
@@ -103,6 +112,18 @@ for (const [candidate, chosen] of [[true, false], [false, false], [false, true]]
   assert.equal(f.launcher.prompts.length, 1);
   assert.deepEqual(f.db.attempt(f.source.id), sourceBefore);
   await assert.rejects(dispatch(f.db, { ...f.args, sourceCommit: chosen ? head : start }, person, 'continue', f.runtime, () => {}), { code: 'request_input_mismatch' });
+});
+
+test('R12/A19: an invalid-result held attempt continues from its retained branch without a candidate', async t => {
+  const f = await fixture(t, true, true);
+  assert.equal(f.db.attempt(f.source.id).outcome, 'held');
+  assert.equal(f.db.attempt(f.source.id).candidate, null);
+  assert.equal(f.db.invalidWorkerResult(f.source.id)!.message, 'Malformed result JSON');
+  await assert.rejects(dispatch(f.db, f.args, person, 'continue-invalid', f.runtime, () => {}), { code: 'worker_failed' });
+  const next = f.db.attempt(f.db.requests().find(r => r.requestKey === 'continue-invalid')!.attemptId!);
+  assert.equal(next.specification.startingCommit, head);
+  assert.equal(f.allocations[0]!.startingCommit, head);
+  assert.equal(f.db.attempt(f.source.id).outcome, 'held');
 });
 
 test('R12/A26: person chooses an earlier commit; unrelated commits refuse', async t => {

@@ -1174,8 +1174,45 @@ export class Database {
     return this.snapshot(() => { this.attemptRow(attemptId); return this.validatedResultInTransaction(attemptId); });
   }
 
-  /** The source and retained artefacts are checked even after validation. Evidence is never replaced. */
+  private invalidResultInTransaction(attemptId: string): { message: string } | null {
+    const row = this.db.prepare("SELECT * FROM events WHERE attempt_id = ? AND kind = 'attempt.result_invalid' LIMIT 1").get(attemptId);
+    return row ? { message: String(this.decodeEvent(row).payload.message) } : null;
+  }
+
+  invalidWorkerResult(attemptId: string): { message: string } | null {
+    text(attemptId);
+    return this.snapshot(() => this.invalidResultInTransaction(attemptId));
+  }
+
   async validateWorkerResult(attemptId: string, host: WorkerHost,
+    repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>): Promise<ValidatedResult> {
+    text(attemptId); workerHost(host);
+    const previous = this.invalidWorkerResult(attemptId);
+    if (previous) throw new StorageError('result_invalid', previous.message);
+    try {
+      return await this.validateWorkerResultFiles(attemptId, host, repository);
+    } catch (error) {
+      if (error instanceof StorageError && ['result_invalid', 'result_identity_mismatch'].includes(error.code)) {
+        await this.write(() => {
+          const attempt = this.attemptRow(attemptId), taskId = String(attempt.task_id);
+          this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
+          if (attempt.outcome !== null || this.validatedResultInTransaction(attemptId)
+            || !this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'").get(attemptId)) return;
+          const message = error.message.slice(0, 1024);
+          this.db.prepare("UPDATE attempts SET outcome = 'held', phase = 'settled', execution_open = 0, settled_at = ?, revision = revision + 1 WHERE id = ?")
+            .run(new Date().toISOString(), attemptId);
+          this.db.prepare("UPDATE tasks SET state = 'queued', hold_reason = 'worker_held' WHERE id = ? AND decision_revision = ?")
+            .run(taskId, Number(attempt.started_decision_revision));
+          this.launchEvent(attemptId, taskId, host, 'attempt.result_invalid', { message });
+          this.launchEvent(attemptId, taskId, host, 'attempt.completed', { outcome: 'held', message, candidate: null });
+        });
+      }
+      throw error;
+    }
+  }
+
+  /** The source and retained artefacts are checked even after validation. Evidence is never replaced. */
+  private async validateWorkerResultFiles(attemptId: string, host: WorkerHost,
     repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>): Promise<ValidatedResult> {
     text(attemptId); workerHost(host);
     const actor = object(host) as WorkerHost;
@@ -1203,6 +1240,8 @@ export class Database {
       const attempt = this.attemptRow(attemptId);
       this.workerClaim(attemptId, String(attempt.owner_claim_id), actor);
       if (json(binding) !== json(this.resultBindingInTransaction(attemptId))) throw new StorageError('result_identity_mismatch', 'Result binding changed');
+      const invalid = this.invalidResultInTransaction(attemptId);
+      if (invalid) throw new StorageError('result_invalid', invalid.message);
       const recorded = this.validatedResultInTransaction(attemptId);
       if (recorded) {
         if (recorded.digest !== value.digest || json(recorded.artefacts) !== json(value.artefacts)) throw new StorageError('result_discrepancy', 'Validated result changed');

@@ -33,11 +33,17 @@ function paginate<T>(items: T[], page: Page, key: (value: T) => string) {
 function taskView(db: Database, task: Task) {
   return { ...task, blockedBy: task.blockerIds, ready: db.readyTasks().some(t => t.id === task.id) };
 }
+function invalidResultAction(attemptId: string) {
+  return { operation: 'attempt.continue', args: { sourceAttemptId: attemptId, sourceCommit: null, profile: null, note: null, dryRun: true },
+    description: 'Plan continuing from the retained output branch, or discard the attempt with attempt.discard.' };
+}
 function attemptView(db: Database, id: string) {
   const attempt = db.attempt(id), preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
   return { ...attempt, identity: { databaseId: attempt.specification.databaseId, contextId: attempt.specification.contextId,
     taskId: attempt.taskId, attemptId: id, leaseId: attempt.allocation?.leaseId ?? null, sessionId: preparation?.input.sessionId ?? null },
     workerRef: preparation?.result?.reference ?? null, result: db.validatedWorkerResult(id),
+    resultInvalid: db.invalidWorkerResult(id),
+    nextAction: db.invalidWorkerResult(id) ? invalidResultAction(id) : null,
     terminalEvidence: db.events().filter(e => e.attemptId === id && e.kind === 'worker.observed' && e.payload.kind === 'terminal'),
     taskTransitionApplied: db.events().some(e => e.attemptId === id && e.kind === 'acceptance.finished'),
     acceptance: attempt.candidate ? db.acceptance(id, String(attempt.candidate.id)) : null,
@@ -58,7 +64,9 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
   if (message.includes('request') && (message.includes('fingerprint') || message.includes('different') || message.includes('match'))) throw new CommandFailure('request_input_mismatch', data);
   if (message.includes('Admission blocked')) throw new CommandFailure(blockers.some(b => 'claimId' in b) ? 'claim_unresolved' : 'effect_uncertain', { ...data, blockers });
   if (error.code === 'busy') throw new CommandFailure('storage_busy', data);
-  if (error.code.startsWith('result_')) throw new CommandFailure(error.code as 'result_invalid', data);
+  if (error.code.startsWith('result_')) throw new CommandFailure(error.code as 'result_invalid',
+    { ...data, message: error.message.slice(0, 1024) },
+    request?.attemptId ? invalidResultAction(request.attemptId) : null);
   if (/capacity/iu.test(message)) throw new CommandFailure('capacity', data);
   if (/revision changed/iu.test(message)) throw new CommandFailure('task_changed', data);
   if (/eligible|ready/iu.test(message)) throw new CommandFailure('not_ready', data);
@@ -108,17 +116,18 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             ? await leaseReturnReason(db, a.id, caller, (await services()).completion) : null;
           const returnReason = currentReturnReason === 'Lease is ready to return.' && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;
-          const reason = returnReason ?? (resolved ? null : ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
+          const invalidResult = db.invalidWorkerResult(a.id);
+          const reason = (!resolved ? invalidResult?.message : null) ?? returnReason ?? (resolved ? null : ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
             : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
             : a.leaseState === 'held' ? 'Lease is held.'
             : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null);
-          const nextAction = reason === null ? null
+          const nextAction = invalidResult && !resolved ? invalidResultAction(a.id) : reason === null ? null
             : returnReason ? action('attempt.return', { attemptId: a.id, dryRun: true }, `Resolve the return condition (${returnReason}), then plan returning the lease.`)
             : checksState === 'failed' || checksState === 'uncertain' ? action('attempt.show', { attemptId: a.id }, 'Inspect check evidence before retrying or resolving uncertainty.')
             : a.candidate && !accepted ? action('attempt.accept', { attemptId: a.id, candidateCommit: a.candidate.commit, overrideReason: null, dryRun: true }, 'Inspect the acceptance plan for this candidate.')
             : action('attempt.show', { attemptId: a.id }, 'Inspect the attempt and lease before continuing or returning it.');
           return { id: a.id, taskId: a.taskId, number: a.number, phase: a.phase, outcome: a.outcome,
-            leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, checksState, reason, nextAction };
+            leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, checksState, resultInvalid: invalidResult, reason, nextAction };
         }))).filter(a => !args.attentionOnly || a.reason !== null);
         const blockers = db.admissionBlockers();
         const claims = db.claims().filter(c => !c.releasedAt).map(c => {
