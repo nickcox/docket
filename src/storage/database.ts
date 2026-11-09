@@ -1096,6 +1096,64 @@ export class Database {
     });
   }
 
+  /** Recorded commands are noticed by the owning dispatch, never executed by another process. */
+  workerStopRequested(attemptId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND category = 'command' AND operation = 'attempt.stop' LIMIT 1").get(attemptId);
+  }
+
+  async requestWorkerControl(command: CommandInput, dryRun = false): Promise<void> {
+    commandInput(command);
+    const value = JSON.parse(json(command)) as CommandInput;
+    const check = () => {
+      const attempt = this.attemptRow(String(value.input.attemptId));
+      taskActor(value.caller as TaskActor);
+      this.duplicateRequest(value, 'command');
+      return String(attempt.id);
+    };
+    if (dryRun) { this.snapshot(check); return; }
+    await this.write(() => {
+      const id = check();
+      this.recordCommandInTransaction(value, id);
+    });
+  }
+
+  /** Recheck the exact bound owner immediately before a control effect, without adopting it. */
+  checkWorkerControlEffect(effectId: string, host: WorkerHost, reference: WorkerReference): void {
+    workerHost(host); workerReference(reference);
+    this.snapshot(() => {
+      const effect = this.effect(effectId, 'claimed');
+      const claim = this.effectExecutor(effect, { claimId: effect.claimId!, generation: host.generation });
+      this.workerClaim(effect.attemptId!, claim.id, host);
+      const attempt = this.attemptRow(effect.attemptId!);
+      if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh'
+        || !['worker.stop', 'worker.deliver'].includes(effect.operation)
+        || json(effect.target!.reference) !== json(reference)
+        || json(JSON.parse(String(attempt.runtime_ref))) !== json(reference)) {
+        throw new StorageError('conflict', 'Worker control requires a fresh matching owner and reference');
+      }
+    });
+  }
+
+  /** A requested interruption is settled only after the launcher supplied terminal evidence. */
+  async interruptWorker(attemptId: string, host: WorkerHost): Promise<Attempt> {
+    workerHost(host);
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId);
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
+      if (!this.workerStopRequested(attemptId) || !this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ?
+        AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'`).get(attemptId)) {
+        throw new StorageError('conflict', 'Interruption requires a stop request and terminal evidence');
+      }
+      if (attempt.outcome !== null) return this.decodeAttempt(attempt);
+      this.changed(this.db.prepare(`UPDATE attempts SET outcome = 'interrupted', phase = 'settled', execution_open = 0,
+        settled_at = ?, revision = revision + 1 WHERE id = ? AND outcome IS NULL`).run(new Date().toISOString(), attemptId));
+      this.db.prepare(`UPDATE tasks SET state = 'queued', hold_reason = 'worker_interrupted'
+        WHERE id = ? AND decision_revision = ?`).run(String(attempt.task_id), Number(attempt.started_decision_revision));
+      this.launchEvent(attemptId, String(attempt.task_id), host, 'attempt.interrupted', {});
+      return this.decodeAttempt(this.attemptRow(attemptId));
+    });
+  }
+
   /** Commit one launch-or-fence decision; permission creates one pending activation effect. */
   async decideWorkerLaunch(attemptId: string, claimId: string, decision: 'permit' | 'fence', host: WorkerHost): Promise<LaunchDecision> {
     nonblank(attemptId); nonblank(claimId); workerHost(host);
@@ -1110,7 +1168,7 @@ export class Database {
         throw new StorageError('conflict', 'Attempt has not started');
       }
       const taskId = String(attempt.task_id);
-      if (decision === 'fence') {
+      if (decision === 'fence' || this.workerStopRequested(attemptId)) {
         this.changed(this.db.prepare("UPDATE attempts SET launch_state = 'fenced', revision = revision + 1 WHERE id = ? AND launch_state = 'pending'").run(attemptId));
         this.launchEvent(attemptId, taskId, caller, 'attempt.launch_fenced', { claimId });
         return { state: 'fenced', changed: true, effectId: null };
@@ -1146,7 +1204,7 @@ export class Database {
     const caller = object(host) as WorkerHost, bound = object(reference);
     return this.write(() => {
       const attempt = this.attemptRow(attemptId);
-      if (attempt.launch_state === 'fenced') return { kind: 'fenced' };
+      if (attempt.launch_state === 'fenced' || this.workerStopRequested(attemptId)) return { kind: 'fenced' };
       if (attempt.launch_state === 'pending') return { kind: 'pending' };
       if (json(JSON.parse(String(attempt.runtime_ref))) !== json(bound)) throw new StorageError('conflict', 'Activation reference does not match the bound worker');
       this.workerClaim(attemptId, String(attempt.owner_claim_id), caller);
@@ -1192,7 +1250,7 @@ export class Database {
     if (claim.resourceKey !== `worker:${attempt.id}` || claim.role !== 'worker_owner' || claim.attemptId !== attempt.id
       || attempt.phase !== 'running' || attempt.execution_open !== 1) throw new StorageError('conflict', 'Worker executor scope mismatch');
     if (effect.operation === 'worker.activate') {
-      if (attempt.launch_state !== 'permitted' || attempt.owner_claim_id !== identity.claimId
+      if (this.workerStopRequested(String(attempt.id)) || attempt.launch_state !== 'permitted' || attempt.owner_claim_id !== identity.claimId
         || attempt.runtime_ref === null || json(effect.target!.reference) !== json(JSON.parse(String(attempt.runtime_ref)))) {
         throw new StorageError('conflict', 'Worker activation is not permitted');
       }

@@ -201,6 +201,21 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           sourceAttemptId: String(args.sourceAttemptId), sourceCommit: args.sourceCommit as string | null, note: args.note as string | null }, caller, requestKey, await services(), progress);
       }
       case 'attempt.dispatch': return await dispatch(db, args as unknown as Parameters<typeof dispatch>[1], caller, requestKey, await services(), progress);
+      case 'attempt.stop': case 'attempt.steer': {
+        const attemptId = String(args.attemptId), attempt = db.attempt(attemptId);
+        const capabilities = (await services()).launcher.capabilities(attempt.specification.profile as JsonObject);
+        if (operation.name === 'attempt.stop' && !capabilities.terminalFence) throw new CommandFailure('capability_missing', { attemptId });
+        if (operation.name === 'attempt.steer') {
+          if (!(args.mode === 'active' ? capabilities.activeSteering : capabilities.afterTurnMessage)) {
+            throw new CommandFailure('capability_missing', { attemptId, mode: args.mode });
+          }
+          if (!attempt.executionOpen || db.workerStopRequested(attemptId)) throw new CommandFailure('launch_fenced', { attemptId });
+        }
+        await db.requestWorkerControl(command, Boolean(args.dryRun));
+        const steps = attempt.executionOpen ? [step(operation.name === 'attempt.stop' ? 'worker.fence' : 'worker.deliver', attemptId,
+          ['current_owner', 'launcher_capability'], true)] : [];
+        return args.dryRun ? { steps } : { attempt: db.attempt(attemptId), steps };
+      }
       case 'attempt.rebase': {
         const completion = (await services()).completion;
         const input = { requestKey, attemptId: String(args.attemptId), caller };

@@ -11,7 +11,7 @@ import { applicationId, Database, StorageError } from '../../src/storage/databas
 import type { EventInput, JsonObject } from '../../src/storage/database.ts';
 import type { WorkerHost, WorkerReference } from '../../src/storage/launch.ts';
 import type { Allocation } from '../../src/storage/reservations.ts';
-import { activateWorker, prepareWorker } from '../../src/workers.ts';
+import { activateWorker, prepareWorker, controlWorker } from '../../src/workers.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
 import { PiLauncher } from '../../src/adapters/pi.ts';
@@ -65,6 +65,78 @@ async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
   }
   return { db, root, path, options, allocated, started, prepared };
 }
+
+test('R06/R07/R08/R09: another connection records stop; only the owner fences, replay is inert and terminal evidence settles', async t => {
+  const { db, path, options, prepared } = await fixture(t);
+  const value = await prepared();
+  const remote = await Database.open(path, options);
+  defer(t, () => remote.close());
+  const command = { requestKey: 'stop', operation: 'attempt.stop', caller: person,
+    fingerprint: 'stop', input: { attemptId: value.attemptId, dryRun: false } };
+  const before = state(db, path, value.attemptId);
+  await remote.requestWorkerControl(command, true);
+  assert.deepEqual(state(db, path, value.attemptId), before);
+  await remote.requestWorkerControl(command);
+  assert.equal(db.attempt(value.attemptId).outcome, null);
+  assert.equal(db.attempt(value.attemptId).executionOpen, true);
+  assert.equal(value.launcher.calls.filter(c => c.operation === 'fence').length, 0);
+  assert.equal((await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host)).state, 'fenced');
+  assert.equal(await activateWorker(db, value.attemptId, value.reference, host, value.launcher), null);
+  await assert.rejects(controlWorker(db, value.attemptId, value.reference, { ...host, generation: 'other' }, value.launcher));
+  await controlWorker(db, value.attemptId, value.reference, host, value.launcher);
+  assert.equal(value.launcher.prompts.length, 0);
+  assert.equal(value.launcher.calls.filter(c => c.operation === 'fence').length, 1);
+  assert.equal(db.attempt(value.attemptId).outcome, null);
+  await assert.rejects(db.interruptWorker(value.attemptId, host), conflict);
+  await remote.requestWorkerControl(command);
+  await controlWorker(db, value.attemptId, value.reference, host, value.launcher);
+  assert.equal(value.launcher.calls.filter(c => c.operation === 'fence').length, 1);
+  assert.equal(db.requests().filter(r => r.operation === 'worker.stop').length, 1);
+  await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: 1, attemptId: value.attemptId,
+    workerRef: value.reference, observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
+    payload: { terminal: true, laterTurnsRefused: true } }, host);
+  assert.equal((await db.interruptWorker(value.attemptId, host)).outcome, 'interrupted');
+  assert.equal(db.attempt(value.attemptId).executionOpen, false);
+});
+
+test('R06/R09: a stop recorded during allocation survives preparation and fences permission', async t => {
+  const { db, allocated } = await fixture(t), value = await allocated();
+  await db.requestWorkerControl({ requestKey: 'early-stop', operation: 'attempt.stop', caller: person,
+    fingerprint: 'early-stop', input: { attemptId: value.attemptId, dryRun: false } });
+  await db.startAttempt(value.attemptId, person);
+  const launcher = new FakeLauncher();
+  const prepared = await prepareWorker(db, value.attemptId, host, launcher);
+  const reference = prepared.result!.reference as WorkerReference;
+  assert.equal((await db.decideWorkerLaunch(value.attemptId, prepared.claimId!, 'permit', host)).state, 'fenced');
+  await controlWorker(db, value.attemptId, reference, host, launcher);
+  assert.equal(await activateWorker(db, value.attemptId, reference, host, launcher), null);
+  assert.equal(launcher.prompts.length, 0);
+});
+
+test('R08/R09: an uncertain stop never repeats or supplies terminal evidence', async t => {
+  const { db, prepared } = await fixture(t), value = await prepared();
+  await db.requestWorkerControl({ requestKey: 'uncertain-stop', operation: 'attempt.stop', caller: person,
+    fingerprint: 'uncertain-stop', input: { attemptId: value.attemptId, dryRun: false } });
+  let calls = 0;
+  value.launcher.fence = async () => { calls++; return uncertain('Lost fence acknowledgement'); };
+  await assert.rejects(controlWorker(db, value.attemptId, value.reference, host, value.launcher));
+  assert.equal(db.requests().find(r => r.operation === 'worker.stop')!.state, 'uncertain');
+  await assert.rejects(controlWorker(db, value.attemptId, value.reference, host, value.launcher));
+  await assert.rejects(db.interruptWorker(value.attemptId, host), conflict);
+  assert.equal(calls, 1);
+  assert.equal(db.attempt(value.attemptId).outcome, null);
+  assert.equal(db.attempt(value.attemptId).executionOpen, true);
+});
+
+test('R06/R09: stop after permission but before activation prevents the initial prompt', async t => {
+  const { db, prepared } = await fixture(t), value = await prepared();
+  await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
+  await db.requestWorkerControl({ requestKey: 'late-stop', operation: 'attempt.stop', caller: person,
+    fingerprint: 'late-stop', input: { attemptId: value.attemptId, dryRun: false } });
+  assert.equal(await activateWorker(db, value.attemptId, value.reference, host, value.launcher), null);
+  await controlWorker(db, value.attemptId, value.reference, host, value.launcher);
+  assert.equal(value.launcher.prompts.length, 0);
+});
 
 function rows(path: string, attemptId: string) {
   using read = new DatabaseSync(path, { readOnly: true });

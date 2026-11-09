@@ -7,7 +7,7 @@ import type { ReservationInput, Allocation } from './storage/reservations.ts';
 import type { TaskActor } from './storage/tasks.ts';
 import type { TurnFailure } from './adapters/launcher.ts';
 import type { Runtime } from './runtime.ts';
-import { prepareWorker, activateWorker } from './workers.ts';
+import { prepareWorker, activateWorker, controlWorker } from './workers.ts';
 import type { WorkerHost, WorkerReference } from './storage/launch.ts';
 import { runCandidateChecks } from './checks.ts';
 import { CommandFailure } from './response.ts';
@@ -175,16 +175,18 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     await refresh();
     await recheck();
     progress('worker.permit'); await db.decideWorkerLaunch(id, prepared.claimId!, 'permit', host);
+    await controlWorker(db, id, reference, host, runtime.launcher);
     if (stopRequested) throw new CommandFailure('policy_refused', { attemptId: id });
     await recheck();
     progress('worker.activate');
     const activation = await withHeartbeat(activateWorker(db, id, reference, host, runtime.launcher));
-    if (activation?.state !== 'succeeded') throw new CommandFailure('effect_uncertain', { attemptId: id });
+    if (activation?.state !== 'succeeded' && !db.workerStopRequested(id)) throw new CommandFailure('effect_uncertain', { attemptId: id });
     progress('worker.wait');
     const deadline = Date.now() + Number(profile.runMs);
     let refreshed = Date.now();
     let turnFailure: TurnFailure | undefined;
     while (true) {
+      await controlWorker(db, id, reference, host, runtime.launcher);
       const observation = await runtime.launcher.inspect(reference);
       if (observation.status !== 'known') throw new CommandFailure('owner_unknown', { attemptId: id });
       turnFailure = observation.turnFailure;
@@ -208,6 +210,11 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       throw new CommandFailure('worker_failed', { attemptId: id, profile: reservation.attempt.specification.profileName,
         failureKind: turnFailure.kind, message: turnFailure.message, leaseReturn: { state: leaseReturn.state, reason: leaseReturn.reason } },
         nextAction('attempt.show', { attemptId: id }, 'Inspect the failure before retrying; a person must clear a limited profile after its provider limit resets.'));
+    }
+    if (db.workerStopRequested(id)) {
+      const attempt = await db.interruptWorker(id, host);
+      return { attempt, leaseReturn: { state: 'kept', reason: 'Stopped work is retained for inspection.' },
+        skippedTasks: reservation.skippedTasks, steps };
     }
     await withHeartbeat(db.completeWorker(id, host, runtime.repository));
     if (db.attempt(id).candidate) {

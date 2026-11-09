@@ -22,7 +22,7 @@ const attention = { reason: nullable(string), nextAction: nullable(object({ oper
 const statusTask = object({ id, title: string, state: { enum: ['queued', 'in_flight', 'done'] }, ready: bool,
   holdReason: nullable(string), blockedBy: { type: 'array', items: id }, ...attention });
 const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', minimum: 1 }, phase: string,
-  outcome: nullable({ enum: ['completed', 'held', 'failed'] }), leaseState: string,
+  outcome: nullable({ enum: ['completed', 'held', 'failed', 'interrupted', 'over_budget'] }), leaseState: string,
   candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), review: view, checksState: string, resultInvalid: nullable(object({ message: { ...string, maxLength: 1024 } })), ...attention });
 function outputSchema(name: string): JsonSchema {
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
@@ -93,6 +93,8 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.show', 'Read full attempt identity and evidence.', attempt, false),
   operation('checks.run', 'Run checks for a recorded candidate of a terminal attempt, reusing matching passing evidence.', {
     ...planAttempt, commit: { type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' } }),
+  operation('attempt.stop', 'Request that the owning dispatch fence the worker; terminal evidence remains separate.', planAttempt),
+  operation('attempt.steer', 'Deliver a message only when the launcher supports the requested mode.', { ...planAttempt, message: string, mode: { enum: ['active', 'after_turn'] } }),
   operation('attempt.accept', 'Accept an exact retained candidate and apply finalisation policy.', { ...planAttempt, candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), overrideReason: nullable(string) }),
   operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt, true, ['person']),
   operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),

@@ -10,6 +10,8 @@ import type { GitRepository } from './adapters/repository.ts';
 import { runCandidateChecks } from './checks.ts';
 import type { CheckServices } from './checks.ts';
 import type { TaskActor } from './storage/tasks.ts';
+import { canonicalJson } from './configuration.ts';
+import { CommandFailure } from './response.ts';
 
 /** Observations are retained before result processing, so a refusal cannot lose a terminal fact. */
 export async function observeWorker(db: Database, observation: WorkerObservation, host: WorkerHost,
@@ -33,6 +35,48 @@ export async function observeWorker(db: Database, observation: WorkerObservation
 function evidence(result: Result<unknown>): JsonObject {
   // Adapter diagnostics may contain Error objects or undefined fields. Retain a JSON value.
   return JSON.parse(JSON.stringify(result)) as JsonObject;
+}
+
+/** Only the bound owner consumes recorded control commands. Claimed effects are never retried. */
+export async function controlWorker(db: Database, attemptId: string, reference: WorkerReference,
+  host: WorkerHost, launcher: Launcher): Promise<void> {
+  const owner = db.claims().find(c => c.attemptId === attemptId && c.role === 'worker_owner' && !c.releasedAt);
+  if (!owner || canonicalJson(owner.ownerRef) !== canonicalJson(host)) throw new CommandFailure('owner_unresolved');
+  const executor = { claimId: owner.id, generation: host.generation };
+  for (const command of db.requests().filter(r => r.category === 'command' && r.attemptId === attemptId
+    && ['attempt.stop', 'attempt.steer'].includes(r.operation))) {
+    const stop = command.operation === 'attempt.stop';
+    const operation = stop ? 'worker.stop' : 'worker.deliver';
+    const existing = db.requests().find(r => r.parentId === command.id && r.operation === operation);
+    if (existing) {
+      if (existing.state === 'succeeded' || existing.state === 'rejected') continue;
+      throw new CommandFailure('effect_uncertain', { effectId: existing.id });
+    }
+    const capabilities = launcher.capabilities(db.attempt(attemptId).specification.profile as JsonObject);
+    if (!(stop ? capabilities.terminalFence : command.input.mode === 'active' ? capabilities.activeSteering : capabilities.afterTurnMessage)) {
+      throw new CommandFailure('capability_missing');
+    }
+    if (!stop && db.workerStopRequested(attemptId)) continue;
+    const effect = await db.recordEffect({ requestKey: `control:${command.id}`, operation, caller: command.caller,
+      input: { reference, ...command.input }, fingerprint: command.fingerprint, parentId: command.id,
+      executor, attemptId, target: { kind: 'worker', reference } });
+    await db.claimEffect(effect.id, executor);
+    try {
+      // Fresh ownership and worker evidence immediately precede each external effect.
+      const observed = await launcher.inspect(reference);
+      if (observed.status !== 'known') throw new CommandFailure('owner_unknown');
+      db.checkWorkerControlEffect(effect.id, host, reference);
+      const result = observed.terminal ? { status: 'confirmed' as const, value: { alreadyTerminal: true } }
+        : stop ? await launcher.fence(reference, effect.id)
+        : await launcher.deliver(reference, String(command.input.message), command.input.mode === 'active' ? 'active_steering' : 'after_turn', effect.id);
+      await db.recordEffectOutcome(effect.id, executor, result.status === 'confirmed' ? 'succeeded'
+        : result.status === 'rejected' ? 'rejected' : 'uncertain', evidence(result));
+      if (result.status !== 'confirmed') throw new CommandFailure(result.status === 'uncertain' ? 'effect_uncertain' : 'policy_refused');
+    } catch (error) {
+      if (db.request(effect.id).state === 'claimed') await db.recordEffectOutcome(effect.id, executor, 'uncertain', { reason: String(error) });
+      throw error;
+    }
+  }
 }
 
 /** A repeated call returns durable progress, never another prepare call. */

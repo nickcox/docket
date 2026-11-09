@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { cp, mkdir, mkdtemp, realpath, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -86,6 +88,48 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
   return { home, repo, git, config, invoke, file };
 }
 const definition = { title: 'Implement feature', instructions: 'Implement the feature', criteria: ['Works'], kind: 'code', profile: null };
+
+test('R07/R08/R09/R31/R35: a separate CLI stops the live dispatch owner; Pi steering refuses without delivery', { timeout: 20000 }, async t => {
+  const f = await fixture(t, 'running');
+  assert.equal(f.invoke('task.add', { id: 'feature', definition, objectiveId: null }).status, 0);
+  const child = spawn(process.execPath, [entry, 'attempt', 'dispatch', '--config', f.file, '--stdin', '--json', '--request-id', 'live-dispatch'], {
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home, PEER_MODE: 'running', PEER_RECORD: join(f.home, 'peer.jsonl') },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const exited = once(child, 'exit');
+  child.stdin.end(JSON.stringify({ taskId: 'feature', profile: null, dryRun: false }));
+  const until = Date.now() + 10000;
+  while (!stderr.includes('worker.wait') && Date.now() < until && child.exitCode === null) await delay(20);
+  assert.ok(stderr.includes('worker.wait'), stderr + stdout);
+  const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } });
+  const attemptId = status.data.attempts.items[0].id;
+  const before = await snapshot(f.home);
+  for (const mode of ['active', 'after_turn']) for (const dryRun of [true, false]) {
+    const steer = f.invoke('attempt.steer', { attemptId, message: 'Change direction', mode, dryRun });
+    assert.equal(steer.envelope.code, 'capability_missing');
+  }
+  assert.deepEqual(await snapshot(f.home), before);
+  const planned = f.invoke('attempt.stop', { attemptId, dryRun: true });
+  assert.equal(planned.status, 0);
+  assert.deepEqual(await snapshot(f.home), before);
+  const stopped = f.invoke('attempt.stop', { attemptId, dryRun: false }, 'stop');
+  assert.equal(stopped.status, 0, JSON.stringify(stopped.envelope));
+  assert.deepEqual(stopped.data.steps, planned.data.steps);
+  const [code] = await exited;
+  assert.equal(code, 0, stderr + stdout);
+  const result = JSON.parse(stdout);
+  assert.equal(result.data.attempt.outcome, 'interrupted');
+  assert.equal(result.data.attempt.executionOpen, false);
+  assert.ok(f.invoke('attempt.show', { attemptId }).data.terminalEvidence);
+  assert.equal(f.invoke('attempt.stop', { attemptId, dryRun: false }, 'stop').status, 0);
+  const peer = (await readFile(join(f.home, 'peer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(peer.filter(row => row.type === 'prompt').length, 1);
+  assert.equal(peer.filter(row => ['steer', 'follow_up'].includes(row.type)).length, 0);
+});
 
 test('R29/R04/R27: unknown profiles refuse definitions, automatic dispatch reports skips and status explains the repair', async t => {
   const f = await fixture(t);

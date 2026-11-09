@@ -27,14 +27,14 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
   assert.equal(catalogue.catalogueVersion, 1);
   assert.deepEqual(catalogue.operations.map(operation => operation.name).sort(), ['catalog.show', 'context.init', 'context.configure', 'status.show',
     'task.add', 'task.show', 'task.list', 'task.update', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
-    'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'request.show'].sort());
+    'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'request.show'].sort());
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
     assert.ok(operation.roles.includes('person'));
     if (['context.init', 'context.configure', 'attempt.continue', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
     assert.deepEqual(operation.bindingDerivedFields, operation.name === 'task.add' ? ['objectiveId'] : []);
     assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show', 'request.show'].includes(operation.name));
-    assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run'].includes(operation.name));
+    assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);
     checkInputSchema(operation.inputSchema);
@@ -63,6 +63,25 @@ test('R28/R30: dependency schemas require exactly two task IDs and do not offer 
     for (const invalid of [{ taskId: 'feature' }, { ...input, blockerId: '' }, { ...input, taskId: 'not a slug' },
       { ...input, dryRun: true }, { ...input, caller: 'person' }]) {
       assert.notEqual(validateSchema(operation.inputSchema, invalid), null);
+    }
+  }
+});
+
+test('R28/R30/R31: stop and steer expose the exact planable control inputs and trusted roles', () => {
+  const attemptId = '11111111-1111-4111-8111-111111111111';
+  for (const name of ['attempt.stop', 'attempt.steer']) {
+    const operation = findOperation(name)!;
+    assert.deepEqual(operation.roles, ['person', 'supervisor']);
+    assert.equal(operation.plans, true);
+    const args = { attemptId, dryRun: true, ...(name === 'attempt.steer' ? { message: 'Change direction', mode: 'active' } : {}) };
+    assert.equal(validateSchema(operation.inputSchema, args), null);
+    assert.notEqual(validateSchema(operation.inputSchema, { ...args, extra: true }), null);
+    const { dryRun: _, ...missing } = args;
+    assert.notEqual(validateSchema(operation.inputSchema, missing), null);
+    if (name === 'attempt.steer') {
+      assert.equal(validateSchema(operation.inputSchema, { ...args, mode: 'after_turn' }), null);
+      assert.notEqual(validateSchema(operation.inputSchema, { ...args, mode: 'restart' }), null);
+      assert.notEqual(validateSchema(operation.inputSchema, { ...args, message: ' ' }), null);
     }
   }
 });
