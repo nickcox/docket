@@ -50,8 +50,8 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
       const crash = signal !== null && ['SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGFPE', 'SIGABRT'].includes(signal);
       // Windows reports NT status values as exit codes, including console interruption.
       const interrupted = process.platform === 'win32' ? code !== null && (code >>> 0) === 0xC000013A : signal !== null && !crash;
-      resolve({ status: spawnFailed ? 'not_run' : timedOut ? 'failed' : interrupted ? 'uncertain'
-        : crash || (code !== null && code !== 0) ? 'failed' : pipesOpen || signal || code === null ? 'uncertain' : 'passed',
+      resolve({ status: spawnFailed ? 'not_run' : pipesOpen ? 'uncertain' : timedOut ? 'failed' : interrupted ? 'uncertain'
+        : crash || (code !== null && code !== 0) ? 'failed' : signal || code === null ? 'uncertain' : 'passed',
         exitCode: spawnFailed ? null : code, signal, timedOut,
         stdout: out.slice(0, 8192), stderr: err.slice(0, 8192),
         truncated: stdoutTruncated || stderrTruncated || out.length > 8192 || err.length > 8192,

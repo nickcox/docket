@@ -178,12 +178,13 @@ test('R31/R33/R35: exact cwd/provider/model, controlled resources and environmen
   assert.notEqual(spawn.environment.HOME, f.root);
   assert.ok(spawn.environment.HOME.startsWith(join(f.root, 'state')));
   if (process.platform === 'win32') {
-    const acl = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ' +
+    const script = '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ' +
       '$rules = @((Get-Acl -LiteralPath $env:PRIVATE_HOME).Access | ForEach-Object { ' +
       '@{ sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; ' +
       'allow = ($_.AccessControlType -eq "Allow"); full = (($_.FileSystemRights -band 2032127) -eq 2032127) } }); ' +
-      '@{ owner = $sid; rules = $rules } | ConvertTo-Json -Depth 4'],
+      '@{ owner = $sid; rules = $rules } | ConvertTo-Json -Depth 4';
+    const acl = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+      Buffer.from(script, 'utf16le').toString('base64')],
     { env: { ...process.env, PRIVATE_HOME: spawn.environment.HOME }, encoding: 'utf8' }));
     assert.ok(acl.rules.length > 0);
     for (const rule of acl.rules) assert.deepEqual(rule, { sid: acl.owner, allow: true, full: true });

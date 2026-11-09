@@ -29,19 +29,32 @@ export interface ExecutionProfiles {
 /** Host settings are person-controlled and never accepted in operation JSON. */
 export async function loadExecutionProfiles(home = homedir()): Promise<ExecutionProfiles> {
   const path = join(home, '.config', 'docket', 'execution-profiles.json');
+  // Only fixed condition names reach diagnostics, never an OS error or parser input.
+  let condition = 'file metadata could not be read';
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.nlink !== 1 || info.size > 256 * 1024) throw new Error();
+    condition = 'not a regular file';
+    if (!info.isFile()) throw new Error();
+    condition = 'link count is not one';
+    if (info.nlink !== 1) throw new Error();
+    condition = 'file exceeds 256 KiB';
+    if (info.size > 256 * 1024) throw new Error();
+    condition = process.platform === 'win32' ? 'Windows owner/write ACL is untrusted or could not be verified' : 'group or other write permission';
     if (process.platform === 'win32' ? !await windowsSettingsWritableOnlyByOwner(path) : (info.mode & 0o022) !== 0) throw new Error();
-    const value = strictJson(await readFile(path, 'utf8')) as ExecutionProfiles;
+    condition = 'file contents could not be read';
+    const text = await readFile(path, 'utf8');
+    condition = 'invalid JSON';
+    const value = strictJson(text) as ExecutionProfiles;
+    condition = 'invalid execution profiles schema';
     if (!value || value.version !== 1 || Object.keys(value).some(k => !['version', 'pi', 'checks'].includes(k))
       || !value.pi || typeof value.pi !== 'object' || Array.isArray(value.pi) || !value.checks || typeof value.checks !== 'object' || Array.isArray(value.checks)) throw new Error();
     for (const [id, profile] of Object.entries(value.checks)) {
+      condition = 'invalid check profile schema';
       if (!profile || profile.id !== id || Object.keys(profile).some(k => !['id', 'tools', 'dependencies', 'ignoredGeneratedPaths'].includes(k))
         || !profile.tools || !profile.dependencies) throw new Error();
     }
     return value;
-  } catch { throw new ConfigurationError('$executionProfiles', 'Cannot read person-controlled execution profiles'); }
+  } catch { throw new ConfigurationError('$executionProfiles', `Cannot read person-controlled execution profiles: ${condition}`); }
 }
 export async function createRuntime(db: Database, config: Configuration, home?: string): Promise<Runtime> {
   const profiles = await loadExecutionProfiles(home);

@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { GitRepository } from '../../src/adapters/repository.ts';
 import { checkCommandRunner } from '../../src/adapters/checks.ts';
+import { confirmed } from '../../src/adapters/command.ts';
+import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
-import { checkFixture, contextChecks, person, profile } from '../helpers/check-attempt.ts';
+import { checkFixture, contextChecks, head, person, profile, start } from '../helpers/check-attempt.ts';
 
 const check = (script: string, timeoutMs = 2000) => ({ name: 'command', command: [process.execPath, '-e', script], timeoutMs });
 const environment = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
@@ -61,6 +63,41 @@ test('R16/A35: crashes fail and interruptions stay uncertain with observed termi
       assert.equal(result.status, ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGKILL'].includes(signal) ? 'uncertain' : 'failed', signal);
       assert.equal(result.signal, signal); assert.equal(result.exitCode, null);
     }
+  }
+});
+
+test('R16/A35: open descendant pipes keep both successful and nonzero exits uncertain and retain the slot', async t => {
+  for (const code of [0, 1]) {
+    const f = await checkFixture(t);
+    // The IPC acknowledgement proves the descendant is alive with inherited pipes before exit.
+    // A bounded lifetime is a fallback if an assertion interrupts cleanup.
+    const descendant = "process.send('ready'); setTimeout(() => process.exit(0), 10000)";
+    const definition = check(`const { spawn } = require('node:child_process');
+      const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: ['ignore', 1, 2, 'ipc'] });
+      child.once('message', () => { console.log(child.pid); child.disconnect(); process.exit(${code}); });`, 5000);
+    const policy = JSON.stringify({ version: 1, fast: [], full: [definition] });
+    const a = await f.attempt('one', ['Criterion'], undefined, head, start, policy);
+    const b = await f.attempt('two', ['Criterion'], undefined, head, start, policy);
+    const realRun = checkCommandRunner(environment);
+    let commands = 0;
+    const services = { profile, repository: {
+      readCheckPolicy: async () => parseCheckPolicy(start, policy, contextChecks),
+      identity: async () => confirmed('/repo'),
+      inspectWorkspace: async () => confirmed({ branch: 'refs/heads/worker', head, clean: true, uncommitted: [], untracked: [] }),
+    }, run: async () => {
+      commands++;
+      const result = await realRun(definition, f.root);
+      const pid = Number(result.stdout.trim());
+      assert.ok(Number.isSafeInteger(pid) && pid > 0);
+      t.after(() => { try { process.kill(pid); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; } });
+      assert.equal(result.status, 'uncertain'); assert.equal(result.exitCode, code);
+      return result;
+    } };
+    assert.equal((await runCandidateChecks(f.db, a.id, person, services)).state, 'uncertain');
+    assert.equal((await runCandidateChecks(f.db, b.id, person, services)).state, 'pending');
+    assert.equal((await runCandidateChecks(f.db, a.id, person, services, 'new-request')).state, 'pending');
+    assert.equal(commands, 1);
+    assert.equal(f.db.claims().filter(value => value.role === 'check_executor' && !value.releasedAt).length, 1);
   }
 });
 
