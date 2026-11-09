@@ -23,6 +23,7 @@ Before continuing work that another agent session started, check that the sessio
 
 - Follow the test layers in the specification's [testing section](docs/specification/delivery.md#testing). Prefer the cheapest layer that shows the behaviour: pure rules first, then operations with real temporary SQLite and fake external owners. Use real Git, Treehouse or processes only to test an adapter or a specific process boundary.
 - Every test shows a stated behaviour or risk. Name the requirement or scenario it covers (for example `R04` or `A06`).
+- Tests run on macOS, Linux and Windows CI, but you can only run them on macOS. Register every fixture clean-up with `defer` from `tests/helpers/cleanup.ts`, so databases and other handles close before their temporary directory is removed; Windows cannot delete open files. Build every filesystem path with `node:path` (`join`, `resolve`, `relative`), never with `/` in a template string, and compare paths with `node:path` too.
 - Before finishing, run the checks listed in `.docket/checks.json` once it exists. Until then, run whatever checks your task names.
 
 ## Writing
