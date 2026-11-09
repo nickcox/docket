@@ -172,7 +172,9 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             nextAction: b.kind === 'claim'
               ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
-          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor' || q.scope.objectiveId === caller.objectiveId)).map(q => ({ ...q,
+          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor'
+            || q.scope.objectiveId === caller.objectiveId && (q.scope.taskId === null || visibleTask(db.task(q.scope.taskId))))).map(q => ({ ...q,
+            reason: q.waiting ? 'The asker is waiting for an answer.' : 'Question is unanswered.',
             nextAction: action('question.answer', { questionId: q.id, text: '<answer>' }, 'Answer this question; only a person may answer a question addressed to a person.') })) };
       }
       case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));

@@ -1706,6 +1706,17 @@ export class Database {
       this.insertEvent({ sourceKey: `worker.observation:${json([value.attemptId, value.sourceId, value.sourceSequence])}`,
         kind: 'worker.observed', payloadVersion: 1, correlationId: value.attemptId, actor,
         occurredAt: value.observedAt, attemptId: value.attemptId, taskId: String(attempt.task_id), payload: value });
+      if (value.kind === 'terminal') {
+        // Serialise shutdown with answers: a late answer must not leave an ownerless
+        // pending delivery blocking continuation. Claimed/uncertain sends stay unresolved.
+        for (const request of this.requests().filter(r => r.attemptId === value.attemptId
+          && r.operation.startsWith('question.deliver.') && r.state === 'pending')) {
+          const result = { reason: 'Worker is terminal; answer retained for continuation.' };
+          this.db.prepare("UPDATE requests SET state = 'withdrawn', result = ?, revision = revision + 1 WHERE id = ? AND state = 'pending'")
+            .run(json(result), request.id);
+          this.storageEvent('request.withdrawn', actor, { request: object(this.request(request.id)) }, request.id);
+        }
+      }
       return this.decodeAttempt(attempt);
     });
   }

@@ -12,6 +12,7 @@ import { CommandFailure } from '../../src/response.ts';
 import { permissions, unlimitedBudget } from '../../src/storage/objectives.ts';
 import type { TaskActor } from '../../src/storage/tasks.ts';
 import { supervisorPermissions } from '../../src/authority.ts';
+import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { configuration } from '../fixtures/configuration.ts';
 
 const person: TaskActor = { kind: 'person', id: 'operator' };
@@ -86,6 +87,29 @@ test('R21/R28/A43/A44: bound question tools derive the asker, status keeps choic
   const answered = await boundPerson.execute('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
   assert.deepEqual(answered.openPersonQuestions, []);
   assert.equal((answered.effects as any[])[0].state, 'pending', 'Recording an answer does not prove message delivery');
+});
+
+test('R18/R21/A43: question status follows current task membership without changing the immutable recipient', async t => {
+  const f = await fixture(t);
+  await f.db.addTask({ id: 'inside', title: 'Inside', objectiveId: 'goal' }, person);
+  const reservation = await f.db.reserveAttempt({ requestKey: 'reserve-question', taskId: 'inside', caller: person,
+    startingCommit: 'a'.repeat(40), checks: parseCheckPolicy('a'.repeat(40), null, { executionProfile: 'node-v1', fast: [], full: [] }), delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+  const worker = createBinding({ kind: 'worker', attemptId: reservation.attempt.id }, { config: f.file }, { home: f.home });
+  const args = { text: 'Which approach?', choices: ['A', 'B'], waiting: true };
+  const asked = await worker.execute('question.ask', args, 'worker-question');
+  const question = asked.question as any;
+  assert.deepEqual(question.recipient, { kind: 'supervisor', objectiveId: 'goal' });
+  const statusArgs = { attentionOnly: true, page: { after: null, limit: 100 } };
+  const status = await f.binding.execute('status.show', statusArgs);
+  assert.equal((status.openPersonQuestions as any[])[0].id, question.id);
+  assert.ok((status.openPersonQuestions as any[])[0].reason);
+  await f.db.moveTask('inside', f.db.task('inside').definitionRevision, 'other', person);
+  const moved = await f.binding.execute('status.show', statusArgs);
+  assert.deepEqual(moved.openPersonQuestions, []);
+  await assert.rejects(f.binding.execute('question.answer', { questionId: question.id, text: 'A' }), code('outside_objective'));
+  const boundPerson = createBinding(person, { config: f.file }, { home: f.home });
+  await boundPerson.execute('question.answer', { questionId: question.id, text: 'A' });
+  assert.deepEqual(f.db.questions()[0]!.recipient, question.recipient);
 });
 
 test('R18/A36: every admitted operation checks its permission and current membership, including plans', async t => {

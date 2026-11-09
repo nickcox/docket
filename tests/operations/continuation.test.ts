@@ -114,6 +114,30 @@ for (const [candidate, chosen] of [[true, false], [false, false], [false, true]]
   await assert.rejects(dispatch(f.db, { ...f.args, sourceCommit: chosen ? head : start }, person, 'continue', f.runtime, () => {}), { code: 'request_input_mismatch' });
 });
 
+test('R12/R21/A26/A44: a new worker receives current answers and open questions in an immutable handover', async t => {
+  const f = await fixture(t);
+  const worker = { kind: 'worker' as const, attemptId: f.source.id };
+  const answered = await f.db.askQuestion({ text: 'Which approach?', choices: ['A', 'B'], waiting: true }, worker, 'answered');
+  const input = { questionId: answered.id, text: 'A' };
+  await f.db.answerQuestion(answered.id, input.text, person, { requestKey: 'answer', operation: 'question.answer',
+    caller: person, input, fingerprint: JSON.stringify(input) });
+  const open = await f.db.askQuestion({ text: 'Which test?', choices: null, waiting: false }, worker, 'open');
+  await assert.rejects(dispatch(f.db, f.args, person, 'continue-questions', f.runtime, () => {}), { code: 'worker_failed' });
+  const next = f.db.attempt(f.db.requests().find(r => r.requestKey === 'continue-questions')!.attemptId!);
+  const handover = next.specification.handover as Record<string, any>;
+  assert.deepEqual(handover.openQuestions, [open]);
+  assert.equal(handover.answeredQuestions[0].id, answered.id);
+  assert.equal(handover.answeredQuestions[0].answer.text, 'A');
+  assert.deepEqual([...f.launcher.workers.values()][0]!.binding.specification.handover, handover);
+  const later = { questionId: open.id, text: 'Unit test' };
+  await f.db.answerQuestion(open.id, later.text, person, { requestKey: 'later-answer', operation: 'question.answer',
+    caller: person, input: later, fingerprint: JSON.stringify(later) });
+  assert.deepEqual(f.db.attempt(next.id).specification.handover, handover, 'Later answers cannot rewrite a reserved handover');
+  const current = continuationHandover(f.db, next.id, head, false, null);
+  assert.deepEqual(current.openQuestions, []);
+  assert.equal((current.answeredQuestions as any[]).length, 2, 'Questions from earlier attempts follow the task');
+});
+
 test('R17/R18/A36: supervisor continuation uses the bound objective and refuses a person-selected source commit', async t => {
   const f = await fixture(t);
   await f.db.addObjective({ id: 'goal', request: 'Build', criteria: ['Works'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);

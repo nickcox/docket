@@ -158,6 +158,30 @@ test('R21/A44: worker becoming terminal between answer recording and delivery wi
   assert.deepEqual(launcher.calls, []);
 });
 
+test('R21/A44: terminal observation withdraws late pending deliveries but preserves uncertain sends', async t => {
+  const f = await prepared(t);
+  const q = await f.db.askQuestion(input, { kind: 'worker', attemptId: f.source.id }, 'question');
+  await f.db.answerQuestion(q.id, 'A', person, command(person, 'question.answer', { questionId: q.id, text: 'A' }));
+  const message = f.db.requests().find(r => r.operation === 'question.deliver.message')!;
+  const owner = f.db.claims().find(c => c.id === message.claimId)!;
+  const executor = { claimId: owner.id, generation: owner.generation };
+  await f.db.claimEffect(message.id, executor);
+  await f.db.recordEffectOutcome(message.id, executor, 'uncertain', { reason: 'Lost send response' });
+  const terminal = f.source.observation('terminal', 1);
+  await f.db.recordWorkerObservation(terminal, host);
+  assert.equal(f.db.request(message.id).state, 'uncertain');
+  assert.equal(f.db.requests().find(r => r.operation === 'question.deliver.file')!.state, 'withdrawn');
+  assert.equal(f.db.questions()[0]!.answer!.text, 'A');
+  const events = f.db.events().filter(e => e.kind === 'request.withdrawn');
+  assert.equal(events.length, 1);
+  await f.db.recordWorkerObservation(terminal, host);
+  assert.deepEqual(f.db.events().filter(e => e.kind === 'request.withdrawn'), events);
+  const late = await f.db.askQuestion(input, { kind: 'worker', attemptId: f.source.id }, 'late');
+  await f.db.answerQuestion(late.id, 'B', person, command(person, 'question.answer', { questionId: late.id, text: 'B' }));
+  assert.ok(f.db.requests().filter(r => r.operation.startsWith('question.deliver.') && r.input.questionId === late.id)
+    .every(r => r.state === 'withdrawn'));
+});
+
 test('R12/R21/A44: answer after terminal is retained for continuation, with withdrawn intents and no restart', async t => {
   const f = await prepared(t);
   const q = await f.db.askQuestion(input, { kind: 'worker', attemptId: f.source.id }, 'question');
