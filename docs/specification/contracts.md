@@ -116,7 +116,7 @@ The operation-specific schema for ordinary task.add restricts kind to code/repor
 | task.reorder | orderedTaskIds:Id[] | Scoped mutation; unique existing IDs, reorder only this scope |
 | task.done / task.reopen | taskId:Id, note:Text\|null | Scoped judgement; does not invent accepted evidence |
 | attempt.dispatch | taskId:Id\|null, profile:String\|null, dryRun:boolean | Person/supervisor; null task selects first ready, null profile uses resolved default |
-| attempt.continue | sourceAttemptId:UUID, profile:String\|null, note:Text\|null, dryRun:boolean | Person/supervisor; separate from fresh dispatch |
+| attempt.continue | sourceAttemptId:UUID, sourceCommit:Commit\|null, profile:String\|null, note:Text\|null, dryRun:boolean | Person/supervisor; separate from fresh dispatch; null sourceCommit starts at the source output branch's current commit; only a person can name sourceCommit |
 | profile.clear | profile:String, dryRun:boolean | Person; clear a profile limited after a provider_limit failure, once the provider's limit has reset |
 | attempt.show | attemptId:UUID | Scoped full detail |
 | attempt.review | attemptId:UUID, dryRun:boolean | Person/supervisor; create exact-target review task |
