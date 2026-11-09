@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
@@ -17,7 +18,7 @@ interface ChildMessage {
 
 async function fixture(t: test.TestContext) {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-registry-lock-')));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  defer(t, () => rm(home, { recursive: true, force: true }));
   const registry = join(home, '.config', 'docket', 'contexts.json');
   async function config(name: string, id = name, sharedPool?: string) {
     const value = configuration(home, id);
@@ -34,7 +35,7 @@ async function fixture(t: test.TestContext) {
     process.stderr!.on('data', chunk => { stderr += chunk; });
     process.on('message', message => { messages.push(message as ChildMessage); notify?.(); });
     const exited = once(process, 'exit');
-    t.after(async () => { if (process.exitCode === null && process.signalCode === null) process.kill('SIGKILL'); await exited; });
+    defer(t, async () => { if (process.exitCode === null && process.signalCode === null) process.kill('SIGKILL'); await exited; });
     async function phase(name: string) {
       for (;;) {
         const index = messages.findIndex(message => message.phase === name);

@@ -25,7 +25,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     assert.equal(result.code, 0, JSON.stringify(result));
     return result.stdout.trim();
   };
-  await git("init", "-q", "-b", "main"); await git("config", "user.name", "Adapter tests"); await git("config", "user.email", "test@example.invalid");
+  await git("init", "-q", "-b", "main"); await git('config', 'core.autocrlf', 'false'); await git("config", "user.name", "Adapter tests"); await git("config", "user.email", "test@example.invalid");
   await writeFile(join(repository, "file"), "base\n"); await git("add", "."); await git("commit", "-qm", "base");
   const startingCommit = await git("rev-parse", "HEAD");
   const repo = new GitRepository({ repository });

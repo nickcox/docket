@@ -117,7 +117,7 @@ test('A02/R24: canonical retained regular files only; reject links, directories 
   await assert.rejects(Database.open(f.path, f.options), errorCode('path'));
   await rm(hard);
   const directoryAlias = join(f.root, 'directory-alias');
-  await symlink(f.root, directoryAlias, 'dir');
+  await symlink(f.root, directoryAlias, process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(Database.open(join(directoryAlias, 'context.sqlite'), f.options), errorCode('path'));
   await assert.rejects(Database.open(f.path, { ...f.options, location: { retainedRoot: f.root, recyclableRoots: [f.root] } }), errorCode('path'));
   const other = join(f.root, 'other');

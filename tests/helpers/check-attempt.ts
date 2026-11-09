@@ -1,3 +1,4 @@
+import { defer } from './cleanup.ts';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -24,7 +25,7 @@ export const retention = { compare: async () => confirmed(true), verifyRetention
 type TestContext = { after: (fn: () => Promise<void> | void) => void };
 export async function checkFixture(t: TestContext, maximum = 1) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-checks-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [join(root, 'pool')] }, retryMs: 1000, readOnly: false };
   const workerProfile = { launcher: 'bb', provider: 'example', model: 'model', reasoning: null,
@@ -36,7 +37,7 @@ export async function checkFixture(t: TestContext, maximum = 1) {
       defaultProfile: 'worker', profileByKind: { code: 'worker', report: 'worker', review: 'worker' },
       finalisation: { kind: 'manual', targetBranch: 'main', globalFile: null, forbid: [] }, checks: contextChecks,
     } } }, options);
-  t.after(() => db.close());
+  defer(t, () => db.close());
   const [claim] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch-1', ownerRef: person,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
   const executor = { claimId: claim!.id, generation: claim!.generation };

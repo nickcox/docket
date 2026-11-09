@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { link, mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -24,7 +25,7 @@ const refuses = (code: string, reason?: RegExp) => (error: unknown) => error ins
 type TestContext = { after: (fn: () => Promise<void> | void) => void };
 async function fixture(t: TestContext, kind: 'code' | 'report' = 'code', deliverables: string[] = []) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-result-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [join(root, 'pool')] }, readOnly: false, retryMs: 1000 };
   const profile = { launcher: 'bb', provider: 'example', model: 'model', reasoning: null,
@@ -36,7 +37,7 @@ async function fixture(t: TestContext, kind: 'code' | 'report' = 'code', deliver
       defaultProfile: 'worker', profileByKind: { code: 'worker', report: 'worker', review: 'worker' },
       finalisation: { kind: 'manual', targetBranch: 'main', globalFile: null, forbid: [] },
     } } }, options);
-  t.after(() => db.close());
+  defer(t, () => db.close());
   const [claim] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch-1', ownerRef: person,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
   const executor = { claimId: claim!.id, generation: claim!.generation };
@@ -132,7 +133,7 @@ test('R11/A17: oversized, linked, non-regular and malformed result files are ref
     if (scenario === 'parent-link') {
       const directory = dirname(f.binding.resultPath), other = join(f.root, 'other');
       await mkdir(other); await writeFile(join(other, 'result.json'), JSON.stringify(f.result));
-      await rm(directory, { recursive: true }); await symlink(other, directory);
+      await rm(directory, { recursive: true }); await symlink(other, directory, process.platform === 'win32' ? 'junction' : 'dir');
     }
     if (scenario === 'directory') { await unlink(f.binding.resultPath); await mkdir(f.binding.resultPath); }
     if (scenario === 'malformed') await writeFile(f.binding.resultPath, '{');
@@ -214,7 +215,7 @@ test('R11: validation is write-once, persists across reopening, and changed or m
   assert.equal(original.relativePath, 'result.json'); assert.equal(original.validationVersion, 1);
   assert.ok(Number.isFinite(Date.parse(original.validatedAt))); assert.deepEqual(original.content, f.result);
   assert.deepEqual(await f.db.validateWorkerResult(f.attemptId, host, repository), original);
-  const reopened = await Database.open(f.path, f.options); t.after(() => reopened.close());
+  const reopened = await Database.open(f.path, f.options); defer(t, () => reopened.close());
   assert.deepEqual(reopened.validatedWorkerResult(f.attemptId), original);
   await writeFile(f.binding.resultPath, source + '\n');
   await assert.rejects(f.db.validateWorkerResult(f.attemptId, host, repository), refuses('result_discrepancy'));
@@ -353,7 +354,7 @@ test('R11: the host inventory also excludes recyclable roots other than this att
   const f = await fixture(t); await f.save();
   const other = await Database.open(f.path, { ...f.options,
     location: { retainedRoot: f.root, recyclableRoots: [dirname(f.binding.resultPath)] } });
-  t.after(() => other.close());
+  defer(t, () => other.close());
   await assert.rejects(other.validateWorkerResult(f.attemptId, host, repository), refuses('result_invalid', /recyclable/));
   assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
 });
@@ -370,7 +371,7 @@ test('R07: Pi terminal proof requires direct child exit and rejects process-stop
 
 test('R10/R25: simultaneous validation and completion through independent stores retain one result and outcome', async t => {
   const f = await fixture(t); await f.save();
-  const other = await Database.open(f.path, f.options); t.after(() => other.close());
+  const other = await Database.open(f.path, f.options); defer(t, () => other.close());
   await f.db.recordWorkerObservation(f.observation('terminal'), host);
   const results = await Promise.all([f.db.validateWorkerResult(f.attemptId, host, repository), other.validateWorkerResult(f.attemptId, host, repository)]);
   assert.deepEqual(results[0], results[1]);

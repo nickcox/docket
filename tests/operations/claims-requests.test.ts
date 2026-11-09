@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,12 +20,12 @@ const claimInput = (resourceKey = 'checks:1'): ClaimInput => ({ resourceKey, rol
 
 async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-claims-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [] }, retryMs: 1000 };
   const db = await Database.initialise(path, { contextId: 'claims', repository: { identity: 'example' },
     stateDirectory: root, createdBy: actor, configuration: { revision: 1, resolved: {}, digest: 'test', provenance: {} } }, options);
-  t.after(async () => db.close());
+  defer(t, () => db.close());
   return { db, path, options };
 }
 

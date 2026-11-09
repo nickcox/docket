@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
@@ -167,7 +168,7 @@ test('R16: failed evidence is not automatically rerun; a new explicit request ma
 
 test('R16: two database connections admit only one full run, show waiting and admit the waiter after confirmed completion', async t => {
   const f = await checkFixture(t), a = await f.attempt('one'), b = await f.attempt('two', ['Other criterion']);
-  const other = await Database.open(f.path, f.options); t.after(() => other.close());
+  const other = await Database.open(f.path, f.options); defer(t, () => other.close());
   const fake = fakeServices();
   let entered!: () => void, release!: () => void;
   const fullEntered = new Promise<void>(resolve => { entered = resolve; });

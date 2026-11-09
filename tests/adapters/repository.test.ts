@@ -26,6 +26,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     return result.stdout.trim();
   };
   await git("init", "-q", "-b", "main");
+  await git('config', 'core.autocrlf', 'false');
   await git("config", "user.name", "Adapter tests");
   await git("config", "user.email", "test@example.invalid");
   await writeFile(join(path, "file"), "base\n");
@@ -33,7 +34,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const base = await git("rev-parse", "HEAD");
   await git("switch", "-qc", "output");
   await writeFile(join(path, "file"), "output\n");
-  await writeFile(join(path, "new\nfile"), "new\n");
+  await writeFile(join(path, "new file – café"), "new\n");
   await git("add", "."); await git("commit", "-qm", "output");
   const head = await git("rev-parse", "HEAD");
   await git("switch", "-q", "main");
@@ -108,9 +109,16 @@ test("R32 workspace inspection separates tracked and untracked changes; changed 
   const state = value(await f.repo.inspectWorkspace(f.path));
   assert.deepEqual(state.uncommitted, ["file"]);
   assert.deepEqual(state.untracked, ["untracked"]);
-  assert.deepEqual(value(await f.repo.changedPaths(f.base, f.head)).sort(), ["file", "new\nfile"].sort());
+  assert.deepEqual(value(await f.repo.changedPaths(f.base, f.head)).sort(), ["file", "new file – café"].sort());
   assert.equal(value(await f.repo.compare(f.base, f.head)), true);
   assert.equal(value(await f.repo.compare(f.head, f.base)), false);
+});
+
+test('R32: changed-path parsing preserves newline-containing names without requiring an OS to create them', async () => {
+  const repo = new GitRepository({ repository: process.cwd(), run: async () => ({
+    code: 0, complete: true, stdout: 'file\0new\nfile\0', stderr: '',
+  }) });
+  assert.deepEqual(value(await repo.changedPaths('a'.repeat(40), 'b'.repeat(40))), ['file', 'new\nfile']);
 });
 
 test("R32 changed paths retain reverted changes rather than just the final tree difference", async t => {
@@ -118,7 +126,7 @@ test("R32 changed paths retain reverted changes rather than just the final tree 
   await f.git("switch", "-q", "output");
   await f.git("revert", "--no-edit", f.head);
   const reverted = await f.git("rev-parse", "HEAD");
-  assert.deepEqual(value(await f.repo.changedPaths(f.base, reverted)).sort(), ["file", "new\nfile"].sort());
+  assert.deepEqual(value(await f.repo.changedPaths(f.base, reverted)).sort(), ["file", "new file – café"].sort());
   assert.equal(await f.git("diff", "--name-only", f.base, reverted), "");
 });
 
@@ -258,7 +266,7 @@ test("R32 retention requires exact reachability, clean workspace and regular art
   assert.equal((await f.repo.verifyRetention({ ...request, references: [{ ref: "refs/heads/main", commit: f.head }] })).status, "rejected");
   const recycled = join(pool, "report"); await writeFile(recycled, "{}");
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [recycled] })).status, "rejected");
-  const linked = join(f.root, "linked"); await symlink(recycled, linked);
+  const linked = join(f.root, "linked"); await symlink(recycled, linked, process.platform === 'win32' ? 'junction' : 'dir');
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [linked] })).status, "rejected");
   assert.equal((await f.repo.verifyRetention({ ...request, artefacts: [join(f.root, "missing")] })).status, "uncertain");
   await writeFile(join(f.path, "untracked"), "work");

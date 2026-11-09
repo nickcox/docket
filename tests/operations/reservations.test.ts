@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -29,12 +30,12 @@ function input(requestKey = 'dispatch', taskId?: string): ReservationInput {
 }
 async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-reserve-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [] }, readOnly: false, retryMs: 1000 };
   const db = await Database.initialise(path, { contextId: 'reservations', repository: { identity: 'example' },
     stateDirectory: root, createdBy: actor, configuration: { revision: 1, resolved: configuration(root), digest: 'config-1', provenance: {} } }, options);
-  t.after(() => db.close());
+  defer(t, () => db.close());
   const [claim] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'generation', ownerRef: actor,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], actor);
   const executor = { claimId: claim!.id, generation: claim!.generation };

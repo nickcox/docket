@@ -91,6 +91,18 @@ Full-check evidence is produced once per matching candidate/check identity. Dock
 - Local fast/full timing and check invocation counts, example configuration/catalogue/operator recovery documentation, and successful context activation.
 - This specification, edited into plain prose, describes the released behaviour, with a short README giving the purpose, installation, limits, examples and links.
 
+### Current platform qualification (R38)
+
+CI runs the same type check and default test suite on macOS, Linux and Windows. It installs Treehouse **3.1.4** for the runner's OS and Node architecture, verifying the archive against that release's `checksums.txt` before extraction. A green contract suite is not real-host workflow qualification. Linux and Windows remain **not yet fully qualified** for R38 until real host workflows and platform timing evidence are recorded; this task was checked locally on macOS only.
+
+Windows has a specific **R16 qualification limit**: Node can report a child killed from inside the child as a nonzero exit code without a signal. The check adapter cannot distinguish that from a normal failing exit. It therefore records any nonzero, non-timeout Windows exit as **uncertain**, retaining the observed exit code in diagnostics, rather than claiming a definite failure and releasing the check slot. Timeout and spawn-failure evidence remain distinct. Windows check-failure classification is **not qualified** for R16; an operator must reconcile an uncertain check. The signal-death regression runs on every platform and still requires uncertainty.
+
+Windows also has an **R31 qualification limit**: Node 26.7.0's libuv 1.52.1 restores Windows system/account variables even with an explicit child environment. Its `src/win/process.c` `required_vars` list includes `HOMEDRIVE`, `HOMEPATH`, `LOGONSERVER`, `PATH`, `SYSTEMDRIVE`, `SYSTEMROOT`, `TEMP`, `USERDOMAIN`, `USERNAME`, `USERPROFILE` and `WINDIR`. The Pi adapter explicitly replaces home/temp paths with private paths; the environment test asserts the exact remaining OS-added variables and their host values. The strict R31 environment list is **not qualified on Windows**. This is an explicit tested platform limitation, not permission to inherit other variables or credentials. See [libuv 1.52.1 process creation](https://github.com/libuv/libuv/blob/v1.52.1/src/win/process.c).
+
+Pi's private process directory uses owner-only POSIX permissions on macOS/Linux and an owner-only inheritable Windows ACL on Windows (R31/R35). The adapter test checks the relevant access-control mechanism, not Windows' synthetic POSIX mode bits. This does not qualify a real Pi workflow or isolation from an administrator. The optional paid/credential-backed Pi probe remains outside the default suite on every OS; R35/R38 real dispatch evidence is still required.
+
+Real Git fixtures use LF without automatic conversion and portable space/Unicode filenames. A synthetic Git response separately tests newline-containing paths on every platform because Windows cannot create those filenames (R32). No platform drops the NUL-delimited parsing assertion. Directory-link fixtures use Windows junctions where needed; regular-file link tests still run and require symlink privileges on the runner.
+
 ## Context initialisation and activation
 
 **R39.** Docket initialises a database only at an explicitly selected empty path. It records a database UUID and uses that identity in state-directory paths and output refs. An incompatible or nonempty database is refused without replacement.

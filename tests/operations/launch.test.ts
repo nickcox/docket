@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -22,7 +23,7 @@ const hash = 'a'.repeat(40);
 
 async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-launch-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [] }, readOnly: false, retryMs: 1000 };
   const profile = { launcher: 'bb', provider: 'example', model: 'model', reasoning: null,
@@ -34,7 +35,7 @@ async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
       defaultProfile: 'worker', profileByKind: { code: 'worker', report: 'worker', review: 'worker' },
       finalisation: { kind: 'manual', targetBranch: 'main', globalFile: null, forbid: [] },
     } } }, options);
-  t.after(() => db.close());
+  defer(t, () => db.close());
   const [claim] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch-1', ownerRef: person,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
   const executor = { claimId: claim!.id, generation: claim!.generation };
@@ -101,7 +102,7 @@ for (const mode of ['', 'lost-ack', 'result']) test(`R31/R35/A14/A15: synthetic 
   });
   const prepared = await prepareWorker(db, value.attemptId, host, launcher);
   const reference = prepared.result!.reference as WorkerReference;
-  t.after(async () => { await launcher.fence(reference, 'cleanup'); });
+  defer(t, async () => { await launcher.fence(reference, 'cleanup'); });
   const records = async () => (await readFile(record, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.equal((await records()).filter(r => r.type === 'prompt').length, 0);
   assert.equal(await activateWorker(db, value.attemptId, reference, host, launcher), null);
@@ -344,7 +345,8 @@ test('A13: permission and recovery fence in independent processes have one irrev
     const { db, root, path, prepared } = await fixture(t), value = await prepared();
     const child = spawn(process.execPath, ['tests/helpers/launch-child.ts', path, root, value.attemptId, value.claimId],
       { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-    t.after(() => { child.kill(); });
+    const stopped = once(child, 'close');
+    defer(t, async () => { if (child.exitCode === null && child.signalCode === null) child.kill(); await stopped; });
     let stderr = ''; child.stderr!.on('data', chunk => { stderr += String(chunk); });
     const ready = await Promise.race([once(child, 'message'), once(child, 'exit').then(() => { throw new Error(stderr); })]);
     assert.deepEqual(ready[0], { ready: true });

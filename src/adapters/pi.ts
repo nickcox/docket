@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, realpath, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { dirname, isAbsolute, join, parse, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import type { JsonObject } from '../storage/database.ts';
 import type { WorkerReference } from '../storage/launch.ts';
-import { confirmed, rejected, uncertain, type Result } from './command.ts';
+import { commandRunner, confirmed, rejected, uncertain, type Result } from './command.ts';
 import type { Launcher, LauncherCapabilities, MessageMode, Usage, WorkerBinding, WorkerObservation } from './launcher.ts';
 import { PiRpc, PiRpcRejection, type RpcRecord } from './pi-rpc.ts';
 
@@ -43,7 +43,7 @@ const capabilities: LauncherCapabilities = {
 };
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonnegative = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
-const outside = (parent: string, path: string) => { const rel = relative(parent, path); return rel.startsWith('../') || rel === '..' || isAbsolute(rel); };
+const outside = (parent: string, path: string) => { const rel = relative(parent, path); return rel.startsWith(`..${sep}`) || rel === '..' || isAbsolute(rel); };
 
 /** One non-acting Pi child per preparation. Losing this owner makes observations unknown, never absent. */
 export class PiLauncher implements Launcher {
@@ -104,6 +104,16 @@ export class PiLauncher implements Launcher {
       if (!outside(cwd, root)) return rejected('Pi state must be outside the leased workspace');
       const directory = join(root, randomUUID());
       await mkdir(directory, { mode: 0o700 });
+      if (process.platform === 'win32') {
+        // Windows ignores POSIX permission bits. Remove inherited grants and
+        // grant only the current account access to this fresh process directory.
+        const run = commandRunner();
+        const account = await run('whoami', ['/user', '/fo', 'csv', '/nh'], root);
+        const sid = account.stdout.match(/S-1-\d+(?:-\d+)+/)?.[0];
+        if (!account.complete || account.code !== 0 || !sid) throw new Error('Cannot identify the private Pi directory owner');
+        const secured = await run('icacls', [directory, '/inheritance:r', '/grant:r', `*${sid}:(OI)(CI)F`], root);
+        if (!secured.complete || secured.code !== 0) throw new Error('Cannot secure the private Pi directory');
+      }
       const home = join(directory, 'home'), sessions = join(directory, 'sessions');
       await mkdir(join(home, '.pi', 'agent'), { recursive: true, mode: 0o700 });
       await mkdir(sessions, { mode: 0o700 });
@@ -121,6 +131,16 @@ export class PiLauncher implements Launcher {
         if (!name.startsWith('DOCKET_') && host[name] !== undefined) environment[name] = host[name];
       }
       environment.HOME = home; // Only explicitly approved agent files are shared by the SDK path.
+      if (process.platform === 'win32') {
+        // libuv otherwise restores the host's Windows home and temp variables.
+        const temp = join(directory, 'temp');
+        await mkdir(temp);
+        environment.USERPROFILE = home;
+        environment.HOMEDRIVE = parse(home).root.replace(/\\$/, '');
+        environment.HOMEPATH = home.slice(environment.HOMEDRIVE.length);
+        environment.TEMP = temp;
+        environment.TMPDIR = temp;
+      }
       let args = [...(execution.entrypoint ? [execution.entrypoint] : []), '--mode', 'rpc',
         '--session-id', binding.sessionId, '--session-dir', sessions, '--provider', profile.provider, '--model', profile.model,
         ...(profile.reasoning === null ? [] : ['--thinking', String(profile.reasoning)]),

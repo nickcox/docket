@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { writeFile, unlink } from 'node:fs/promises';
@@ -343,7 +344,7 @@ test('R10/A24: interrupted acceptance resumes every durable step without repeati
       await assert.rejects(acceptCandidate(f.db, f.accept, f.services), /unresolved/);
       f.refs.set('refs/heads/main', head);
     }
-    const reopened = await Database.open(f.path, f.options); t.after(() => reopened.close());
+    const reopened = await Database.open(f.path, f.options); defer(t, () => reopened.close());
     await acceptCandidate(reopened, f.accept, f.services);
     await acceptCandidate(reopened, f.accept, f.services);
     assert.equal(reopened.task('task').state, 'done', step);
@@ -490,7 +491,7 @@ test('R11/A24: return resumes after each durable step and never repeats the leas
       return value;
     };
     await assert.rejects(returnAttempt(f.db, f.returns, f.services), /crash/);
-    const reopened = await Database.open(f.path, f.options); t.after(() => reopened.close());
+    const reopened = await Database.open(f.path, f.options); defer(t, () => reopened.close());
     await returnAttempt(reopened, f.returns, f.services);
     await returnAttempt(reopened, f.returns, f.services);
     assert.equal(reopened.attempt(f.a.id).leaseState, 'returned');
@@ -682,7 +683,7 @@ test('R09: interrupted rebase resumes durable steps and never replays a successf
       return request;
     };
     await assert.rejects(rebaseAttempt(f.db, f.input, f.services), /Lost durable response/);
-    const reopened = await Database.open(f.path, f.options); t.after(() => reopened.close());
+    const reopened = await Database.open(f.path, f.options); defer(t, () => reopened.close());
     await planAttemptRebase(reopened, f.input, f.services);
     await rebaseAttempt(reopened, f.input, f.services);
     assert.equal(reopened.attempt(f.a.id).candidate!.commit, f.rebased);

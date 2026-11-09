@@ -37,6 +37,10 @@ test('R16/A35: timeout and spawn failure never pass; a signal-killed command rem
   assert.equal(missing.status, 'not_run'); assert.equal(missing.exitCode, null);
   const signal = await run(check("process.kill(process.pid, 'SIGKILL')"), root);
   assert.equal(signal.status, 'uncertain'); assert.equal(signal.exitCode, null);
+  const failure = await run(check('process.exit(1)'), root);
+  assert.equal(failure.status, process.platform === 'win32' ? 'uncertain' : 'failed');
+  assert.equal(failure.exitCode, process.platform === 'win32' ? null : 1);
+  if (process.platform === 'win32') assert.equal(failure.observedExitCode, 1);
 });
 
 test('R15: Git reads exact target content without checkout; worker changes cannot relax it; absence differs from malformed', async t => {

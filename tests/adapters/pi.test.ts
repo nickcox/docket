@@ -1,4 +1,6 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -43,7 +45,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
     },
   });
   let reference: WorkerReference | undefined;
-  t.after(async () => { if (reference) await launcher.stop(reference, 'cleanup'); await rm(root, { recursive: true, force: true }); });
+  defer(t, async () => { if (reference) await launcher.stop(reference, 'cleanup'); await rm(root, { recursive: true, force: true }); });
   const prepared = await launcher.prepare(binding, 'prepare');
   if (prepared.status === 'confirmed') reference = prepared.value;
   else if (prepared.status === 'uncertain' && prepared.referenceHints) reference = prepared.referenceHints as WorkerReference;
@@ -92,7 +94,7 @@ test('R31/R35: concurrent preparation cannot spawn a second child for the same e
   const binding = { ...f.binding, sessionId: randomUUID() };
   const replies = await Promise.all([1, 2].map(() => f.launcher.prepare(binding, 'concurrent-prepare')));
   for (const reply of replies) if (reply.status === 'confirmed') {
-    t.after(async () => { await f.launcher.stop(reply.value, 'cleanup-concurrent'); });
+    defer(t, async () => { await f.launcher.stop(reply.value, 'cleanup-concurrent'); });
   }
   assert.equal(replies.filter(reply => reply.status === 'confirmed').length, 1);
   assert.equal((await f.launcher.prepare(binding, 'another-effect')).status, 'uncertain');
@@ -160,12 +162,34 @@ test('R31/R33/R35: exact cwd/provider/model, controlled resources and environmen
   for (const flag of ['--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-approve']) assert.ok(spawn.args.includes(flag));
   // CoreFoundation can add this variable inside the child on macOS; it is not inherited by the launcher.
   const environmentKeys = Object.keys(spawn.environment).filter(key => process.platform !== 'darwin' || key !== '__CF_USER_TEXT_ENCODING');
+  const windowsSystem = process.platform === 'win32'
+    ? ['LOGONSERVER', 'SYSTEMDRIVE', 'SYSTEMROOT', 'USERDOMAIN', 'USERNAME', 'WINDIR'].filter(key => process.env[key] !== undefined) : [];
+  const windowsPrivate = process.platform === 'win32' ? ['USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP'] : [];
   assert.deepEqual(environmentKeys.sort(), ['PATH', 'HOME', 'TMPDIR', 'LANG', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY',
-    'PROVIDER_KEY', 'PEER_RECORD', 'PEER_MODE', 'EXTRA_APPROVED'].sort());
+    'PROVIDER_KEY', 'PEER_RECORD', 'PEER_MODE', 'EXTRA_APPROVED', ...windowsSystem, ...windowsPrivate].sort());
+  for (const key of windowsSystem) assert.equal(spawn.environment[key], process.env[key]);
+  if (process.platform === 'win32') {
+    assert.equal(spawn.environment.USERPROFILE, spawn.environment.HOME);
+    assert.equal(spawn.environment.HOMEDRIVE + spawn.environment.HOMEPATH, spawn.environment.HOME);
+    assert.equal(spawn.environment.TEMP, spawn.environment.TMPDIR);
+    assert.ok(spawn.environment.TEMP.startsWith(join(f.root, 'state')));
+  }
   assert.equal(spawn.environment.PROVIDER_KEY, 'synthetic-secret');
   assert.notEqual(spawn.environment.HOME, f.root);
   assert.ok(spawn.environment.HOME.startsWith(join(f.root, 'state')));
-  assert.equal((await stat(spawn.environment.HOME)).mode & 0o077, 0);
+  if (process.platform === 'win32') {
+    const acl = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ' +
+      '$rules = @((Get-Acl -LiteralPath $env:PRIVATE_HOME).Access | ForEach-Object { ' +
+      '@{ sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; ' +
+      'allow = ($_.AccessControlType -eq "Allow"); full = (($_.FileSystemRights -band 2032127) -eq 2032127) } }); ' +
+      '@{ owner = $sid; rules = $rules } | ConvertTo-Json -Depth 4'],
+    { env: { ...process.env, PRIVATE_HOME: spawn.environment.HOME }, encoding: 'utf8' }));
+    assert.ok(acl.rules.length > 0);
+    for (const rule of acl.rules) assert.deepEqual(rule, { sid: acl.owner, allow: true, full: true });
+  } else {
+    assert.equal((await stat(spawn.environment.HOME)).mode & 0o077, 0);
+  }
   assert.throws(() => new PiLauncher({ stateDirectory: f.root, profiles: { bad: { executable: process.execPath,
     credentialVariable: 'PROVIDER_KEY', passEnvironment: ['DOCKET_ANYTHING'] } }, admit: async () => true }), /environment/);
 });
@@ -303,7 +327,7 @@ test('R35: optional real Pi prepares without a model request and fences by direc
       ...(process.env.DOCKET_TEST_PI_CREDENTIAL_VARIABLE ? { credentialVariable: process.env.DOCKET_TEST_PI_CREDENTIAL_VARIABLE } : {}), passEnvironment: [] } },
     admit: async () => false });
   let reference: WorkerReference | undefined;
-  t.after(async () => { if (reference) await launcher.stop(reference, 'cleanup'); await rm(root, { recursive: true, force: true }); });
+  defer(t, async () => { if (reference) await launcher.stop(reference, 'cleanup'); await rm(root, { recursive: true, force: true }); });
   const prepared = await launcher.prepare({ databaseId: randomUUID(), contextId: 'probe', taskId: 'probe', attemptId: randomUUID(),
     resultPath: join(root, 'attempt', 'result.json'), sessionId: randomUUID(), profileDigest: 'probe', owner: { claimId: randomUUID(), generation: 'probe' },
     specification: { resultPath: join(root, 'attempt', 'result.json'), profile: { launcher: 'pi', provider, model, reasoning: null, executionProfile: 'real' },

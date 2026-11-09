@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,13 +14,13 @@ const conflict = (error: unknown) => error instanceof StorageError && error.code
 
 async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-tasks-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [] }, retryMs: 1000 };
   const db = await Database.initialise(path, { contextId: 'tasks', repository: { identity: 'example' },
     stateDirectory: root, createdBy: person,
     configuration: { revision: 1, resolved: { profiles: { worker: {}, other: {} } }, digest: 'test', provenance: {} } }, options);
-  t.after(async () => db.close());
+  defer(t, () => db.close());
   return { db, path, options };
 }
 

@@ -36,7 +36,7 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', timeout: 5000 });
     assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
   };
-  git('init', '-q', '-b', 'main'); git('config', 'user.name', 'Tests'); git('config', 'user.email', 'test@example.invalid');
+  git('init', '-q', '-b', 'main'); git('config', 'core.autocrlf', 'false'); git('config', 'user.name', 'Tests'); git('config', 'user.email', 'test@example.invalid');
   await writeFile(join(repo, 'README'), 'Base\n'); git('add', '.'); git('commit', '-qm', 'Base');
   const config = configuration(home); config.repository = repo;
   config.profiles.worker.launcher = 'pi'; config.profiles.worker.executionProfile = 'pi-test'; config.profiles.worker.runMs = 10000;
@@ -385,7 +385,7 @@ test('A16/A49/R30: stale claim and uncertain effect block dispatch until scoped 
   const f = await fixture(t);
   f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
   const options = { readOnly: false, location: { retainedRoot: f.config.stateDirectory, recyclableRoots: [f.config.workspace.poolRoot] } };
-  const db = await Database.open(f.config.databasePath, options);
+  using db = await Database.open(f.config.databasePath, options);
   const person = { kind: 'person' as const, id: String(userInfo().uid) };
   const [claim] = await db.registerClaims([{ resourceKey: 'owner', role: 'maintenance', generation: 'test-generation', ownerRef: person,
     schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
