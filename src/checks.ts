@@ -35,7 +35,16 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
   if (!admission.execute) return admission.request;
   const commands: JsonObject[] = [];
   let status: 'passed' | 'failed' | 'uncertain' = 'passed';
+  let heartbeat: Promise<void> | undefined, heartbeatFailed = false;
+  const timer = setInterval(() => {
+    if (heartbeat || heartbeatFailed) return;
+    heartbeat = db.refreshClaim(admission.executor!, new Date().toISOString(), caller).then(() => {}, () => {
+      heartbeatFailed = true;
+      clearInterval(timer);
+    }).finally(() => { heartbeat = undefined; });
+  }, 5000);
   const clean = async (): Promise<boolean> => {
+    if (heartbeatFailed) throw new Error('Check executor heartbeat failed');
     const state = await repository.inspectWorkspace(workspace, true, profile.ignoredGeneratedPaths ?? []);
     return state.status === 'confirmed' && state.value.head === commit && state.value.clean;
   };
@@ -59,6 +68,7 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
             continue;
           }
           const result = await run(check, workspace);
+          if (result.status === 'uncertain') clearInterval(timer);
           const unchanged = await clean();
           const commandStatus = result.status === 'uncertain' ? 'uncertain'
             : !unchanged || result.timedOut || (result.status === 'passed' && result.exitCode !== 0) ? 'failed' : result.status;
@@ -72,7 +82,12 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
   } catch {
     // A thrown adapter call cannot establish that a started process is no longer running.
     status = 'uncertain'; commands.push({ status: 'uncertain', reason: 'Check owner or workspace observation interrupted' });
+  } finally {
+    clearInterval(timer);
+    // Drain any write before recording the result, including an uncertain one.
+    await heartbeat;
   }
+  if (heartbeatFailed) status = 'uncertain';
   return db.finishChecks(admission.request.id, admission.executor!, { status,
     evidenceKey: String(admission.request.input.evidenceKey), commands });
 }

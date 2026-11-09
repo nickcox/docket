@@ -2,6 +2,8 @@ import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
+import { setImmediate } from 'node:timers/promises';
+import { heartbeatStatus } from '../../src/storage/claims.ts';
 import { confirmed, uncertain } from '../../src/adapters/command.ts';
 import type { CheckCommandResult } from '../../src/adapters/checks.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
@@ -189,6 +191,72 @@ test('R16: two database connections admit only one full run, show waiting and ad
   assert.equal(maximum, 1); assert.deepEqual(fake.calls, ['fast', 'full', 'fast', 'full']);
 });
 
+test('R08/R16/A35: long commands refresh their check claim every five seconds and stop on every outcome', async t => {
+  for (const ending of ['passed', 'failed', 'uncertain', 'throw'] as const) {
+    const f = await checkFixture(t), a = await f.attempt('one'), fake = fakeServices();
+    t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+    const pulses: { heartbeatAt: string; now: number }[] = [];
+    let reservations = 0;
+    fake.services.run = async check => {
+      fake.calls.push(check.name);
+      for (let pulse = 0; pulse < 9; pulse++) {
+        t.mock.timers.tick(5000);
+        await setImmediate();
+        const claim = f.db.claims().find(claim => claim.role === 'check_executor')!;
+        pulses.push({ heartbeatAt: claim.heartbeatAt, now: Date.now() });
+        // Keep the fixture's other owners fresh, as the dispatch loop does.
+        for (const owner of f.db.claims().filter(value => value.role !== 'check_executor' && !value.releasedAt)) {
+          await f.db.refreshClaim({ claimId: owner.id, generation: owner.generation }, new Date().toISOString(), person);
+        }
+      }
+      // Reservation uses the same unresolved-claim guard as a parallel dispatch.
+      if (check.name === 'fast') {
+        await f.db.addTask({ id: 'parallel', title: 'Parallel' }, person);
+        await f.db.reserveAttempt({ requestKey: 'parallel', taskId: 'parallel', caller: person, startingCommit: start,
+          checks: parseCheckPolicy(start, policyContent, contextChecks),
+          delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+        reservations++;
+      }
+      if (ending === 'throw') throw new Error('Interrupted owner');
+      return { ...passed, status: ending, exitCode: ending === 'passed' ? 0 : ending === 'failed' ? 1 : null };
+    };
+    const result = await runCandidateChecks(f.db, a.id, person, fake.services);
+    assert.equal(result.state, ending === 'passed' ? 'succeeded' : ending === 'failed' ? 'rejected' : 'uncertain');
+    assert.deepEqual(fake.calls, ending === 'passed' ? ['fast', 'full'] : ['fast']);
+    assert.equal(reservations, 1);
+    assert.equal(pulses.length, ending === 'passed' ? 18 : 9);
+    for (const pulse of pulses) {
+      assert.equal(pulse.heartbeatAt, new Date(pulse.now).toISOString());
+      assert.equal(heartbeatStatus(pulse.heartbeatAt, pulse.now), 'fresh');
+    }
+    const claim = f.db.claims().find(claim => claim.role === 'check_executor')!;
+    t.mock.timers.tick(35000);
+    await setImmediate();
+    assert.deepEqual(f.db.claims().find(value => value.id === claim.id), claim);
+    assert.equal(heartbeatStatus(claim.heartbeatAt, Date.now()), 'stale');
+    assert.equal(claim.releasedAt === null, result.state === 'uncertain');
+    t.mock.timers.reset();
+  }
+});
+
+test('R08/R16/A35: a failed heartbeat stops refreshing and prevents later check commands', async t => {
+  const f = await checkFixture(t), a = await f.attempt('one'), fake = fakeServices();
+  t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+  const refresh = t.mock.method(f.db, 'refreshClaim', async () => { throw new Error('Lost storage'); });
+  fake.services.run = async check => {
+    fake.calls.push(check.name);
+    t.mock.timers.tick(5000);
+    await setImmediate();
+    return passed;
+  };
+  assert.equal((await runCandidateChecks(f.db, a.id, person, fake.services)).state, 'uncertain');
+  assert.deepEqual(fake.calls, ['fast']);
+  t.mock.timers.tick(35000);
+  await setImmediate();
+  assert.equal(refresh.mock.callCount(), 1);
+  assert.equal(f.db.claims().find(claim => claim.role === 'check_executor')!.releasedAt, null);
+});
+
 test('R16: killing a separate executor process preserves its durable request and check slot', async t => {
   const f = await checkFixture(t), a = await f.attempt('one'), b = await f.attempt('two', ['Other criterion']);
   const databaseModule = new URL('../../src/storage/database.ts', import.meta.url).href;
@@ -202,6 +270,12 @@ test('R16: killing a separate executor process preserves its durable request and
   const admission = JSON.parse(killed.stdout);
   assert.equal(admission.execute, true);
   assert.equal(f.db.request(admission.request.id).state, 'claimed');
+  const claim = f.db.claims().find(value => value.role === 'check_executor')!;
+  t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+  t.mock.timers.tick(35000);
+  await setImmediate();
+  assert.deepEqual(f.db.claims().find(value => value.id === claim.id), claim);
+  assert.equal(heartbeatStatus(claim.heartbeatAt, Date.now()), 'stale');
   const fake = fakeServices();
   assert.equal((await runCandidateChecks(f.db, b.id, person, fake.services)).state, 'pending');
   assert.deepEqual(fake.calls, []);
