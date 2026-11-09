@@ -117,6 +117,7 @@ The operation-specific schema for ordinary task.add restricts kind to code/repor
 | task.done / task.reopen | taskId:Id, note:Text\|null | Scoped judgement; does not invent accepted evidence |
 | attempt.dispatch | taskId:Id\|null, profile:String\|null, dryRun:boolean | Person/supervisor; null task selects first ready, null profile uses resolved default |
 | attempt.continue | sourceAttemptId:UUID, profile:String\|null, note:Text\|null, dryRun:boolean | Person/supervisor; separate from fresh dispatch |
+| profile.clear | profile:String, dryRun:boolean | Person; clear a profile limited after a provider_limit failure, once the provider's limit has reset |
 | attempt.show | attemptId:UUID | Scoped full detail |
 | attempt.review | attemptId:UUID, dryRun:boolean | Person/supervisor; create exact-target review task |
 | attempt.rebase | attemptId:UUID, dryRun:boolean | Person/supervisor with rebase permission; no acceptance |
@@ -172,6 +173,7 @@ schema_mismatch migration_waiting storage_busy not_ready task_changed
 capacity attempt_limit existing_request request_input_mismatch
 outside_objective permission_denied person_required creator_required
 capability_missing owner_unknown owner_read_retryable owner_unresolved
+worker_failed provider_limited
 effect_uncertain claim_unresolved launch_fenced
 result_invalid result_identity_mismatch result_discrepancy
 candidate_missing candidate_moved not_retained workspace_dirty

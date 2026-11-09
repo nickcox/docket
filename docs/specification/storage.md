@@ -59,6 +59,7 @@ All payloads are strictly validated when read. Unknown fields refuse at public/a
 | review.recorded | source and review attempt IDs, candidate/criteria identity, verdict, complete criterion findings |
 | checks.completed | evidence key, the attempt and its allocation, commands/profile/policy identity, exact commit, statuses, durations and bounded diagnostic references |
 | session.registered | session ID, worker/supervisor kind, objective fixed at registration, worker reference, restriction/capabilities |
+| profile.limited / profile.cleared | profile name, the attempt and failure kind, bounded redacted message and time; for cleared, the person and the limited event cleared |
 | usage.observed | session, source sequence, high-water values and availability/currency per metric |
 | question.created / question.invalid / question.answered | Stable question ID, scope/recipient or answer, immutable content and source identity |
 | supervisor.* | Session state, error/reason, related notification IDs; explicit resumed/retrying/stopped facts where supported |
