@@ -27,13 +27,14 @@ const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', 
 function outputSchema(name: string): JsonSchema {
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
+  if (name === 'profile.clear') return object({ profile: string, steps });
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
   if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision'],
     properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'effects'].map(key => [key, {}])), additionalProperties: false };
   if (name === 'status.show') return object({ contextId: string, databaseId: string, configurationRevision: { type: 'integer' }, migrationState: string,
-    capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
+    limitedProfiles: { type: 'array', items: view }, capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
     blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
   const variants: JsonSchema[] = [object({ steps })];
   if (name === 'attempt.dispatch') {
@@ -56,6 +57,7 @@ function operation(name: string, description: string, properties: Record<string,
 }
 export const coreOperations: OperationDefinition[] = [
   operation('context.configure', 'Validate and apply the selected configuration while quiescent.', { dryRun: bool }, true, ['person']),
+  operation('profile.clear', 'Clear a limited profile after its provider limit resets.', { profile: string, dryRun: bool }, true, ['person']),
   operation('status.show', 'Read context status, capacity and unresolved owners.', { attentionOnly: bool, page }, false),
   operation('task.add', 'Add a task at the end of the queue.', { id: nullable(id), definition: definition(false), objectiveId: nullable(id) }),
   operation('task.show', 'Read a task and its readiness.', { taskId: id }, false),

@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { CommandFailure } from '../response.ts';
+import type { TurnFailure } from '../adapters/launcher.ts';
 import { canonicalJson } from '../configuration.ts';
 import { readFileSync } from 'node:fs';
 import { lstat, open, realpath, statfs, unlink } from 'node:fs/promises';
@@ -709,11 +711,18 @@ export class Database {
         const config = resolveReservationConfig(configEvent.payload, problem ? { ...task, profile: null } : task, value.profile);
         if ((value.expectedConfigRevision !== undefined && value.expectedConfigRevision !== config.revision) ||
           (value.expectedConfigDigest !== undefined && value.expectedConfigDigest !== config.digest)) throw new StorageError('conflict', 'Configuration changed');
+        const limited = this.limitedProfiles().find(item => item.profile === config.profileName);
+        if (limited) {
+          if (value.taskId !== undefined || value.profile !== undefined) throw new CommandFailure('provider_limited', { ...limited, configuredProfiles: Object.keys(resolved.profiles as JsonObject).filter(name => name !== config.profileName) },
+            { operation: 'profile.clear', args: { profile: config.profileName, dryRun: true }, description: 'After the provider limit resets, ask a person to clear the profile.' });
+          skippedTasks.push({ taskId: task.id, reason: `Profile ${config.profileName} is provider_limited: ${limited.message}` });
+          continue;
+        }
         const unavailable = task.state !== 'queued' || task.holdReason !== null ||
           this.db.prepare(`SELECT 1 FROM dependencies JOIN tasks AS blocker ON blocker.id = blocker_id
             WHERE task_id = ? AND blocker.state <> 'done' LIMIT 1`).get(task.id) ||
           this.db.prepare("SELECT 1 FROM attempts WHERE task_id = ? AND (execution_open = 1 OR lease_state IN ('held', 'unknown')) LIMIT 1").get(task.id) ||
-          Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE task_id = ?').get(task.id)!.count) >= config.maxAttemptsPerTask;
+          Number(this.db.prepare("SELECT count(*) AS count FROM attempts WHERE task_id = ? AND id NOT IN (SELECT attempt_id FROM events WHERE kind = 'profile.limited')").get(task.id)!.count) >= config.maxAttemptsPerTask;
         if (unavailable || task.objectiveId !== null) {
           if (value.taskId !== undefined) throw new StorageError('conflict', task.objectiveId !== null ? 'Objective-linked tasks are not supported' : 'Task is not eligible for reservation');
           continue;
@@ -1180,6 +1189,48 @@ export class Database {
         kind: 'worker.observed', payloadVersion: 1, correlationId: value.attemptId, actor,
         occurredAt: value.observedAt, attemptId: value.attemptId, taskId: String(attempt.task_id), payload: value });
       return this.decodeAttempt(attempt);
+    });
+  }
+
+  limitedProfiles(): { profile: string; time: string; message: string; eventId: string }[] {
+    const active = new Map<string, { profile: string; time: string; message: string; eventId: string }>();
+    for (const event of this.db.prepare("SELECT * FROM events WHERE kind IN ('profile.limited', 'profile.cleared') ORDER BY seq").all().map(row => this.decodeEvent(row))) {
+      const profile = String(event.payload.profile);
+      if (event.kind === 'profile.limited') active.set(profile, { profile, time: event.occurredAt, message: String(event.payload.message), eventId: event.id });
+      if (event.kind === 'profile.cleared') active.delete(profile);
+    }
+    return [...active.values()];
+  }
+
+  async clearProfile(profile: string, caller: TaskActor, dryRun: boolean) {
+    taskActor(caller);
+    if (caller.kind !== 'person') throw new CommandFailure('person_required');
+    const build = () => {
+      requireProfile(this.decodeEvent(this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get()!).payload.resolved as JsonObject, profile);
+      const limited = this.limitedProfiles().find(item => item.profile === profile);
+      if (limited && !dryRun) {
+        const source = this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE id = ?').get(limited.eventId)!);
+        this.storageEvent('profile.cleared', caller, { profile, attemptId: source.attemptId!, failureKind: source.payload.failureKind!,
+          message: limited.message, limitedEventId: limited.eventId, person: caller, time: new Date().toISOString() });
+      }
+      return { profile, steps: limited ? [{ operation: 'profile.clear', target: profile, requires: ['person'], conditional: false }] : [] };
+    };
+    return dryRun ? this.snapshot(build) : this.write(build);
+  }
+
+  async failWorkerTurn(attemptId: string, host: WorkerHost, failure: TurnFailure): Promise<Attempt> {
+    return this.write(() => {
+      const attempt = this.attemptRow(attemptId), taskId = String(attempt.task_id);
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
+      if (attempt.outcome !== null) return this.decodeAttempt(attempt);
+      if (!this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'").get(attemptId)) throw new StorageError('conflict', 'Terminal evidence required');
+      const spec = JSON.parse(String(attempt.specification)) as JsonObject;
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE attempts SET outcome = 'failed', phase = 'settled', execution_open = 0, settled_at = ?, revision = revision + 1 WHERE id = ?").run(now, attemptId);
+      this.db.prepare("UPDATE tasks SET state = 'queued', hold_reason = 'worker_failed' WHERE id = ? AND decision_revision = ?").run(taskId, Number(attempt.started_decision_revision));
+      this.launchEvent(attemptId, taskId, host, 'attempt.completed', { outcome: 'failed', failureKind: failure.kind, message: failure.message, candidate: null });
+      if (failure.kind === 'provider_limit') this.launchEvent(attemptId, taskId, host, 'profile.limited', { profile: spec.profileName!, attemptId, failureKind: failure.kind, message: failure.message, time: now });
+      return this.decodeAttempt(this.attemptRow(attemptId));
     });
   }
 

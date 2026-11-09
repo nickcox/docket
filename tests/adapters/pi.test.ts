@@ -83,6 +83,27 @@ test('R31/R35/A14: prepare is non-acting; only matching committed admission send
   assert.equal((await f.records()).filter(r => r.kind === 'spawn').length, 1);
 });
 
+for (const [mode, kind] of [['usage-limit', 'provider_limit'], ['model-error', 'model_error']]) {
+  test(`A61: ${mode} is a known failed turn, not transport uncertainty`, async t => {
+    const f = await fixture(t, mode); f.permit();
+    assert.equal((await f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation')).status, 'confirmed');
+    await f.launcher.usage(f.reference);
+    const observed = await f.launcher.inspect(f.reference);
+    assert.equal(observed.status, 'known');
+    if (observed.status === 'known') {
+      assert.equal(observed.turn, 'ended'); assert.equal(observed.terminal, false);
+      assert.equal(observed.turnFailure?.kind, kind);
+      assert.ok(observed.turnFailure!.message.length <= 4096);
+      if (mode === 'usage-limit') assert.equal(observed.turnFailure?.message, 'Codex error: The usage limit has been reached');
+      else assert.equal(observed.turnFailure?.message, 'Model unavailable: api_key=[redacted]');
+    }
+    assert.equal((await f.launcher.fence(f.reference, 'fence')).status, 'confirmed');
+    const terminal = await f.launcher.inspect(f.reference);
+    assert.equal(terminal.status, 'known');
+    if (terminal.status === 'known') { assert.equal(terminal.terminal, true); assert.equal(terminal.turnFailure?.kind, kind); }
+  });
+}
+
 test('R31/R35: concurrent activation consumes only one prompt attempt', async t => {
   const f = await fixture(t); f.permit();
   const replies = await Promise.all([1, 2].map(() => f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation')));

@@ -7,6 +7,8 @@ import type { JsonObject } from '../storage/database.ts';
 import type { WorkerReference } from '../storage/launch.ts';
 import { commandRunner, confirmed, rejected, uncertain, type Result } from './command.ts';
 import type { Launcher, LauncherCapabilities, MessageMode, Usage, WorkerBinding, WorkerObservation } from './launcher.ts';
+import { redactDiagnostics } from './checks.ts';
+import type { TurnFailure } from './launcher.ts';
 import { PiRpc, PiRpcRejection, type RpcRecord } from './pi-rpc.ts';
 
 /** Person-controlled host configuration, not task/model input. Values are credential references only. */
@@ -33,7 +35,7 @@ export interface PiLauncherOptions {
 type Worker = {
   reference: WorkerReference; binding: WorkerBinding; rpc: PiRpc; directory: string; resultPath: string;
   sequence: number; turn: 'idle' | 'running' | 'ended'; attempted: boolean; prepared: boolean;
-  fenced: boolean; usage?: Usage;
+  fenced: boolean; usage?: Usage; turnFailure?: TurnFailure;
 };
 const capabilities: LauncherCapabilities = {
   preparation: 'non_acting', admission: true, activeSteering: false, afterTurnMessage: false,
@@ -203,6 +205,7 @@ export class PiLauncher implements Launcher {
       worker: worker.rpc.exit ? 'stopped' : worker.attempted ? 'active' : 'prepared', turn: worker.turn,
       terminal: worker.rpc.exit !== undefined, capabilities: this.capabilities(worker.binding.specification.profile as JsonObject),
       ...(worker.rpc.exit ? { exit: structuredClone(worker.rpc.exit) } : {}),
+      ...(worker.turnFailure ? { turnFailure: structuredClone(worker.turnFailure) } : {}),
       ...(this.failed(worker) ? { failure: 'Pi protocol, model turn or child failed' } : {}) };
   }
   async deliver(_reference: WorkerReference, _message: string, _mode: MessageMode, _effectId: string): Promise<Result<JsonObject>> {
@@ -261,7 +264,7 @@ export class PiLauncher implements Launcher {
     } catch { return uncertain('Pi result file is unavailable', reference); }
   }
   private failed(worker: Worker): boolean {
-    return worker.rpc.failure !== undefined || (worker.rpc.exit !== undefined
+    return worker.turnFailure !== undefined || worker.rpc.failure !== undefined || (worker.rpc.exit !== undefined
       && worker.rpc.exit.code !== 0 && !(worker.fenced && worker.rpc.exit.signal !== null));
   }
   private get requestMs(): number { return this.options.requestMs ?? 5000; }
@@ -289,7 +292,17 @@ export class PiLauncher implements Launcher {
     }
     if (record.type === 'message_end' && object(record.message) && record.message.role === 'assistant'
       && ['error', 'aborted'].includes(String(record.message.stopReason))) {
-      worker.rpc.fail(new Error('Pi model turn failed')); return;
+      if (!worker.attempted || typeof record.message.errorMessage !== 'string') {
+        worker.rpc.fail(new Error('Invalid Pi failed turn')); return;
+      }
+      const message = record.message.errorMessage;
+      const profile = worker.binding.specification.profile as JsonObject;
+      const execution = this.options.profiles[String(profile.executionProfile)]!;
+      const secrets = [execution.credentialVariable, ...execution.passEnvironment]
+        .flatMap(name => name && this.options.environment![name] ? [this.options.environment![name]!] : []);
+      worker.turnFailure = { kind: /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|usage limit (?:has been )?reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|usage[- ]limit|quota|balance/i.test(message)
+        ? 'provider_limit' : 'model_error', message: redactDiagnostics(message, secrets).slice(0, 4096) };
+      worker.turn = 'ended'; return;
     }
     if (record.type === 'agent_end' || record.type === 'agent_settled') {
       if (!worker.attempted) { worker.rpc.fail(new Error('Pi ended an unadmitted turn')); return; }

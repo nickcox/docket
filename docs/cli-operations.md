@@ -53,6 +53,10 @@ Create a person-controlled `~/.config/docket/execution-profiles.json`, not writa
 
 The context worker profile selects `launcher:"pi"` and `executionProfile:"pi-worker-v1"`. Its check configuration selects the check profile ID. For an approved RPC executable, use `executable` with an optional absolute `entrypoint` instead of `sdkModule` and `agentFiles`. Credential references belong only in these host settings, not task records.
 
+A failed model turn is fenced and settled immediately without a result file. Dispatch refuses with `worker_failed`, naming the attempt, profile, failure kind (`provider_limit` or `model_error`) and bounded, redacted message. Clean leases return automatically; unsafe returns stay held. Broken launcher connections remain `owner_unknown`.
+
+A `provider_limit` failure limits the profile until a person runs `profile clear` with `{"profile":"worker","dryRun":false}` after the provider limit resets. Use `dryRun:true` to plan without changing the limit. Named and default dispatch refuse with `provider_limited` before reservation; automatic dispatch skips and reports tasks using limited profiles. Status lists limited profiles with their failure time, message and next action. Provider-limit attempts do not count towards the per-task attempt limit.
+
 Plan dispatch with `{"taskId":"notes","profile":null,"dryRun":true}`. Change only `dryRun` to false to execute. Dispatch reserves, acquires, starts, prepares, binds, permits and activates one worker, waits for its turn, fences it and observes direct-child exit, validates its result, records completion and runs the trusted checks. It does not accept output. After recording a held or failed outcome it checks whether the lease can be returned automatically. A replay inspects progress and never launches another worker.
 
 ## Acceptance and return

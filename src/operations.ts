@@ -85,6 +85,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   try {
     const id = String(args.taskId);
     switch (operation.name) {
+      case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
       case 'status.show': {
         const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!));
         const action = (operation: string, args: Record<string, unknown>, description: string) => ({ operation, args, description });
@@ -138,6 +139,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         const section = (kind: string) => page.items.filter(entry => entry.kind === kind).map(entry => entry.value);
         return { contextId: context.configuration.resolved.contextId, databaseId: context.databaseId,
           configurationRevision: context.configuration.revision, migrationState: 'current',
+          limitedProfiles: db.limitedProfiles().map(item => ({ ...item, nextAction: action('profile.clear', { profile: item.profile, dryRun: true }, 'After the provider limit resets, ask a person to clear the profile.') })),
           capacity: { used: attempts.filter(a => a.executionOpen).length, limit: (context.configuration.resolved.limits as JsonObject).maxAttempts },
           tasks: { items: section('task'), next: page.next, total: tasks.length },
           attempts: { items: section('attempt'), next: page.next, total: attentionAttempts.length },

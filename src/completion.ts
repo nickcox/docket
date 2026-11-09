@@ -49,6 +49,14 @@ export async function retainedOutput(db: Database, attemptId: string, services: 
   if (attempt.allocation && attempt.leaseState !== 'returned'
     && known(await services.repository.identity(attempt.allocation.path)) !== repository) refuse('Allocation belongs to a different repository');
   const recorded = db.validatedWorkerResult(attemptId);
+  if (!recorded && db.events().some(e => e.attemptId === attemptId && e.kind === 'attempt.completed' && ['provider_limit', 'model_error'].includes(String(e.payload.failureKind)))) {
+    const ref = String(attempt.specification.outputRef);
+    const output = known(await services.repository.inspectRef(ref));
+    if (output.state !== 'present') refuse('Failed worker output reference is missing');
+    const retention: RetentionRequest = { references: [{ ref, commit: (output as { commit: string }).commit }], artefacts: [], recyclableRoots: binding.recyclableRoots };
+    known(await services.repository.verifyRetention(retention));
+    return retention;
+  }
   if (!recorded) refuse('Validated retained output is required');
   const current = await readWorkerResult(binding);
   if (recorded!.digest !== current.digest || canonicalJson(recorded!.artefacts) !== canonicalJson(current.artefacts)) refuse('Validated output changed');

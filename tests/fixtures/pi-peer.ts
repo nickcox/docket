@@ -51,9 +51,14 @@ function receive(line: string) {
     active = true;
     emit({ type: 'agent_start' });
     if (mode !== 'lost-ack') respond({ disposition: 'started' });
-    if (mode === 'model-error') {
-      // As when the provider refuses, for example at a usage limit: the turn fails and the child stays alive.
-      emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'The usage limit has been reached' } });
+    if (mode === 'lost-connection') {
+      setTimeout(() => process.stdout.write('{bad json}\n'), 50);
+      return;
+    }
+    if (mode === 'model-error' || mode === 'usage-limit') {
+      // Failed model turns leave the child alive until Docket fences it.
+      emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', usage: { totalTokens: 0 },
+        errorMessage: mode === 'usage-limit' ? 'Codex error: The usage limit has been reached' : 'Model unavailable: api_key=synthetic-secret' } });
       return;
     }
     if (mode === 'invalid-result') {

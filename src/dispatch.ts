@@ -5,6 +5,7 @@ import { Database, applicationId, schemaVersion } from './storage/database.ts';
 import type { JsonObject } from './storage/database.ts';
 import type { ReservationInput, Allocation } from './storage/reservations.ts';
 import type { TaskActor } from './storage/tasks.ts';
+import type { TurnFailure } from './adapters/launcher.ts';
 import type { Runtime } from './runtime.ts';
 import { prepareWorker, activateWorker } from './workers.ts';
 import type { WorkerHost, WorkerReference } from './storage/launch.ts';
@@ -129,9 +130,11 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     progress('worker.wait');
     const deadline = Date.now() + Number(profile.runMs);
     let refreshed = Date.now();
+    let turnFailure: TurnFailure | undefined;
     while (true) {
       const observation = await runtime.launcher.inspect(reference);
       if (observation.status !== 'known') throw new CommandFailure('owner_unknown', { attemptId: id });
+      turnFailure = observation.turnFailure;
       if (observation.terminal) { terminal = true; break; }
       if (observation.turn === 'ended' || Date.now() >= deadline || stopRequested) break;
       if (Date.now() - refreshed >= 5000) { await refresh(); refreshed = Date.now(); }
@@ -146,6 +149,13 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
       payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
     progress('attempt.complete');
+    if (turnFailure) {
+      await db.failWorkerTurn(id, host, turnFailure);
+      const leaseReturn = await automaticReturn(db, id, caller, runtime.completion);
+      throw new CommandFailure('worker_failed', { attemptId: id, profile: reservation.attempt.specification.profileName,
+        failureKind: turnFailure.kind, message: turnFailure.message, leaseReturn: { state: leaseReturn.state, reason: leaseReturn.reason } },
+        { operation: 'attempt.show', args: { attemptId: id }, description: 'Inspect the failure before retrying; a person must clear a limited profile after its provider limit resets.' });
+    }
     await withHeartbeat(db.completeWorker(id, host, runtime.repository));
     if (db.attempt(id).candidate) {
       progress('checks.run');

@@ -83,6 +83,34 @@ function permutations<T>(values: T[]): T[][] {
   return values.length ? values.flatMap((value, index) => permutations(values.filter((_, i) => i !== index)).map(rest => [value, ...rest])) : [[]];
 }
 
+test('A61: model failures settle without a result; limits and person-only clearing are durable and dry runs do not write', async t => {
+  for (const kind of ['provider_limit', 'model_error'] as const) {
+    const f = await fixture(t);
+    await assert.rejects(f.db.failWorkerTurn(f.attemptId, host, { kind, message: 'Failure' }), /Terminal evidence/);
+    await f.db.recordWorkerObservation(f.observation('terminal'), host);
+    const failed = await f.db.failWorkerTurn(f.attemptId, host, { kind, message: 'Failure' });
+    assert.equal(failed.outcome, 'failed'); assert.equal(failed.executionOpen, false);
+    assert.equal(f.db.validatedWorkerResult(f.attemptId), null);
+    const completed = f.db.events().find(e => e.kind === 'attempt.completed')!;
+    assert.equal(completed.payload.failureKind, kind); assert.equal(completed.payload.message, 'Failure');
+    await f.db.failWorkerTurn(f.attemptId, host, { kind, message: 'Duplicate' });
+    assert.equal(f.db.events().filter(e => e.kind === 'attempt.completed').length, 1);
+    if (kind === 'model_error') { assert.deepEqual(f.db.limitedProfiles(), []); continue; }
+    const limited = f.db.events().find(e => e.kind === 'profile.limited')!;
+    assert.equal(limited.seq, completed.seq + 1);
+    assert.equal(f.db.limitedProfiles()[0]!.profile, 'worker');
+    await assert.rejects(f.db.clearProfile('worker', { kind: 'supervisor', id: 'supervisor' } as unknown as import('../../src/storage/tasks.ts').TaskActor, false), TypeError);
+    const before = f.db.events();
+    await f.db.clearProfile('worker', person, true);
+    assert.deepEqual(f.db.events(), before);
+    await f.db.clearProfile('worker', person, false);
+    assert.deepEqual(f.db.limitedProfiles(), []);
+    const cleared = f.db.events().find(e => e.kind === 'profile.cleared')!;
+    assert.equal(cleared.payload.limitedEventId, limited.id);
+    assert.deepEqual(cleared.actor, person);
+  }
+});
+
 test('R07/A17: every ordering, duplicate and old source sequence completes once, only with terminal plus validated result', async t => {
   for (const order of permutations<WorkerObservation['kind']>(['terminal', 'turn_ended', 'idle', 'result_available'])) {
     const f = await fixture(t);

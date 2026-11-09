@@ -362,23 +362,80 @@ test('R11: CLI discards terminal missing/invalid output, refuses dirty work and 
   }
 });
 
-test('R07/R08/R11: a failed model turn leaves a confirmed terminal stop, a released owner claim and a discardable attempt', async t => {
+test('A61/R10/R11: a failed model turn settles immediately, releases its owner and returns a clean lease', async t => {
   const f = await fixture(t, 'model-error');
   f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
   const failed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
-  assert.notEqual(failed.status, 0);
+  assert.equal(failed.envelope.code, 'worker_failed');
+  assert.equal(failed.data.failureKind, 'model_error');
+  assert.equal(failed.data.profile, 'worker');
+  assert.match(failed.data.message, /\[redacted\]/);
+  assert.equal(failed.envelope.nextAction.operation, 'attempt.show');
   const attemptId = failed.data.attemptId;
   assert.ok(attemptId, JSON.stringify(failed.envelope));
   const shown = f.invoke('attempt.show', { attemptId }).data;
   assert.ok(shown.terminalEvidence.length > 0, JSON.stringify(shown.terminalEvidence));
+  assert.equal(shown.outcome, 'failed');
+  assert.equal(shown.executionOpen, false);
+  assert.equal(shown.leaseState, 'returned');
   const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data;
   assert.deepEqual(status.blockers, []);
   assert.equal(status.claims.length, 0);
-  const discarded = f.invoke('attempt.discard', { attemptId, confirmDiscard: true, reason: 'Provider refused the turn', dryRun: false }, 'discard');
-  assert.equal(discarded.status, 0, JSON.stringify(discarded.envelope));
-  assert.equal(discarded.data.attempt.outcome, 'failed');
-  assert.equal(discarded.data.attempt.leaseState, 'returned');
   assert.equal(f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data.capacity.used, 0);
+});
+
+test('A61/R08: a lost launcher connection remains owner_unknown, not a failed model outcome', async t => {
+  const f = await fixture(t, 'lost-connection');
+  f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+  const failed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false });
+  assert.equal(failed.envelope.code, 'owner_unknown');
+  const attempt = f.invoke('attempt.show', { attemptId: failed.data.attemptId }).data;
+  assert.equal(attempt.outcome, null);
+  assert.equal(attempt.executionOpen, true);
+  assert.deepEqual(f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.limitedProfiles, []);
+});
+
+test('A61: provider limits block reservation, automatic selection reports skips, and person clearing permits reuse', async t => {
+  const f = await fixture(t, 'usage-limit');
+  const changed = { ...f.config, profiles: { worker: f.config.profiles.worker, other: f.config.profiles.worker },
+    limits: { ...f.config.limits, maxAttemptsPerTask: 1 } };
+  await writeFile(f.file, JSON.stringify(changed));
+  assert.equal(f.invoke('context.configure', { dryRun: false }).status, 0);
+  f.invoke('task.add', { id: 'limited', definition, objectiveId: null });
+  const failed = f.invoke('attempt.dispatch', { taskId: 'limited', profile: null, dryRun: false });
+  assert.equal(failed.envelope.code, 'worker_failed');
+  assert.equal(failed.data.failureKind, 'provider_limit');
+  assert.equal(failed.data.message, 'Codex error: The usage limit has been reached');
+  assert.equal(failed.data.leaseReturn.state, 'returned');
+  f.invoke('task.add', { id: 'next', definition, objectiveId: null });
+  f.invoke('task.add', { id: 'other', definition: { ...definition, profile: 'other' }, objectiveId: null });
+  const stable = await snapshot(f.home);
+  for (const profile of [null, 'worker']) {
+    const refused = f.invoke('attempt.dispatch', { taskId: 'next', profile, dryRun: false });
+    assert.equal(refused.envelope.code, 'provider_limited');
+    assert.equal(refused.data.profile, 'worker');
+    assert.deepEqual(refused.data.configuredProfiles, ['other']);
+    assert.ok(refused.data.time);
+  }
+  assert.deepEqual(await snapshot(f.home), stable);
+  const automatic = f.invoke('attempt.dispatch', { taskId: null, profile: null, dryRun: true });
+  assert.equal(automatic.status, 0, JSON.stringify(automatic.envelope));
+  assert.equal(automatic.data.taskId, 'other');
+  assert.ok(automatic.data.skippedTasks.some((item: { taskId: string }) => item.taskId === 'next'));
+  const other = f.invoke('attempt.dispatch', { taskId: 'other', profile: null, dryRun: false });
+  assert.equal(other.envelope.code, 'worker_failed');
+  assert.equal(other.data.profile, 'other');
+  const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  assert.equal(status.data.limitedProfiles.length, 2);
+  assert.equal(status.data.limitedProfiles[0].nextAction.operation, 'profile.clear');
+  const beforeClear = await snapshot(f.home);
+  assert.equal(f.invoke('profile.clear', { profile: 'worker', dryRun: true }).status, 0);
+  assert.deepEqual(await snapshot(f.home), beforeClear);
+  assert.equal(f.invoke('profile.clear', { profile: 'worker', dryRun: false }).status, 0);
+  assert.equal(f.invoke('task.release', { taskId: 'limited' }).status, 0);
+  const retry = f.invoke('attempt.dispatch', { taskId: 'limited', profile: null, dryRun: false });
+  assert.equal(retry.envelope.code, 'worker_failed', JSON.stringify(retry.envelope));
+  assert.notEqual(retry.data.attemptId, failed.data.attemptId);
 });
 
 test('A16/A49/R30: stale claim and uncertain effect block dispatch until scoped person resolutions; plans do not write', async t => {
