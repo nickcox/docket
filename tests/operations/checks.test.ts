@@ -7,7 +7,10 @@ import { heartbeatStatus } from '../../src/storage/claims.ts';
 import { confirmed, uncertain } from '../../src/adapters/command.ts';
 import type { CheckCommandResult } from '../../src/adapters/checks.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
-import { runCandidateChecks } from '../../src/checks.ts';
+import { runCandidateChecks, runChecks } from '../../src/checks.ts';
+import { CommandFailure } from '../../src/response.ts';
+import { findOperation } from '../../src/catalog.ts';
+import { validateSchema } from '../../src/operation-schemas.ts';
 import type { CheckServices } from '../../src/checks.ts';
 import { Database } from '../../src/storage/database.ts';
 import { reserveWithTrustedChecks } from '../../src/attempts.ts';
@@ -26,6 +29,66 @@ function fakeServices() {
   return { services, calls, policy: (value: string | null) => { content = value; }, source: (value: string) => { sourceCommit = value; },
     dirty: () => { clean = false; }, move: () => { candidate = start; } };
 }
+
+test('R28/R30/R15/R16/A35: checks.run plans without writes, retries failures explicitly and reuses passing evidence', async t => {
+  const f = await checkFixture(t), a = await f.attempt('task'), fake = fakeServices();
+  const input = { attemptId: a.id, commit: head, dryRun: false };
+  const operation = findOperation('checks.run')!;
+  assert.deepEqual(operation.roles, ['person', 'supervisor']);
+  assert.equal(operation.plans, true);
+  assert.equal(validateSchema(operation.inputSchema, input), null);
+  assert.notEqual(validateSchema(operation.inputSchema, { ...input, commit: 'bad' }), null);
+  const before = { events: f.db.events(), requests: f.db.requests(), claims: f.db.claims() };
+  const plan = await runChecks(f.db, { ...input, dryRun: true }, person, 'explicit', fake.services);
+  assert.deepEqual(plan.steps.map(step => step.operation), ['checks.run']);
+  assert.deepEqual({ events: f.db.events(), requests: f.db.requests(), claims: f.db.claims() }, before);
+  assert.deepEqual(fake.calls, []);
+  fake.services.run = async check => { fake.calls.push(check.name); return { ...passed, status: 'failed', exitCode: 1 }; };
+  await assert.rejects(runChecks(f.db, input, person, 'explicit', fake.services), (error: unknown) =>
+    error instanceof CommandFailure && error.code === 'check_failed' && error.nextAction?.operation === 'checks.run');
+  const read = fake.services.repository.readCheckPolicy;
+  fake.services.repository.readCheckPolicy = async () => { throw new Error('Replay must not read policy'); };
+  await assert.rejects(runChecks(f.db, input, person, 'explicit', fake.services), (error: unknown) =>
+    error instanceof CommandFailure && error.code === 'check_failed');
+  await assert.rejects(runChecks(f.db, { ...input, dryRun: true }, person, 'explicit', fake.services), (error: unknown) =>
+    error instanceof CommandFailure && error.code === 'check_failed');
+  await assert.rejects(runChecks(f.db, { ...input, commit: start }, person, 'explicit', fake.services), (error: unknown) =>
+    error instanceof CommandFailure && error.code === 'request_input_mismatch');
+  assert.deepEqual(fake.calls, ['fast']);
+  fake.services.repository.readCheckPolicy = read;
+  fake.services.run = async check => { fake.calls.push(check.name); return passed; };
+  const retry = await runChecks(f.db, input, person, 'retry', fake.services);
+  assert.deepEqual(retry.steps, plan.steps);
+  assert.equal(validateSchema(operation.outputSchema, retry), null);
+  assert.deepEqual(fake.calls, ['fast', 'fast', 'full']);
+  await runChecks(f.db, input, person, 'retry', fake.services);
+  const reuse = await runChecks(f.db, input, person, 'reuse', fake.services);
+  assert.deepEqual(reuse.steps, []);
+  assert.deepEqual(fake.calls, ['fast', 'fast', 'full']);
+  await assert.rejects(runChecks(f.db, { ...input, commit: start }, person, 'wrong-candidate', fake.services), (error: unknown) =>
+    error instanceof CommandFailure && error.code === 'candidate_missing');
+});
+
+test('R16/R30: checks.run reports the occupied full-check slot and resumes its pending request', async t => {
+  const f = await checkFixture(t), a = await f.attempt('one'), b = await f.attempt('two', ['Other criterion']);
+  const fake = fakeServices();
+  const holder = await f.db.beginChecks({ attemptId: a.id, commit: head,
+    checks: parseCheckPolicy(start, policyContent, contextChecks), profile, caller: person });
+  const input = { attemptId: b.id, commit: head, dryRun: false };
+  const plan = await runChecks(f.db, { ...input, dryRun: true }, person, 'waiting', fake.services);
+  await assert.rejects(runChecks(f.db, input, person, 'waiting', fake.services), (error: unknown) => {
+    assert.ok(error instanceof CommandFailure);
+    assert.equal(error.code, 'checks_waiting');
+    assert.equal(error.nextAction?.operation, 'checks.run');
+    assert.equal((error.data.slotHolders as { claimId: string }[])[0]!.claimId, holder.executor!.claimId);
+    return true;
+  });
+  assert.deepEqual(fake.calls, []);
+  await f.db.finishChecks(holder.request.id, holder.executor!, { status: 'failed', evidenceKey: String(holder.request.input.evidenceKey), commands: [] });
+  const result = await runChecks(f.db, input, person, 'waiting', fake.services);
+  assert.deepEqual(result.steps, plan.steps);
+  assert.deepEqual(fake.calls, ['fast', 'full']);
+});
 
 test('R15: trusted reservation freezes target checks and provenance; replay does not reread policy', async t => {
   const f = await checkFixture(t), fake = fakeServices();

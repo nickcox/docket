@@ -148,6 +148,16 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch').data.attempt.id, attempt.id);
   const detail = f.invoke('attempt.show', { attemptId: attempt.id }).data;
   assert.equal(detail.specification.task.instructions, definition.instructions, 'R27: attempt.show retains full instructions');
+  const checksInput = { attemptId: attempt.id, commit: detail.candidate.commit, dryRun: true };
+  const beforeChecksPlan = await snapshot(f.home);
+  const checksPlan = f.invoke('checks.run', checksInput, 'explicit-checks');
+  assert.equal(checksPlan.status, 0, JSON.stringify(checksPlan.envelope));
+  assert.deepEqual(checksPlan.data.steps, [], 'R15/R30: matching successful evidence needs no commands');
+  assert.deepEqual(await snapshot(f.home), beforeChecksPlan);
+  const checked = f.invoke('checks.run', { ...checksInput, dryRun: false }, 'explicit-checks');
+  assert.equal(checked.status, 0, JSON.stringify(checked.envelope));
+  assert.equal(checked.data.request.result.status, 'passed');
+  assert.equal(f.invoke('checks.run', { ...checksInput, dryRun: false }, 'explicit-checks').data.request.id, checked.data.request.id);
   for (const attentionOnly of [false, true]) {
     const status = f.invoke('status.show', { attentionOnly, page: { after: null, limit: 100 } }).data;
     assert.equal(JSON.stringify(status).includes(definition.instructions), false, 'R27: status excludes task instructions');

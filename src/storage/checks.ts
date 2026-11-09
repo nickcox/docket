@@ -24,6 +24,10 @@ export function acceptanceCheckFailure(attemptId: string, commit: string, reques
   }
   const code = request?.result?.status === 'failed' ? 'check_failed'
     : request?.state === 'uncertain' || request?.result?.status === 'uncertain' ? 'effect_uncertain' : 'check_missing';
+  if (code === 'check_failed' || code === 'check_missing') return new CommandFailure(code, data, {
+    operation: 'checks.run', args: { attemptId, commit, dryRun: false },
+    description: 'Run checks with a new request key, then retry acceptance if they pass.',
+  });
   return new CommandFailure(code, data, request ? {
     operation: 'request.show', args: { requestId: request.requestKey },
     description: 'Inspect the check request before deciding how to proceed.',

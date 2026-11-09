@@ -1399,7 +1399,8 @@ export class Database {
         request = this.recordCommandInTransaction({ ...command, input: { ...logical, checks: value.checks, profile: value.profile } }, value.attemptId);
       }
       const previous = this.db.prepare(`SELECT * FROM requests WHERE operation = 'checks.run' AND id <> ?
-        AND json_extract(input, '$.evidenceKey') = ? AND state IN ('succeeded', 'rejected') ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(request.id, key);
+        AND json_extract(input, '$.evidenceKey') = ? AND state IN ('succeeded', 'rejected')
+        ORDER BY CASE WHEN state = 'succeeded' THEN 0 ELSE 1 END, created_at DESC, rowid DESC LIMIT 1`).get(request.id, key);
       if (previous && (previous.state === 'succeeded' || value.requestKey === undefined)) {
         const reused = this.decodeRequest(previous);
         this.finishPendingCommandInTransaction(request.id, reused.state as 'succeeded' | 'rejected', reused.result!);

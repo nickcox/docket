@@ -11,6 +11,7 @@ import type { CommandInput } from './storage/requests.ts';
 import { createRuntime } from './runtime.ts';
 import type { Runtime } from './runtime.ts';
 import { dispatch } from './dispatch.ts';
+import { runChecks } from './checks.ts';
 import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason, OwnerReadError } from './completion.ts';
 import { CommandFailure } from './response.ts';
 import { rebaseAttempt, planAttemptRebase } from './rebase.ts';
@@ -171,6 +172,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'task.done': return { task: await db.markTaskDone(id, caller, command) };
       case 'task.reopen': return { task: await db.reopenTask(id, caller, command) };
       case 'attempt.show': return attemptView(db, String(args.attemptId));
+      case 'checks.run': return await runChecks(db, { attemptId: String(args.attemptId), commit: String(args.commit),
+        dryRun: Boolean(args.dryRun) }, caller, requestKey, (await services()).completion);
       case 'attempt.continue': {
         const previous = db.requests().find(r => r.requestKey === requestKey);
         const taskId = previous ? previous.input.taskId as string | null : db.attempt(String(args.sourceAttemptId)).taskId;

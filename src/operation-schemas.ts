@@ -49,6 +49,7 @@ function outputSchema(name: string): JsonSchema {
   else if (['attempt.accept', 'attempt.return', 'attempt.discard'].includes(name)) {
     variants.push(object({ attempt: view, leaseReturn, steps }), object({ attempt: view, leaseReturn }));
   }
+  else if (name === 'checks.run') variants.push(object({ request: view, steps }));
   else if (name.startsWith('attempt.')) variants.push(object({ attempt: view, steps }));
   else if (name === 'claim.resolve') variants.push(object({ steps, scope: view }), object({ claim: view, steps, scope: view }));
   else if (name === 'effect.resolve') variants.push(object({ steps, target: nullable(view) }), object({ effect: view, steps, target: nullable(view) }));
@@ -78,6 +79,8 @@ export const coreOperations: OperationDefinition[] = [
     sourceAttemptId: uuid, sourceCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }),
     profile: nullable(string), note: nullable(string), dryRun: bool }, true, ['person']),
   operation('attempt.show', 'Read full attempt identity and evidence.', attempt, false),
+  operation('checks.run', 'Run checks for a recorded candidate of a terminal attempt, reusing matching passing evidence.', {
+    ...planAttempt, commit: { type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' } }),
   operation('attempt.accept', 'Accept an exact retained candidate and apply finalisation policy.', { ...planAttempt, candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), overrideReason: nullable(string) }),
   operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt, true, ['person']),
   operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),
