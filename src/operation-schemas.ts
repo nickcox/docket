@@ -25,6 +25,8 @@ const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', 
   outcome: nullable({ enum: ['completed', 'held', 'failed'] }), leaseState: string,
   candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), checksState: string, ...attention });
 function outputSchema(name: string): JsonSchema {
+  if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
+    changedFields: { type: 'array', items: string }, steps });
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
@@ -53,6 +55,7 @@ function operation(name: string, description: string, properties: Record<string,
     tool: { name: `dk_${name.replaceAll('.', '_')}`, description } };
 }
 export const coreOperations: OperationDefinition[] = [
+  operation('context.configure', 'Validate and apply the selected configuration while quiescent.', { dryRun: bool }, true, ['person']),
   operation('status.show', 'Read context status, capacity and unresolved owners.', { attentionOnly: bool, page }, false),
   operation('task.add', 'Add a task at the end of the queue.', { id: nullable(id), definition: definition(false), objectiveId: nullable(id) }),
   operation('task.show', 'Read a task and its readiness.', { taskId: id }, false),

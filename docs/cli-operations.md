@@ -4,6 +4,12 @@
 
 Use `--config /absolute/context.json` or a registered `--context name`, and exactly one of `--stdin` and `--input file.json`. Every command writes one version-1 envelope to stdout. Dispatch progress goes to stderr. Person mutations generate a request ID unless `--request-id key` is supplied. Reuse that key after a lost response, with the same input. Task mutations and their replay result commit together.
 
+## Configuration
+
+Edit the person-controlled configuration file, then run `context.configure` with `{"dryRun":true}` to report changed top-level fields and the next revision. Run it with `{"dryRun":false}` to apply the file. Both use the strict configuration parser and require quiescence: no execution-open attempt, unreleased claim, or claimed or uncertain effect. Refusals list every blocking item; resolve each before trying again.
+
+`contextId`, `databasePath`, `stateDirectory`, `repository` and `workspace` cannot change. Configuration changes are person-only. A changed digest records one new `context.configured` event with the resolved configuration and source file; later operations accept that digest and revision, not the previous file. An equivalent file records no event. Dry runs change nothing.
+
 ## Tasks
 
 For example, add a task:

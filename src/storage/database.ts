@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { canonicalJson } from '../configuration.ts';
 import { readFileSync } from 'node:fs';
 import { lstat, open, realpath, statfs, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -481,6 +482,40 @@ export class Database {
       }
       return value;
     });
+  }
+
+  async configureContext(configuration: { resolved: JsonObject; digest: string; provenance: JsonObject }, actor: TaskActor, dryRun: boolean) {
+    taskActor(actor);
+    if (actor.kind !== 'person') throw new StorageError('conflict', 'Context configuration is person-only');
+    const evaluate = () => {
+      const row = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
+      if (!row) throw new StorageError('conflict', 'Missing context configuration');
+      const recorded = this.decodeEvent(row).payload;
+      const previous = recorded.resolved as JsonObject;
+      const fields = ['contextId', 'databasePath', 'stateDirectory', 'repository', 'workspace']
+        .filter(field => canonicalJson(previous[field]) !== canonicalJson(configuration.resolved[field]));
+      const blockers: JsonObject[] = [];
+      for (const item of this.db.prepare('SELECT id FROM attempts WHERE execution_open = 1 ORDER BY id').all()) {
+        blockers.push({ kind: 'attempt', attemptId: String(item.id) });
+      }
+      for (const item of this.db.prepare('SELECT id, resource_key FROM claims WHERE released_at IS NULL ORDER BY id').all()) {
+        blockers.push({ kind: 'claim', claimId: String(item.id), resourceKey: String(item.resource_key) });
+      }
+      for (const item of this.db.prepare("SELECT id, state FROM requests WHERE category = 'effect' AND state IN ('claimed', 'uncertain') ORDER BY id").all()) {
+        blockers.push({ kind: 'effect', requestId: String(item.id), state: String(item.state) });
+      }
+      const changedFields = Object.keys(configuration.resolved)
+        .filter(field => canonicalJson(previous[field]) !== canonicalJson(configuration.resolved[field]));
+      const changed = recorded.digest !== configuration.digest;
+      const revision = Number(recorded.revision) + (changed ? 1 : 0);
+      if (!dryRun && changed && !fields.length && !blockers.length) {
+        this.insertEvent({ sourceKey: `context.configured:${revision}`, kind: 'context.configured', payloadVersion: 1,
+          correlationId: randomUUID(), actor: object(actor), occurredAt: new Date().toISOString(),
+          payload: { ...configuration, revision } });
+      }
+      return { revision, digest: configuration.digest, changedFields, fields, blockers };
+    };
+    return dryRun ? this.snapshot(evaluate) : this.write(evaluate);
   }
 
   private currentTaskConfiguration(): JsonObject {

@@ -5,10 +5,12 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { ConfigurationError, parseConfiguration } from '../../src/configuration.ts';
 import { ContextError, initialiseContext, openContext, resolveContext } from '../../src/context.ts';
-import { Database, StorageError } from '../../src/storage/database.ts';
+import { Database, StorageError, applicationId } from '../../src/storage/database.ts';
 import { configuration } from '../fixtures/configuration.ts';
 import { findOperation } from '../../src/catalog.ts';
 import { executeCoreOperation } from '../../src/operations.ts';
+import { CommandFailure } from '../../src/response.ts';
+import { parseCheckPolicy } from '../../src/check-policy.ts';
 
 async function fixture(t: test.TestContext, contextId = 'example') {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-context-')));
@@ -17,6 +19,94 @@ async function fixture(t: test.TestContext, contextId = 'example') {
   const config = configuration(home, contextId);
   await writeFile(file, JSON.stringify(config));
   return { home, file, config, options: { home, recyclableRoots: [] as string[], caller: { kind: 'person' as const, id: 'operator' } }, registry: join(home, '.config', 'docket', 'contexts.json') };
+}
+
+const configure = (f: Awaited<ReturnType<typeof fixture>>, dryRun = false) => executeCoreOperation(
+  findOperation('context.configure')!, { dryRun }, () => {}, { config: f.file }, undefined, f.options);
+
+test('R29/A53/R30: configure plans top-level changes, records the next revision, admits the new file and refuses the old one', async t => {
+  const f = await fixture(t);
+  await initialiseContext({ config: f.file }, f.options);
+  const old = JSON.stringify(f.config);
+  const before = await readFile(f.config.databasePath);
+  const unchanged = await configure(f);
+  assert.deepEqual(unchanged.changedFields, []);
+  assert.equal(unchanged.revision, 1);
+  f.config.limits.maxAttempts = 2;
+  f.config.keepAwake = false;
+  await writeFile(f.file, JSON.stringify(f.config));
+  const plan = await configure(f, true);
+  assert.deepEqual(plan.changedFields, ['limits', 'keepAwake']);
+  assert.equal(plan.revision, 2);
+  assert.deepEqual(await readFile(f.config.databasePath), before);
+  assert.deepEqual(await configure(f), plan);
+  const opened = await openContext({ config: f.file }, f.options);
+  using db = opened.database;
+  assert.equal(opened.configuration.revision, 2);
+  const events = db.events().filter(e => e.kind === 'context.configured');
+  assert.equal(events.length, 2);
+  assert.deepEqual(events[1]!.payload, { revision: 2, digest: plan.digest, resolved: f.config, provenance: { file: f.file } });
+  assert.deepEqual((await configure(f)).changedFields, []);
+  await writeFile(f.file, old);
+  await assert.rejects(openContext({ config: f.file }, f.options), contextError('config_changed'));
+});
+
+for (const field of ['contextId', 'databasePath', 'stateDirectory', 'repository', 'workspace'] as const) {
+  test(`R01/R29: configure refuses changed identity field ${field} without events`, async t => {
+    const f = await fixture(t);
+    await initialiseContext({ config: f.file }, f.options);
+    const before = await readFile(f.config.databasePath);
+    const changed = structuredClone(f.config);
+    if (field === 'workspace') changed.workspace.poolRoot = join(f.home, 'other-pool');
+    else changed[field] = field === 'contextId' ? 'other' : join(f.home, `other-${field}`);
+    await writeFile(f.file, JSON.stringify(changed));
+    for (const dryRun of [true, false]) await assert.rejects(configure(f, dryRun), (error: unknown) => {
+      assert.ok(error instanceof ContextError);
+      assert.equal(error.code, 'context_mismatch');
+      assert.deepEqual(error.data.fields, [field]);
+      return true;
+    });
+    assert.deepEqual(await readFile(f.config.databasePath), before);
+  });
+}
+
+test('R29: configure is person-only and uses the strict configuration parser', async t => {
+  const f = await fixture(t);
+  await initialiseContext({ config: f.file }, f.options);
+  await assert.rejects(executeCoreOperation(findOperation('context.configure')!, { dryRun: false }, () => {}, { config: f.file }, undefined,
+    { ...f.options, caller: { kind: 'supervisor', id: 'agent' } as unknown as import('../../src/storage/tasks.ts').TaskActor }), (error: unknown) => error instanceof CommandFailure && error.code === 'person_required');
+  await writeFile(f.file, JSON.stringify({ ...f.config, unknown: true }));
+  await assert.rejects(configure(f), (error: unknown) => error instanceof ConfigurationError && error.field === '$.unknown');
+});
+
+for (const state of ['claimed', 'uncertain'] as const) {
+  test(`R29: configure names every execution-open attempt, unreleased claim and ${state} effect`, async t => {
+    const f = await fixture(t);
+    await initialiseContext({ config: f.file }, f.options);
+    using db = await Database.open(f.config.databasePath, { readOnly: false, location: { retainedRoot: f.config.stateDirectory, recyclableRoots: [] } });
+    await db.addTask({ id: 'work', title: 'Work' }, f.options.caller);
+    const reservation = await db.reserveAttempt({ requestKey: 'reserve', taskId: 'work', caller: f.options.caller,
+      startingCommit: 'a'.repeat(40), checks: parseCheckPolicy('a'.repeat(40), null, f.config.checks),
+      delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+    const [claim] = await db.registerClaims([{ resourceKey: 'configure-test', role: 'maintenance', generation: 'one', ownerRef: f.options.caller,
+      schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], f.options.caller);
+    const executor = { claimId: claim!.id, generation: claim!.generation };
+    const acquisition = await db.beginWorkspaceAcquisition(reservation.attempt.id, reservation.requestId, executor, f.options.caller);
+    if (state === 'uncertain') await db.recordUncertainAcquisition(reservation.attempt.id, acquisition.effect.id, executor, { reason: 'lost response' });
+    const before = db.events();
+    f.config.limits.maxAttempts = 2;
+    await writeFile(f.file, JSON.stringify(f.config));
+    for (const dryRun of [true, false]) await assert.rejects(configure(f, dryRun), (error: unknown) => {
+      assert.ok(error instanceof CommandFailure);
+      assert.deepEqual(error.data.blockers, [
+        { kind: 'attempt', attemptId: reservation.attempt.id },
+        { kind: 'claim', claimId: claim!.id, resourceKey: 'configure-test' },
+        { kind: 'effect', requestId: acquisition.effect.id, state },
+      ]);
+      return true;
+    });
+    assert.deepEqual(db.events(), before);
+  });
 }
 
 function contextError(code: ContextError['code']) { return (error: unknown) => error instanceof ContextError && error.code === code; }

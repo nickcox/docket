@@ -23,16 +23,16 @@ function checkInputSchema(schema: JsonSchema): void {
 
 test("R28/A52: one version-1 catalogue exposes context.init and catalog.show with complete definitions", () => {
   assert.equal(catalogue.catalogueVersion, 1);
-  assert.deepEqual(catalogue.operations.map(operation => operation.name).sort(), ['catalog.show', 'context.init', 'status.show',
+  assert.deepEqual(catalogue.operations.map(operation => operation.name).sort(), ['catalog.show', 'context.init', 'context.configure', 'status.show',
     'task.add', 'task.show', 'task.list', 'task.update', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
     'attempt.dispatch', 'attempt.show', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].sort());
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
     assert.ok(operation.roles.includes('person'));
-    if (['context.init', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
+    if (['context.init', 'context.configure', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
     assert.deepEqual(operation.bindingDerivedFields, operation.name === 'task.add' ? ['objectiveId'] : []);
     assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show'].includes(operation.name));
-    assert.equal(operation.plans, ['attempt.dispatch', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name));
+    assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);
     checkInputSchema(operation.inputSchema);

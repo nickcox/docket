@@ -1,7 +1,7 @@
 import { userInfo } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { canonicalJson, ConfigurationError } from './configuration.ts';
-import { initialiseContext, openContext } from './context.ts';
+import { configureContext, initialiseContext, openContext } from './context.ts';
 import type { ContextOptions, ContextSelector } from './context.ts';
 import type { OperationDefinition } from './catalog.ts';
 import { Database, StorageError, NoEligibleTaskError } from './storage/database.ts';
@@ -75,6 +75,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   const caller = options.caller ?? { kind: 'person', id: String(userInfo().uid) };
   if (!operation.roles.includes(caller.kind)) throw new CommandFailure('person_required');
   if (operation.name === 'context.init') return initialiseContext(selector, { ...options, caller });
+  if (operation.name === 'context.configure') return configureContext(selector, { ...options, caller, dryRun: args.dryRun === true });
   const context = await openContext(selector, { ...options, readOnly: !operation.mutates || args.dryRun === true });
   const db = context.database;
   const input = JSON.parse(JSON.stringify(args)) as JsonObject;

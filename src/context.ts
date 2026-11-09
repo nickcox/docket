@@ -8,6 +8,8 @@ import { canonicalPath, ConfigurationError, inside, parseConfiguration, strictJs
 import type { ResolvedConfiguration } from './configuration.ts';
 import { Database, StorageError } from './storage/database.ts';
 import type { TaskActor } from './storage/tasks.ts';
+import { CommandFailure } from './response.ts';
+import { step } from './plans.ts';
 
 export class ContextError extends Error {
   readonly code: 'context_registered' | 'context_mismatch' | 'config_changed' | 'storage_busy' | 'not_initialised';
@@ -159,6 +161,25 @@ export async function initialiseContext(selector: ContextSelector, options: Cont
   }
 }
 
+/** Reconfiguration admits the new file only after checking the recorded identity and owners. */
+export async function configureContext(selector: ContextSelector, options: ContextOptions & { caller: TaskActor; dryRun: boolean }) {
+  if (options.caller.kind !== 'person') throw new CommandFailure('person_required');
+  const configuration = await resolveContext(selector, options);
+  const config = configuration.resolved;
+  try { await lstat(config.databasePath); }
+  catch (error) {
+    if (missing(error)) throw new ContextError('context_mismatch', 'Cannot change databasePath or configure an uninitialised database', { fields: ['databasePath'] });
+    throw error;
+  }
+  using database = await Database.open(config.databasePath, { readOnly: options.dryRun,
+    location: { retainedRoot: dirname(config.databasePath), recyclableRoots: options.recyclableRoots ?? [] } });
+  const result = await database.configureContext({ resolved: config, digest: configuration.digest, provenance: { file: configuration.file } }, options.caller, options.dryRun);
+  if (result.fields.length) throw new ContextError('context_mismatch', 'Context identity cannot change', { fields: result.fields });
+  if (result.blockers.length) throw new CommandFailure('policy_refused', { blockers: result.blockers }, { operation: 'status.show', args: { attentionOnly: true, page: { after: null, limit: 100 } }, description: 'Resolve each blocking attempt, claim and effect before configuring the context.' });
+  return { revision: result.revision, digest: result.digest, changedFields: result.changedFields,
+    steps: result.changedFields.length ? [step('context.configure', config.contextId, [], false)] : [] };
+}
+
 /** All later operations admit the selected file before reading or mutating context state. */
 export async function openContext(selector: ContextSelector, options: ContextOptions & { expectedRevision?: number; readOnly?: boolean } = {}) {
   if (options.expectedRevision !== undefined && (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 1)) throw new ConfigurationError('$binding.expectedRevision', 'Expected a positive configuration revision');
@@ -175,7 +196,7 @@ export async function openContext(selector: ContextSelector, options: ContextOpt
     const events = database.events();
     const genesis = events.find(event => event.kind === 'database.initialised');
     const recorded = events.findLast(event => event.kind === 'context.configured');
-    const currentRevision = options.expectedRevision ?? configuration.revision;
+    const currentRevision = options.expectedRevision ?? Number(recorded?.payload.revision);
     if (!recorded || recorded.payloadVersion !== 1 || recorded.payload.digest !== configuration.digest || recorded.payload.revision !== currentRevision) {
       throw new ContextError('config_changed', 'Configuration differs from the latest context.configured event', {
         recordedDigest: recorded?.payload.digest ?? null, currentDigest: configuration.digest,
