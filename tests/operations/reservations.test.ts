@@ -55,6 +55,23 @@ function snapshot(db: Database, path: string) {
   return { attempts: sql.prepare('SELECT * FROM attempts ORDER BY id').all(), requests: db.requests(), events: db.events(), tasks: db.tasks() };
 }
 
+test('R02/R03/R04: automatic selection skips blocked tasks and agrees with dependency completion and removal', async t => {
+  const { db, path } = await fixture(t);
+  for (const id of ['dependent', 'blocker', 'next']) await add(db, id);
+  await db.addBlocker('dependent', 'blocker', actor);
+  const before = snapshot(db, path);
+  await assert.rejects(db.reserveAttempt(input('named', 'dependent')), conflict);
+  assert.deepEqual(snapshot(db, path), before);
+  assert.equal((await db.reserveAttempt(input('preview'), true)).attempt.taskId, 'blocker');
+  assert.equal((await db.reserveAttempt(input('automatic'))).attempt.taskId, 'blocker');
+  await db.markTaskDone('blocker', actor);
+  assert.equal((await db.reserveAttempt(input('done-preview'), true)).attempt.taskId, 'dependent');
+  await db.reopenTask('blocker', actor);
+  assert.equal((await db.reserveAttempt(input('reopened-preview'), true)).attempt.taskId, 'next');
+  await db.removeBlocker('dependent', 'blocker', actor);
+  assert.equal((await db.reserveAttempt(input('unblocked-preview'), true)).attempt.taskId, 'dependent');
+});
+
 test('R04/R05: reserve a numbered immutable specification with resolved profile, checks and unique output namespace', async t => {
   const { db, root } = await fixture(t);
   const task = await add(db, 'one');

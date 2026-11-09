@@ -456,7 +456,7 @@ export class Database {
     if (Number(result.changes) !== 1) throw new StorageError('conflict', 'Record changed since it was read');
   }
 
-  private insertBlocker(taskId: string, blockerId: string): boolean {
+  private insertBlocker(taskId: string, blockerId: string): void {
     this.taskRow(taskId);
     this.taskRow(blockerId);
     if (taskId === blockerId) throw new StorageError('conflict', 'A task cannot block itself');
@@ -465,9 +465,10 @@ export class Database {
        SELECT blocker_id FROM dependencies JOIN blockers ON task_id = blockers.id)
       SELECT 1 FROM blockers WHERE id = ?`).get(blockerId, taskId);
     if (cycle) throw new StorageError('conflict', 'Blocker would create a cycle');
-    if (this.db.prepare('SELECT 1 FROM dependencies WHERE task_id = ? AND blocker_id = ?').get(taskId, blockerId)) return false;
+    if (this.db.prepare('SELECT 1 FROM dependencies WHERE task_id = ? AND blocker_id = ?').get(taskId, blockerId)) {
+      throw new StorageError('conflict', 'Duplicate dependency');
+    }
     this.db.prepare('INSERT INTO dependencies (task_id, blocker_id) VALUES (?, ?)').run(taskId, blockerId);
-    return true;
   }
 
   private writeTask<T>(command: CommandInput | undefined, change: () => T): Promise<T> {
@@ -580,8 +581,9 @@ export class Database {
     taskText(taskId); taskText(blockerId); taskActor(actor);
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
-      if (this.insertBlocker(taskId, blockerId)) this.taskEvent('task.block', person, taskId, { blockerId });
-      return this.decodeTask(this.taskRow(taskId));
+      const before = this.decodeTask(this.taskRow(taskId));
+      this.insertBlocker(taskId, blockerId);
+      return this.recordDependencyDecision('task.block', before, blockerId, person);
     });
   }
 
@@ -589,11 +591,19 @@ export class Database {
     taskText(taskId); taskText(blockerId); taskActor(actor);
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
-      this.taskRow(taskId); this.taskRow(blockerId);
+      const before = this.decodeTask(this.taskRow(taskId));
+      this.taskRow(blockerId);
       const result = this.db.prepare('DELETE FROM dependencies WHERE task_id = ? AND blocker_id = ?').run(taskId, blockerId);
-      if (Number(result.changes) !== 0) this.taskEvent('task.unblock', person, taskId, { blockerId });
-      return this.decodeTask(this.taskRow(taskId));
+      return Number(result.changes) === 0 ? before : this.recordDependencyDecision('task.unblock', before, blockerId, person);
     });
+  }
+
+  private recordDependencyDecision(operation: 'task.block' | 'task.unblock', before: Task, blockerId: string, actor: TaskActor): Task {
+    this.changed(this.db.prepare(`UPDATE tasks SET decision_revision = decision_revision + 1
+      WHERE id = ? AND decision_revision = ?`).run(before.id, before.decisionRevision));
+    const task = this.decodeTask(this.taskRow(before.id));
+    this.taskEvent(operation, actor, before.id, { blockerId, before: object(before), after: object(task) });
+    return task;
   }
 
   /** A complete permutation avoids ambiguous partial-order edits. */

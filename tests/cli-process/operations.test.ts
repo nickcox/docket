@@ -581,9 +581,32 @@ test('R28/R27: strict task inputs, mutations, revisions, replay and paginated re
   assert.equal(f.invoke('task.hold', { taskId: 'first', reason: 'Wait' }, 'hold').status, 0);
   assert.equal(f.invoke('task.hold', { taskId: 'first', reason: 'Changed' }, 'hold').envelope.code, 'request_input_mismatch');
   assert.equal(f.invoke('task.release', { taskId: 'first' }).status, 0);
-  assert.equal(f.invoke('task.block', { taskId: 'first', blockerId: 'second' }).status, 0);
-  assert.equal(f.invoke('task.show', { taskId: 'first' }).data.task.ready, false);
-  assert.equal(f.invoke('task.unblock', { taskId: 'first', blockerId: 'second' }).status, 0);
+  const dependency = { taskId: 'first', blockerId: 'second' };
+  assert.equal(f.invoke('task.block', dependency, 'block').status, 0);
+  assert.equal(f.invoke('task.block', dependency, 'block').status, 0, 'R28: replay is not a duplicate mutation');
+  const blocked = f.invoke('task.show', { taskId: 'first' }).data.task;
+  assert.equal(blocked.ready, false);
+  assert.deepEqual(blocked.blockedBy, ['second']);
+  const pageArgs = { after: null, limit: 100 };
+  const ready = () => f.invoke('task.list', { state: null, readyOnly: true, page: pageArgs }).data.items.map((task: { id: string }) => task.id);
+  assert.deepEqual(ready(), ['second']);
+  const status = f.invoke('status.show', { attentionOnly: false, page: pageArgs }).data.tasks.items;
+  assert.equal(status.find((task: { id: string }) => task.id === 'first').ready, false);
+  assert.deepEqual(status.find((task: { id: string }) => task.id === 'first').blockedBy, ['second']);
+  assert.equal(f.invoke('attempt.dispatch', { taskId: null, profile: null, dryRun: true }).data.taskId, 'second');
+  const before = await snapshot(f.home);
+  for (const args of [dependency, { taskId: 'first', blockerId: 'first' }, { taskId: 'first', blockerId: 'missing' },
+    { taskId: 'missing', blockerId: 'first' }, { taskId: 'second', blockerId: 'first' }]) {
+    assert.equal(f.invoke('task.block', args).envelope.code, 'policy_refused');
+    assert.deepEqual(await snapshot(f.home), before, 'R25: refusal changes nothing');
+  }
+  assert.equal(f.invoke('task.unblock', dependency, 'unblock').status, 0);
+  assert.equal(f.invoke('task.unblock', dependency, 'unblock').status, 0);
+  const unblocked = f.invoke('task.show', { taskId: 'first' }).data.task;
+  assert.equal(unblocked.decisionRevision, blocked.decisionRevision + 1);
+  assert.deepEqual(unblocked.blockedBy, []);
+  assert.deepEqual(ready(), ['first', 'second']);
+  assert.equal(f.invoke('attempt.dispatch', { taskId: null, profile: null, dryRun: true }).data.taskId, 'first');
   assert.equal(f.invoke('task.reorder', { orderedTaskIds: ['second', 'first'] }).status, 0);
   assert.equal(f.invoke('task.done', { taskId: 'first', note: 'Person judgement' }).status, 0);
   assert.equal(f.invoke('task.reopen', { taskId: 'first', note: null }).status, 0);

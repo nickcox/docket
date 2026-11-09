@@ -64,7 +64,7 @@ test('A03/R02/R25: self, missing and transitive cyclic blockers roll back, inclu
   await db.addBlocker('b', 'a', person);
   await db.addBlocker('c', 'b', person);
   const before = snapshot(db);
-  for (const [task, blocker] of [['a', 'a'], ['a', 'missing'], ['missing', 'a'], ['a', 'c'], ['b', 'c']]) {
+  for (const [task, blocker] of [['a', 'a'], ['a', 'missing'], ['missing', 'a'], ['a', 'c'], ['b', 'c'], ['b', 'a']]) {
     await assert.rejects(db.addBlocker(task!, blocker!, person), conflict);
     using reopened = await Database.open(path, options);
     assert.deepEqual(snapshot(reopened), before);
@@ -73,15 +73,45 @@ test('A03/R02/R25: self, missing and transitive cyclic blockers roll back, inclu
     await assert.rejects(db.addTask({ id: 'new', title: 'New', blockerIds }, person), conflict);
     assert.deepEqual(snapshot(db), before);
   }
-  // Duplicate edges and removing an absent edge are no-ops, not revision changes or new evidence.
-  await db.addBlocker('b', 'a', person);
+  // Removing an absent edge is a no-op, not a revision change or new evidence.
   await db.removeBlocker('d', 'a', person);
   assert.deepEqual(snapshot(db), before);
   await assert.rejects(db.removeBlocker('d', 'missing', person), conflict);
   await db.removeBlocker('b', 'a', person);
   assert.deepEqual(ids(db.readyTasks()), ['a', 'b', 'd']);
   assert.equal(db.task('b').definitionRevision, 1);
-  assert.equal(db.task('b').decisionRevision, 0);
+  assert.equal(db.task('b').decisionRevision, 2);
+});
+
+test('R03/R25: dependency decisions record revisions and actor, and command replay never repeats a change', async t => {
+  const { db } = await fixture(t);
+  for (const id of ['a', 'b']) await db.addTask({ id, title: id }, person);
+  const command = (operation: string) => ({ requestKey: operation, operation, caller: person,
+    input: { taskId: 'a', blockerId: 'b' }, fingerprint: operation });
+  const before = db.task('a');
+  const blocked = await db.addBlocker('a', 'b', person, command('task.block'));
+  assert.equal(blocked.decisionRevision, before.decisionRevision + 1);
+  assert.equal(blocked.definitionRevision, before.definitionRevision);
+  assert.deepEqual(blocked.blockerIds, ['b']);
+  assert.deepEqual(await db.addBlocker('a', 'b', person, command('task.block')), blocked);
+  const unblocked = await db.removeBlocker('a', 'b', person, command('task.unblock'));
+  assert.equal(unblocked.decisionRevision, blocked.decisionRevision + 1);
+  assert.equal(unblocked.definitionRevision, before.definitionRevision);
+  assert.deepEqual(unblocked.blockerIds, []);
+  const after = snapshot(db);
+  assert.deepEqual(await db.removeBlocker('a', 'b', person, command('task.unblock')), unblocked);
+  // Replaying the old add returns its original result without recreating the edge.
+  assert.deepEqual(await db.addBlocker('a', 'b', person, command('task.block')), blocked);
+  assert.deepEqual(snapshot(db), after);
+  const actions = db.events().filter(e => e.kind === 'action.recorded' && ['task.block', 'task.unblock'].includes(String(e.payload.operation)));
+  assert.equal(actions.length, 2);
+  for (const [index, event] of actions.entries()) {
+    assert.deepEqual(event.actor, person);
+    assert.equal(event.payload.person, person.id);
+    assert.deepEqual(event.payload.before, index === 0 ? before : blocked);
+    assert.deepEqual(event.payload.after, index === 0 ? blocked : unblocked);
+    assert.equal(event.payload.blockerId, 'b');
+  }
 });
 
 test('A03/R02: reopening a done blocker changes future readiness, not started/done dependants', async t => {

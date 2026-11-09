@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { catalogue, executeOperation, findOperation } from "../../src/catalog.ts";
 import type { JsonSchema } from "../../src/catalog.ts";
+import { validateSchema } from '../../src/operation-schemas.ts';
 
 function checkInputSchema(schema: JsonSchema): void {
   if (schema.type === "object") {
@@ -47,6 +48,22 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
     }
   }
   assert.equal(findOperation('not.an-operation'), undefined);
+});
+
+test('R28/R30: dependency schemas require exactly two task IDs and do not offer dry-run planning', () => {
+  for (const name of ['task.block', 'task.unblock']) {
+    const operation = findOperation(name)!;
+    assert.deepEqual(operation.roles, ['person', 'supervisor']);
+    assert.equal(operation.mutates, true);
+    assert.equal(operation.plans, false);
+    assert.deepEqual(operation.inputSchema.required, ['taskId', 'blockerId']);
+    const input = { taskId: 'feature', blockerId: 'prerequisite' };
+    assert.equal(validateSchema(operation.inputSchema, input), null);
+    for (const invalid of [{ taskId: 'feature' }, { ...input, blockerId: '' }, { ...input, taskId: 'not a slug' },
+      { ...input, dryRun: true }, { ...input, caller: 'person' }]) {
+      assert.notEqual(validateSchema(operation.inputSchema, invalid), null);
+    }
+  }
 });
 
 test("R28/A52: the no-argument input schema is a described strict empty object", () => {

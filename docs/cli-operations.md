@@ -21,6 +21,10 @@ printf '%s' '{"id":"notes","definition":{"title":"Write notes","instructions":"W
 
 `task.show`, `task.list` and `status.show` expose readiness and holds. `task.update` replaces the definition at `expectedRevision`. Holds, releases, dependencies, reorder and explicit done/reopen judgements use separate operations. Marking a task done does not invent accepted evidence. Reorder names every task in this context exactly once.
 
+Use `task.block` with `{"taskId":"notes","blockerId":"prerequisite"}` to add a dependency; `task.unblock` takes the same fields to remove it. Neither operation accepts `dryRun`. A self-dependency, missing task, duplicate edge or cycle refuses without changes. Reusing the original request ID replays the original result instead of adding the edge again. Removing an absent edge changes nothing.
+
+Each dependency change records the actor, before/after task and incremented `decisionRevision`; it leaves `definitionRevision` unchanged. `task.show` and `status.show` expose `blockedBy`. A queued, unheld task is ready only when all its blockers are done. `task.list` with `readyOnly:true` and automatic dispatch use that same rule. Completing or reopening a blocker changes future readiness; it does not change an already started or finished dependant's state.
+
 Lists use `page:{"after":null,"limit":100}` initially and return the next cursor. Status uses a shared cursor across its task, attempt, claim and effect sections; its `page` gives the overall count and next cursor.
 
 ## Standalone Pi dispatch
