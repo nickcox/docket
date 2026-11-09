@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lstat, readFile, readdir, realpath, rmdir, unlink } from 'node:fs/promises';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 
 export interface DiagnosticEntry { path: string; kind: 'file' | 'directory'; digest: string | null; size: number }
 export interface DiagnosticManifest { root: string; entries: DiagnosticEntry[] }
@@ -14,7 +14,8 @@ export class DiagnosticsDirectory {
     const walk = async (path: string): Promise<void> => {
       const stat = await lstat(path);
       if (stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) throw new Error('Diagnostic artefact is linked or not regular');
-      const file = relative(root, path);
+      // Manifests use / on every platform so that they are portable and comparable.
+      const file = relative(root, path).split(sep).join('/');
       if (stat.isDirectory()) {
         for (const name of (await readdir(path)).sort()) await walk(join(path, name));
         entries.push({ path: file, kind: 'directory', digest: null, size: 0 });
@@ -34,7 +35,7 @@ export class DiagnosticsDirectory {
       if (!original || original.kind !== entry.kind || original.digest !== entry.digest || original.size !== entry.size) throw new Error('Diagnostic directory changed');
     }
     for (const entry of manifest.entries) {
-      const path = join(manifest.root, entry.path);
+      const path = join(manifest.root, ...entry.path.split('/'));
       try {
         // Recheck ancestry and contents before each removal.
         const remaining = await this.inspect(manifest.root);

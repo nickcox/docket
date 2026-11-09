@@ -1974,7 +1974,7 @@ export class Database {
       throw new StorageError('conflict', 'Attempt has an unresolved effect');
     }
     const referenced = (value: unknown): boolean => {
-      if (typeof value === 'string') return value === root || value.startsWith(`${root}/`);
+      if (typeof value === 'string') return value === root || value.startsWith(`${root}${sep}`) || value.startsWith(`${root}/`);
       if (Array.isArray(value)) return value.some(referenced);
       return value !== null && typeof value === 'object' && Object.values(value).some(referenced);
     };
