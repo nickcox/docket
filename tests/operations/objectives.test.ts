@@ -1,3 +1,4 @@
+import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -22,12 +23,12 @@ const code = (expected: string) => (error: unknown) => error instanceof CommandF
 
 async function fixture(t: test.TestContext) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-objectives-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const db = await Database.initialise(path, { contextId: 'objectives', repository: { identity: 'example' }, stateDirectory: root,
     createdBy: creator, configuration: { revision: 1, resolved: {}, digest: 'test', provenance: {} } },
   { location: { retainedRoot: root, recyclableRoots: [] } });
-  t.after(() => db.close());
+  defer(t, () => db.close());
   return { db, path };
 }
 
