@@ -18,6 +18,8 @@ import { rebaseAttempt, planAttemptRebase } from './rebase.ts';
 import { known } from './operation-utils.ts';
 import { step } from './plans.ts';
 import { unknownProfile, UnknownProfileError } from './profiles.ts';
+import { requestView } from './request-view.ts';
+import { nextAction as action } from './next-action.ts';
 
 export interface OperationOptions extends ContextOptions {
   runtime?: typeof createRuntime;
@@ -35,8 +37,8 @@ function taskView(db: Database, task: Task) {
   return { ...task, blockedBy: task.blockerIds, ready: db.readyTasks().some(t => t.id === task.id) };
 }
 function invalidResultAction(attemptId: string) {
-  return { operation: 'attempt.continue', args: { sourceAttemptId: attemptId, sourceCommit: null, profile: null, note: null, dryRun: true },
-    description: 'Plan continuing from the retained output branch, or discard the attempt with attempt.discard.' };
+  return action('attempt.continue', { sourceAttemptId: attemptId, sourceCommit: null, profile: null, note: null, dryRun: true },
+    'Plan continuing from the retained output branch, or discard the attempt with attempt.discard.');
 }
 function attemptView(db: Database, id: string) {
   const attempt = db.attempt(id), preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
@@ -97,7 +99,6 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
       case 'status.show': {
         const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!));
-        const action = (operation: string, args: Record<string, unknown>, description: string) => ({ operation, args, description });
         const tasks = db.tasks().map(t => {
           const ready = db.readyTasks().some(task => task.id === t.id);
           const problem = t.state === 'queued' ? unknownProfile(context.configuration.resolved, t.profile) : null;
@@ -160,6 +161,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
           objectives: [], openPersonQuestions: [] };
       }
+      case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));
       case 'task.show': return { task: taskView(db, db.task(id)) };
       case 'task.list': return paginate(db.tasks().map(t => taskView(db, t)).filter(t => (args.state === null || t.state === args.state) && (!args.readyOnly || t.ready)), args.page as Page, t => t.id);
       case 'task.add': return { task: await db.addTask({ ...(args.definition as Omit<TaskDefinition, 'objectiveId'>),

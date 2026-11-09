@@ -9,6 +9,10 @@ import { applicationId, Database, StorageError } from '../../src/storage/databas
 import type { EventInput, StoredEvent } from '../../src/storage/database.ts';
 import type { Claim, ClaimInput } from '../../src/storage/claims.ts';
 import type { CommandInput, EffectInput, EffectState } from '../../src/storage/requests.ts';
+import { requestView } from '../../src/request-view.ts';
+import { CommandFailure } from '../../src/response.ts';
+import { findOperation } from '../../src/catalog.ts';
+import { validateSchema } from '../../src/operation-schemas.ts';
 
 const actor = { kind: 'person' as const, id: 'operator' };
 const conflict = (error: unknown) => error instanceof StorageError && error.code === 'conflict';
@@ -41,6 +45,65 @@ async function effectFixture(db: Database, key = 'effect') {
 function snapshot(db: Database) {
   return { claims: db.claims(), requests: db.requests(), events: db.events() };
 }
+
+test('R09/R27: request.show uses the public key and returns bounded, redacted immutable evidence without writes', async t => {
+  const { db } = await fixture(t);
+  const { effect, parent, claim } = await effectFixture(db);
+  await db.claimEffect(effect.id, identity(claim));
+  await db.recordEffectOutcome(effect.id, identity(claim), 'uncertain', {
+    password: 'hidden-password', environment: { PATH: 'raw-environment' },
+    message: 'https://user:credential@example.invalid authorization: Bearer hidden-bearer',
+    commands: [{ stdout: 'large diagnostic '.repeat(10000), apiKey: 'hidden-api-key' }],
+  });
+  const privateInput = { profile: 'full', env: { PATH: 'raw-path' }, nested: { access_token: 'hidden-token' },
+    message: 'api_key=hidden-key', ordinary: 'Keep this text' };
+  const privateCommand = await db.recordCommand({ ...command('private-input'), input: privateInput });
+  const before = snapshot(db);
+  const safeInput = requestView(db, privateCommand).input;
+  assert.deepEqual(safeInput, { profile: 'full', env: '[redacted]', nested: { access_token: '[redacted]' },
+    message: 'api_key=[redacted]', ordinary: 'Keep this text' });
+  assert.deepEqual(db.request(privateCommand.id).input, privateInput, 'Redaction never rewrites immutable input');
+  const request = db.requestByKey(effect.requestKey, actor);
+  const view = requestView(db, request);
+  assert.equal(view.id, effect.id);
+  assert.equal(view.requestId, effect.requestKey);
+  assert.equal(view.operation, effect.operation);
+  assert.equal(view.state, 'uncertain');
+  assert.deepEqual(view.caller, actor);
+  assert.equal(view.attemptId, null);
+  assert.deepEqual(view.parent, { id: parent.id, requestId: parent.requestKey, operation: parent.operation, state: parent.state });
+  assert.deepEqual(view.target, effect.target);
+  assert.deepEqual(view.input, effect.input);
+  assert.equal((view.result as { truncated: boolean }).truncated, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(view)) < 256 * 1024);
+  for (const secret of ['hidden-password', 'raw-environment', 'credential@', 'hidden-bearer', 'hidden-api-key']) {
+    assert.equal(JSON.stringify(view).includes(secret), false);
+  }
+  assert.equal(validateSchema(findOperation('request.show')!.outputSchema, view), null);
+  assert.equal((requestView(db, db.requestByKey(parent.requestKey, actor)).effects as unknown[]).length, 1);
+  assert.throws(() => db.requestByKey(effect.id, actor), error => error instanceof CommandFailure && error.code === 'invalid_input');
+  assert.deepEqual(snapshot(db), before);
+});
+
+test('R17: request reads admit every person but restrict supervisors to current objective membership', async t => {
+  const { db, path } = await fixture(t);
+  using seed = new DatabaseSync(path);
+  for (const objective of ['one', 'two']) seed.prepare(`INSERT INTO objectives
+    (id, request, criteria, scope, constraints_text, permissions, budget, creator, state, created_at)
+    VALUES (?, 'Request', '[]', '', '', '{}', '{}', 'operator', 'open', '2026-11-08')`).run(objective);
+  await db.addTask({ id: 'task', title: 'Task', objectiveId: 'one' }, actor, { ...command('added'), operation: 'task.add' });
+  assert.equal(db.requestByKey('added', { kind: 'supervisor', objectiveId: 'one' }).operation, 'task.add');
+  const request = await db.recordCommand({ ...command('scoped'), input: { taskId: 'task' } });
+  assert.equal(db.requestByKey('scoped', { kind: 'person' }).id, request.id);
+  assert.equal(db.requestByKey('scoped', { kind: 'supervisor', objectiveId: 'one' }).id, request.id);
+  const outside = (error: unknown) => error instanceof CommandFailure && error.code === 'outside_objective';
+  assert.throws(() => db.requestByKey('scoped', { kind: 'supervisor', objectiveId: 'two' }), outside);
+  seed.prepare("UPDATE tasks SET objective_id = 'two' WHERE id = 'task'").run();
+  assert.throws(() => db.requestByKey('scoped', { kind: 'supervisor', objectiveId: 'one' }), outside);
+  assert.equal(db.requestByKey('scoped', { kind: 'supervisor', objectiveId: 'two' }).id, request.id);
+  await db.recordCommand(command('context-command'));
+  assert.throws(() => db.requestByKey('context-command', { kind: 'supervisor', objectiveId: 'one' }), outside);
+});
 
 test('R25: multi-resource claims insert in sorted order, preserve complete identity, and refuse atomically', async t => {
   const { db, path, options } = await fixture(t);
@@ -237,7 +300,10 @@ test('R25: claim and effect references must agree on attempt/objective and execu
   for (const patch of [{ objectiveId: 'other-objective' }, { attemptId: 'other-attempt' }]) {
     await assert.rejects(db.recordEffect({ ...effect, ...patch }), /scope/);
   }
-  await db.recordEffect(effect);
+  const linked = await db.recordEffect(effect);
+  assert.equal(db.requestByKey(linked.requestKey, { kind: 'supervisor', objectiveId: 'objective' }).attemptId, 'attempt');
+  assert.throws(() => db.requestByKey(linked.requestKey, { kind: 'supervisor', objectiveId: 'other-objective' }),
+    error => error instanceof CommandFailure && error.code === 'outside_objective');
   const { input: unscoped } = await effectFixture(db, 'unscoped');
   await assert.rejects(db.recordEffect({ ...unscoped, requestKey: 'bad-attempt-scope', attemptId: 'attempt' }), /scope/);
 });

@@ -18,6 +18,7 @@ import type { Result } from './adapters/command.ts';
 import { readFinalisationPolicy } from './adapters/finalisation.ts';
 import { step } from './plans.ts';
 import { CommandFailure } from './response.ts';
+import { nextAction } from './next-action.ts';
 import { originalCandidateRef } from './storage/rebase.ts';
 import type { CompletionEffect } from './storage/rebase.ts';
 
@@ -96,10 +97,8 @@ async function planAcceptance(db: Database, input: AcceptInput, services: Comple
   if (config.policy.kind === 'local-merge'
     && !known(await services.repository.compare(expected, input.commit))
     && !known(await services.repository.compare(input.commit, expected))) {
-    throw new CommandFailure('not_fast_forward', { attemptId: input.attemptId, targetRef: target, targetCommit: expected, candidateCommit: input.commit }, {
-      operation: 'attempt.rebase', args: { attemptId: input.attemptId, dryRun: true },
-      description: 'Plan rebasing the attempt onto the current target.',
-    });
+    throw new CommandFailure('not_fast_forward', { attemptId: input.attemptId, targetRef: target, targetCommit: expected, candidateCommit: input.commit },
+      nextAction('attempt.rebase', { attemptId: input.attemptId, dryRun: true }, 'Plan rebasing the attempt onto the current target.'));
   }
   return { kind: config.policy.kind as FinalisationPlan['kind'], target, expected, policyDigest: policy.digest };
 }

@@ -1,3 +1,5 @@
+import type { nextAction } from './next-action.ts';
+
 export type Outcome = "succeeded" | "accepted" | "refused" | "failed";
 export type ExitCode = 0 | 1 | 2 | 3;
 
@@ -16,11 +18,7 @@ export interface Envelope {
   code: string;
   data: Record<string, unknown>;
   diagnostics: Diagnostic[];
-  nextAction: {
-    operation: string;
-    args: Record<string, unknown>;
-    description: string;
-  } | null;
+  nextAction: ReturnType<typeof nextAction> | null;
 }
 
 // Messages are fixed, rather than copied from parser, filesystem or runtime errors.

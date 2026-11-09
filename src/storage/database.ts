@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { CommandFailure } from '../response.ts';
+import { nextAction } from '../next-action.ts';
 import type { TurnFailure } from '../adapters/launcher.ts';
 import { canonicalJson } from '../configuration.ts';
 import { readFileSync } from 'node:fs';
@@ -803,7 +804,7 @@ export class Database {
         const limited = this.limitedProfiles().find(item => item.profile === config.profileName);
         if (limited) {
           if (value.taskId !== undefined || value.profile !== undefined) throw new CommandFailure('provider_limited', { ...limited, configuredProfiles: Object.keys(resolved.profiles as JsonObject).filter(name => name !== config.profileName) },
-            { operation: 'profile.clear', args: { profile: config.profileName, dryRun: true }, description: 'After the provider limit resets, ask a person to clear the profile.' });
+            nextAction('profile.clear', { profile: config.profileName, dryRun: true }, 'After the provider limit resets, ask a person to clear the profile.'));
           skippedTasks.push({ taskId: task.id, reason: `Profile ${config.profileName} is provider_limited: ${limited.message}` });
           continue;
         }
@@ -2095,6 +2096,27 @@ export class Database {
   request(id: string): StoredRequest {
     text(id);
     return this.snapshot(() => this.decodeRequest(this.requestRow(id)));
+  }
+
+  /** Public replay-key lookup. Unscoped context commands remain person-only. */
+  requestByKey(key: string, scope: { kind: 'person' } | { kind: 'supervisor'; objectiveId: string }): StoredRequest {
+    text(key);
+    return this.snapshot(() => {
+      const row = this.db.prepare('SELECT * FROM requests WHERE request_key = ?').get(key);
+      if (!row) throw new CommandFailure('invalid_input', { requestId: key });
+      const request = this.decodeRequest(row);
+      if (scope.kind === 'supervisor') {
+        const value = request.result?.value;
+        const taskId = request.attemptId ? this.attemptRow(request.attemptId).task_id
+          : typeof request.input.taskId === 'string' ? request.input.taskId
+          : request.operation === 'task.add' && value !== null && typeof value === 'object' ? (value as JsonObject).id : null;
+        const objectiveId = typeof taskId === 'string'
+          ? this.db.prepare('SELECT objective_id FROM tasks WHERE id = ?').get(taskId)?.objective_id
+          : request.objectiveId;
+        if (objectiveId !== scope.objectiveId) throw new CommandFailure('outside_objective');
+      }
+      return request;
+    });
   }
 
   requests(): StoredRequest[] {

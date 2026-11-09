@@ -9,6 +9,7 @@ import type { ResolvedConfiguration } from './configuration.ts';
 import { Database, StorageError } from './storage/database.ts';
 import type { TaskActor } from './storage/tasks.ts';
 import { CommandFailure } from './response.ts';
+import { nextAction } from './next-action.ts';
 import { step } from './plans.ts';
 
 export class ContextError extends Error {
@@ -175,7 +176,7 @@ export async function configureContext(selector: ContextSelector, options: Conte
     location: { retainedRoot: dirname(config.databasePath), recyclableRoots: options.recyclableRoots ?? [] } });
   const result = await database.configureContext({ resolved: config, digest: configuration.digest, provenance: { file: configuration.file } }, options.caller, options.dryRun);
   if (result.fields.length) throw new ContextError('context_mismatch', 'Context identity cannot change', { fields: result.fields });
-  if (result.blockers.length) throw new CommandFailure('policy_refused', { blockers: result.blockers }, { operation: 'status.show', args: { attentionOnly: true, page: { after: null, limit: 100 } }, description: 'Resolve each blocking attempt, claim and effect before configuring the context.' });
+  if (result.blockers.length) throw new CommandFailure('policy_refused', { blockers: result.blockers }, nextAction('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }, 'Resolve each blocking attempt, claim and effect before configuring the context.'));
   return { revision: result.revision, digest: result.digest, changedFields: result.changedFields,
     steps: result.changedFields.length ? [step('context.configure', config.contextId, [], false)] : [] };
 }

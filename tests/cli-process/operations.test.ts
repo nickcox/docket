@@ -158,6 +158,27 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(checked.status, 0, JSON.stringify(checked.envelope));
   assert.equal(checked.data.request.result.status, 'passed');
   assert.equal(f.invoke('checks.run', { ...checksInput, dryRun: false }, 'explicit-checks').data.request.id, checked.data.request.id);
+  const readBefore = await snapshot(f.home);
+  const request = f.invoke('request.show', { requestId: 'dispatch' });
+  assert.equal(request.status, 0, JSON.stringify(request.envelope));
+  assert.equal(request.data.requestId, 'dispatch');
+  assert.equal(request.data.operation, 'attempt.dispatch');
+  assert.equal(request.data.attemptId, attempt.id);
+  assert.equal(request.data.caller.kind, 'person');
+  assert.equal(request.data.parent, null);
+  assert.equal(request.data.target, null);
+  assert.ok(request.data.input);
+  assert.ok(request.data.effectsTotal > 0);
+  const effectRequest = f.invoke('request.show', { requestId: detail.effects[0].requestKey });
+  assert.equal(effectRequest.status, 0, JSON.stringify(effectRequest.envelope));
+  assert.equal(effectRequest.data.attemptId, attempt.id);
+  assert.equal(effectRequest.data.parent.id, request.data.id);
+  assert.ok(effectRequest.data.target.kind);
+  assert.ok(effectRequest.data.result);
+  assert.equal(f.invoke('request.show', { requestId: request.data.id }).envelope.code, 'invalid_input');
+  assert.equal(f.invoke('request.show', { requestId: 'absent' }).envelope.code, 'invalid_input');
+  assert.equal(f.invoke('request.show', { requestId: 'dispatch', caller: { kind: 'person' } }).envelope.code, 'invalid_input');
+  assert.deepEqual(await snapshot(f.home), readBefore, 'R09/R27: request inspection is read-only');
   for (const attentionOnly of [false, true]) {
     const status = f.invoke('status.show', { attentionOnly, page: { after: null, limit: 100 } }).data;
     assert.equal(JSON.stringify(status).includes(definition.instructions), false, 'R27: status excludes task instructions');

@@ -11,6 +11,7 @@ import { prepareWorker, activateWorker } from './workers.ts';
 import type { WorkerHost, WorkerReference } from './storage/launch.ts';
 import { runCandidateChecks } from './checks.ts';
 import { CommandFailure } from './response.ts';
+import { nextAction } from './next-action.ts';
 import { step } from './plans.ts';
 import { known } from './operation-utils.ts';
 import { automaticReturn, leaseReturnReason } from './completion.ts';
@@ -206,7 +207,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       const leaseReturn = await automaticReturn(db, id, caller, runtime.completion);
       throw new CommandFailure('worker_failed', { attemptId: id, profile: reservation.attempt.specification.profileName,
         failureKind: turnFailure.kind, message: turnFailure.message, leaseReturn: { state: leaseReturn.state, reason: leaseReturn.reason } },
-        { operation: 'attempt.show', args: { attemptId: id }, description: 'Inspect the failure before retrying; a person must clear a limited profile after its provider limit resets.' });
+        nextAction('attempt.show', { attemptId: id }, 'Inspect the failure before retrying; a person must clear a limited profile after its provider limit resets.'));
     }
     await withHeartbeat(db.completeWorker(id, host, runtime.repository));
     if (db.attempt(id).candidate) {

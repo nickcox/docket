@@ -95,6 +95,12 @@ A person can explicitly request the same checks with `attempt.return`: `{"attemp
 
 When return is unsafe the lease is kept. `status.show` with `attentionOnly:true` lists the attempt's current return condition and a next action. Preserve or commit uncommitted and untracked work, retain output, or resolve uncertain effects before requesting a return.
 
+## Request inspection
+
+Use `request.show` with `{"requestId":"<public replay key>"}` to follow a refusal's next action or inspect a command's progress. This is the printed replay key, not the internal request UUID. The read returns the internal ID and public key, operation, state, caller, linked attempt and objective, parent command identity, typed target, immutable input and recorded result. A command also lists up to 20 linked effects with their states and the total count; inspect an effect by its own public key for detail. Unknown keys refuse with `invalid_input`.
+
+The read changes nothing and is not planable, so it has no `dryRun` field. A person can inspect every request. The storage read keeps objective scope explicit for later supervisor bindings; unscoped context commands remain person-only. Credentials and environment fields are redacted recursively, including diagnostic credential patterns. Large input and result objects become marked, bounded summaries (128 KiB and 32 KiB respectively); stored inputs and results are not changed.
+
 ## Resolving uncertainty
 
 `claim.resolve` names the exact claim UUID; `effect.resolve` names the exact effect UUID and `happened` or `not_happened`. Both require person authority, nonblank scoped evidence and `confirmStopped:true`. A stale heartbeat is diagnostic only and never resolves anything. Specialised owner reads must not contradict the person's resolution. Resolving an effect does not silently take over its owner claim, relaunch a worker, acquire another workspace or retry the effect. Inspect the remaining status and resolve each exact scope separately.

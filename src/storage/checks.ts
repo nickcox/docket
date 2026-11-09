@@ -5,6 +5,7 @@ import type { ExecutionProfile } from '../check-policy.ts';
 import type { StoredRequest } from './requests.ts';
 import type { Claim, ClaimIdentity } from './claims.ts';
 import { CommandFailure } from '../response.ts';
+import { nextAction } from '../next-action.ts';
 
 /** A missing or unfinished run is not evidence that checks failed. */
 export function acceptanceCheckFailure(attemptId: string, commit: string, request: StoredRequest | null,
@@ -17,21 +18,16 @@ export function acceptanceCheckFailure(attemptId: string, commit: string, reques
       return { claimId: claim.id, attemptId: claim.attemptId, ownerRef: claim.ownerRef,
         checkRequestId: holder?.id ?? null, requestId: holder?.requestKey ?? null, state: holder?.state ?? null };
     });
-    return new CommandFailure('checks_waiting', { ...data, slotHolders }, {
-      operation: 'attempt.accept', args: { attemptId, candidateCommit: commit, overrideReason: null, dryRun: false },
-      description: 'Retry acceptance after the current check run releases its slot.',
-    });
+    return new CommandFailure('checks_waiting', { ...data, slotHolders }, nextAction('attempt.accept',
+      { attemptId, candidateCommit: commit, overrideReason: null, dryRun: false },
+      'Retry acceptance after the current check run releases its slot.'));
   }
   const code = request?.result?.status === 'failed' ? 'check_failed'
     : request?.state === 'uncertain' || request?.result?.status === 'uncertain' ? 'effect_uncertain' : 'check_missing';
-  if (code === 'check_failed' || code === 'check_missing') return new CommandFailure(code, data, {
-    operation: 'checks.run', args: { attemptId, commit, dryRun: false },
-    description: 'Run checks with a new request key, then retry acceptance if they pass.',
-  });
-  return new CommandFailure(code, data, request ? {
-    operation: 'request.show', args: { requestId: request.requestKey },
-    description: 'Inspect the check request before deciding how to proceed.',
-  } : null);
+  if (code === 'check_failed' || code === 'check_missing') return new CommandFailure(code, data, nextAction('checks.run', { attemptId, commit, dryRun: false },
+    'Run checks with a new request key, then retry acceptance if they pass.'));
+  return new CommandFailure(code, data, request ? nextAction('request.show', { requestId: request.requestKey },
+    'Inspect the check request before deciding how to proceed.') : null);
 }
 
 export interface CheckRunInput {

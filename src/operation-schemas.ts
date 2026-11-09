@@ -28,6 +28,15 @@ function outputSchema(name: string): JsonSchema {
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
   if (name === 'profile.clear') return object({ profile: string, steps });
+  if (name === 'request.show') {
+    const identity = { id: uuid, requestId: string, operation: string,
+      state: { enum: ['pending', 'claimed', 'succeeded', 'rejected', 'withdrawn', 'uncertain'] } };
+    return object({ ...identity, category: { enum: ['command', 'effect'] }, caller: view,
+      attemptId: nullable(uuid), objectiveId: nullable(id), parent: nullable(object(identity)),
+      target: nullable(object({ kind: { enum: ['workspace', 'worker', 'answer', 'checks', 'repository', 'diagnostics'] }, reference: view })),
+      input: view, result: nullable(view), effects: { type: 'array', maxItems: 20, items: object(identity) },
+      effectsTotal: { type: 'integer', minimum: 0 } });
+  }
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
@@ -66,6 +75,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('context.configure', 'Validate and apply the selected configuration while quiescent.', { dryRun: bool }, true, ['person']),
   operation('profile.clear', 'Clear a limited profile after its provider limit resets.', { profile: string, dryRun: bool }, true, ['person']),
   operation('status.show', 'Read context status, capacity and unresolved owners.', { attentionOnly: bool, page }, false),
+  operation('request.show', 'Read a request by its exact public replay key, with bounded and redacted evidence.', { requestId: string }, false),
   operation('task.add', 'Add a task at the end of the queue.', { id: nullable(id), definition: definition(false), objectiveId: nullable(id) }),
   operation('task.show', 'Read a task and its readiness.', { taskId: id }, false),
   operation('task.list', 'Read a page of tasks in queue order.', { state: { enum: ['queued', 'in_flight', 'done', null] }, readyOnly: bool, page }, false),

@@ -3,6 +3,7 @@ import test from "node:test";
 import { catalogue, executeOperation, findOperation } from "../../src/catalog.ts";
 import type { JsonSchema } from "../../src/catalog.ts";
 import { validateSchema } from '../../src/operation-schemas.ts';
+import { nextActionOperations } from '../../src/next-action.ts';
 
 function checkInputSchema(schema: JsonSchema): void {
   if (schema.type === "object") {
@@ -26,13 +27,13 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
   assert.equal(catalogue.catalogueVersion, 1);
   assert.deepEqual(catalogue.operations.map(operation => operation.name).sort(), ['catalog.show', 'context.init', 'context.configure', 'status.show',
     'task.add', 'task.show', 'task.list', 'task.update', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
-    'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run'].sort());
+    'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'request.show'].sort());
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
     assert.ok(operation.roles.includes('person'));
     if (['context.init', 'context.configure', 'attempt.continue', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
     assert.deepEqual(operation.bindingDerivedFields, operation.name === 'task.add' ? ['objectiveId'] : []);
-    assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show'].includes(operation.name));
+    assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show', 'request.show'].includes(operation.name));
     assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);
@@ -64,6 +65,10 @@ test('R28/R30: dependency schemas require exactly two task IDs and do not offer 
       assert.notEqual(validateSchema(operation.inputSchema, invalid), null);
     }
   }
+});
+
+test('R28: every operation named by a next action exists in the catalogue', () => {
+  for (const name of nextActionOperations) assert.ok(findOperation(name), `Missing next-action operation: ${name}`);
 });
 
 test("R28/A52: the no-argument input schema is a described strict empty object", () => {
