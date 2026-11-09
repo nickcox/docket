@@ -14,13 +14,17 @@ import { CommandFailure } from './response.ts';
 import { step } from './plans.ts';
 import { known } from './operation-utils.ts';
 import { automaticReturn, leaseReturnReason } from './completion.ts';
+import { continuationEvidence, continuationHandover } from './continuation.ts';
 
-export async function dispatch(db: Database, args: { taskId: string | null; profile: string | null; dryRun: boolean },
+export async function dispatch(db: Database, args: { taskId: string | null; profile: string | null; dryRun: boolean; sourceAttemptId?: string; sourceCommit?: string | null; note?: string | null },
   caller: TaskActor, requestKey: string, runtime: Runtime, progress: (message: string) => void) {
+  if (args.sourceAttemptId && caller.kind !== 'person') throw new CommandFailure('person_required');
+  const continuationInput = args.sourceAttemptId ? { sourceAttemptId: args.sourceAttemptId, sourceCommit: args.sourceCommit ?? null,
+    ...(args.note == null ? {} : { note: args.note }) } : {};
   const previous = db.requests().find(r => r.requestKey === requestKey);
   // A replay never starts another owner or resumes an interrupted remote call.
   if (previous) {
-    const replay = await db.reserveAttempt({ requestKey, caller, ...(args.taskId === null ? {} : { taskId: args.taskId }),
+    const replay = await db.reserveAttempt({ requestKey, caller, ...continuationInput, ...(args.taskId === null ? {} : { taskId: args.taskId }),
       ...(args.profile === null ? {} : { profile: args.profile }), startingCommit: '', checks: {} as ReservationInput['checks'],
       delivery: {} as ReservationInput['delivery'] }, args.dryRun);
     const leaseReturn = replay.attempt.leaseState === 'returned'
@@ -30,10 +34,14 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   }
   const config = db.checkConfiguration();
   const configured = db.events().findLast(e => e.kind === 'context.configured')!.payload.resolved as JsonObject;
-  const starting = known(await runtime.repository.inspectRef(`refs/heads/${String(configured.baseBranch).replace(/^refs\/heads\//u, '')}`));
+  const inherited = args.sourceAttemptId ? await continuationEvidence(db, args.sourceAttemptId, args.taskId!, runtime, args.sourceCommit ?? null) : null;
+  const starting = inherited ? { state: 'present' as const, commit: inherited.startingCommit }
+    : known(await runtime.repository.inspectRef(`refs/heads/${String(configured.baseBranch).replace(/^refs\/heads\//u, '')}`));
   if (starting.state !== 'present') throw new CommandFailure('candidate_missing');
   const checks = await runtime.repository.readCheckPolicy(config.targetBranch.startsWith('refs/') ? config.targetBranch : `refs/heads/${config.targetBranch}`, config.checks);
-  const input: ReservationInput = { requestKey, caller, startingCommit: starting.commit, checks,
+  const input: ReservationInput = { requestKey, caller, ...continuationInput,
+    ...(inherited ? { handover: continuationHandover(db, args.sourceAttemptId!, starting.commit, args.sourceCommit != null, args.note ?? null) } : {}),
+    startingCommit: starting.commit, checks,
     ...(args.taskId === null ? {} : { taskId: args.taskId }), ...(args.profile === null ? {} : { profile: args.profile }),
     expectedConfigRevision: config.revision, expectedConfigDigest: config.digest,
     delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } };
@@ -48,11 +56,19 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   // Recorded acquisition uncertainty is checked by the same reservation builder.
   // Treehouse status initialises owner metadata on an empty pool, so it is not a
   // read-only prerequisite. Acquisition itself verifies the live pool identity.
-  const steps = ['attempt.reserve', 'workspace.acquire', 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
+  const steps = ['attempt.reserve', ...(inherited ? ['continuation.pin'] : []), 'workspace.acquire',
+    ...(inherited ? ['continuation.cleanup-pin'] : []), 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
     'worker.activate', 'worker.wait', 'worker.fence', 'attempt.complete', 'checks.run'].map(operation => step(operation, task.id,
       operation === 'attempt.reserve' ? ['ready', 'capacity', 'resolved_owners'] : ['current_authority'], operation === 'checks.run'));
-  if (args.dryRun) return { taskId: task.id, skippedTasks: preview.skippedTasks, steps };
+  if (args.dryRun) return { taskId: task.id, skippedTasks: preview.skippedTasks, steps,
+    ...(inherited ? { startingCommit: starting.commit, subject: inherited.subject } : {}) };
   progress('attempt.reserve');
+  if (args.sourceAttemptId) {
+    const current = await continuationEvidence(db, args.sourceAttemptId, task.id, runtime, args.sourceCommit ?? null);
+    starting.commit = current.startingCommit;
+    input.startingCommit = current.startingCommit;
+    input.handover = continuationHandover(db, args.sourceAttemptId, current.startingCommit, args.sourceCommit != null, args.note ?? null);
+  }
   const reservation = await db.reserveAttempt(input);
   if (reservation.replayed) return { attempt: reservation.attempt,
     leaseReturn: reservation.attempt.leaseState === 'returned' ? { state: 'returned', reason: null }
@@ -96,7 +112,31 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     await db.recordEffectOutcome(effect.id, identity, result.status === 'confirmed' ? 'succeeded' : result.status === 'rejected' ? 'rejected' : 'uncertain', JSON.parse(JSON.stringify(result)));
     known(result);
   };
+  const recheck = async () => {
+    if (args.sourceAttemptId) await continuationEvidence(db, args.sourceAttemptId, task.id, runtime, args.sourceCommit ?? null, id, starting.commit);
+  };
+  const pin = `refs/docket/continuations/${id}`;
+  const pinEffect = async (cleanup: boolean) => {
+    await recheck();
+    const operation = cleanup ? 'continuation.cleanup-pin' : 'continuation.pin';
+    const effect = await db.recordEffect({ requestKey: `${operation}:${id}`, operation, caller, executor,
+      parentId: reservation.requestId, attemptId: id, input: { ref: pin, commit: starting.commit },
+      fingerprint: canonicalJson({ ref: pin, commit: starting.commit }), target: { kind: 'repository', reference: { ref: pin } } });
+    await db.claimEffect(effect.id, executor);
+    const existing = await runtime.repository.inspectRef(pin);
+    const result = existing.status !== 'confirmed' ? existing
+      : cleanup ? existing.value.state === 'absent' ? existing : await runtime.repository.conditionalDeleteRef(pin, starting.commit)
+      : existing.value.state === 'present' ? existing.value.commit === starting.commit ? existing
+        : { status: 'rejected' as const, reason: 'Pin moved; preserved', evidence: null }
+        : await runtime.repository.createPinnedRef(pin, starting.commit);
+    await db.recordEffectOutcome(effect.id, executor, result.status === 'confirmed' ? 'succeeded' : result.status === 'rejected' ? 'rejected' : 'uncertain', JSON.parse(JSON.stringify(result)));
+    if (cleanup && result.status !== 'confirmed') progress(`${operation}: ${result.reason}`);
+    if (result.status === 'uncertain') throw new CommandFailure('effect_uncertain', { effectId: effect.id, reason: result.reason });
+    if (!cleanup) known<unknown>(result);
+  };
   try {
+    if (inherited) await pinEffect(false);
+    await recheck();
     progress('workspace.acquire');
     const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, caller);
     try {
@@ -111,8 +151,11 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       await db.recordUncertainAcquisition(id, acquisition.effect.id, executor, { reason: 'Workspace acquisition could not be confirmed' });
       throw error;
     }
+    if (inherited) await pinEffect(true);
+    await recheck();
     await refresh();
     progress('attempt.start'); await db.startAttempt(id, caller);
+    await recheck();
     progress('worker.prepare');
     const prepared = await withHeartbeat(prepareWorker(db, id, host, runtime.launcher));
     if (prepared.state !== 'succeeded') {
@@ -122,8 +165,10 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     reference = prepared.result!.reference as WorkerReference;
     progress('worker.bind');
     await refresh();
+    await recheck();
     progress('worker.permit'); await db.decideWorkerLaunch(id, prepared.claimId!, 'permit', host);
     if (stopRequested) throw new CommandFailure('policy_refused', { attemptId: id });
+    await recheck();
     progress('worker.activate');
     const activation = await withHeartbeat(activateWorker(db, id, reference, host, runtime.launcher));
     if (activation?.state !== 'succeeded') throw new CommandFailure('effect_uncertain', { attemptId: id });

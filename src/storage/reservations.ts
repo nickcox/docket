@@ -24,6 +24,8 @@ export interface ReservationInput {
   profile?: string;
   note?: string;
   sourceAttemptId?: string;
+  sourceCommit?: string | null;
+  handover?: JsonObject;
   startingCommit: string;
   checks: TrustedChecks;
   delivery: { kind: 'code' | 'report'; acceptance: 'review_or_integration'; requiredEvidence: string[]; requiredDeliverables: string[] };
@@ -86,7 +88,7 @@ export function commit(value: unknown): void {
   if (typeof value !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value)) throw new TypeError('Expected exact commit');
 }
 export function reservationInput(value: ReservationInput): void {
-  fields(value, ['requestKey', 'caller', 'taskId', 'profile', 'note', 'sourceAttemptId', 'startingCommit', 'checks', 'delivery',
+  fields(value, ['requestKey', 'caller', 'taskId', 'profile', 'note', 'sourceAttemptId', 'sourceCommit', 'handover', 'startingCommit', 'checks', 'delivery',
     'expectedDefinitionRevision', 'expectedDecisionRevision', 'expectedConfigRevision', 'expectedConfigDigest']);
   text(value.requestKey);
   for (const name of ['taskId', 'profile', 'note', 'sourceAttemptId', 'expectedConfigDigest'] as const) {
@@ -97,6 +99,8 @@ export function reservationInput(value: ReservationInput): void {
 }
 /** Only invoked for a new key: replay must not revalidate resolved repository evidence. */
 export function reservationEvidence(value: ReservationInput): void {
+  if (value.sourceCommit != null) commit(value.sourceCommit);
+  if (value.handover && JSON.stringify(value.handover).length > 262144) throw new TypeError('Continuation handover exceeds size bound');
   commit(value.startingCommit);
   fields(value.checks, ['sourceCommit', 'digest', 'fast', 'full', 'present', 'sourceDigest', 'executionProfile']);
   commit(value.checks.sourceCommit); text(value.checks.digest);

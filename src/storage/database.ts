@@ -671,13 +671,43 @@ export class Database {
     return this.snapshot(() => this.decodeAttempt(this.attemptRow(id)));
   }
 
+  /** R12: checked under the reservation lock and again before continuation effects. */
+  continuationSource(sourceId: string, taskId: string, newAttemptId?: string): Attempt {
+    if (!this.db.isTransaction) return this.snapshot(() => this.continuationSource(sourceId, taskId, newAttemptId));
+    const source = this.decodeAttempt(this.attemptRow(sourceId));
+    if (source.taskId !== taskId || source.executionOpen || source.phase !== 'settled' || !source.outcome
+      || !this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'").get(sourceId)) {
+      throw new StorageError('conflict', 'Continuation requires a terminal settled source for this task');
+    }
+    if (this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND (category = 'effect' OR operation = 'checks.run') AND state IN ('pending', 'claimed', 'uncertain')").get(sourceId)) throw new StorageError('conflict', 'Source has unresolved effects');
+    if (this.db.prepare(`SELECT 1 FROM attempts WHERE task_id = ? AND id <> ? AND id <> ?
+      AND (execution_open = 1 OR lease_state IN ('held', 'unknown')) LIMIT 1`).get(taskId, sourceId, newAttemptId ?? '')) {
+      throw new StorageError('conflict', 'Task is not ready: another attempt or lease blocks continuation');
+    }
+    if (newAttemptId) {
+      const current = this.decodeAttempt(this.attemptRow(newAttemptId)), task = this.decodeTask(this.taskRow(taskId));
+      if ((task.state !== 'queued' && !(task.state === 'in_flight' && current.phase === 'running')) || task.holdReason !== null
+        || task.definitionRevision !== current.specification.definitionRevision
+        || task.decisionRevision !== current.specification.decisionRevision
+        || task.blockerIds.some(id => this.taskRow(id).state !== 'done')) throw new StorageError('conflict', 'Task is not ready for continuation');
+      const configured = this.decodeEvent(this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get()!);
+      const config = resolveReservationConfig(configured.payload, task, String(current.specification.profileName));
+      const limited = this.limitedProfiles().find(item => item.profile === config.profileName);
+      if (limited) throw new CommandFailure('provider_limited', { ...limited });
+      if (Number(this.db.prepare('SELECT count(*) AS count FROM attempts WHERE execution_open = 1').get()!.count) > config.maxAttempts) throw new StorageError('conflict', 'Context attempt capacity reached');
+      if (Number(this.db.prepare("SELECT count(*) AS count FROM attempts WHERE task_id = ? AND id NOT IN (SELECT attempt_id FROM events WHERE kind = 'profile.limited')").get(taskId)!.count) > config.maxAttemptsPerTask) throw new StorageError('conflict', 'Task is not ready: attempt limit reached');
+    }
+    return source;
+  }
+
   /** The key comparison precedes selection, policy resolution and all admission decisions. */
   async reserveAttempt(input: ReservationInput, dryRun = false): Promise<Reservation> {
     reservationInput(input);
     const value = JSON.parse(json(input)) as ReservationInput;
     const logicalInput = { taskId: value.taskId ?? null, profile: value.profile ?? null,
-      sourceAttemptId: value.sourceAttemptId ?? null, note: value.note ?? null };
-    const command: CommandInput = { requestKey: value.requestKey, operation: 'attempt.dispatch', caller: value.caller,
+      sourceAttemptId: value.sourceAttemptId ?? null, note: value.note ?? null,
+      ...(value.sourceAttemptId === undefined ? {} : { sourceCommit: value.sourceCommit ?? null }) };
+    const command: CommandInput = { requestKey: value.requestKey, operation: value.sourceAttemptId === undefined ? 'attempt.dispatch' : 'attempt.continue', caller: value.caller,
       input: logicalInput, fingerprint: createHash('sha256').update(json(logicalInput)).digest('hex') };
     const build = () => {
       const previous = this.duplicateRequest(command, 'command');
@@ -688,7 +718,12 @@ export class Database {
       }
       taskActor(value.caller);
       reservationEvidence(value);
-      if (value.sourceAttemptId !== undefined) throw new StorageError('conflict', 'Continuation is not supported by dispatch');
+      if (value.sourceAttemptId !== undefined) {
+        if (value.caller.kind !== 'person') throw new CommandFailure('person_required');
+        if (value.taskId === undefined || !value.handover) throw new StorageError('conflict', 'Continuation requires a named task and handover');
+        const source = this.continuationSource(value.sourceAttemptId, value.taskId);
+        if (value.handover.sourceRevision !== source.revision) throw new StorageError('conflict', 'Source revision changed');
+      }
       const configured = this.db.prepare("SELECT * FROM events WHERE kind = 'context.configured' ORDER BY seq DESC LIMIT 1").get();
       const genesis = this.db.prepare("SELECT * FROM events WHERE source_key = 'database.initialised'").get();
       if (!configured || !genesis) throw new StorageError('conflict', 'Missing context identity or configuration');
@@ -722,7 +757,7 @@ export class Database {
         const unavailable = task.state !== 'queued' || task.holdReason !== null ||
           this.db.prepare(`SELECT 1 FROM dependencies JOIN tasks AS blocker ON blocker.id = blocker_id
             WHERE task_id = ? AND blocker.state <> 'done' LIMIT 1`).get(task.id) ||
-          this.db.prepare("SELECT 1 FROM attempts WHERE task_id = ? AND (execution_open = 1 OR lease_state IN ('held', 'unknown')) LIMIT 1").get(task.id) ||
+          this.db.prepare("SELECT 1 FROM attempts WHERE task_id = ? AND (execution_open = 1 OR (lease_state IN ('held', 'unknown') AND id <> ?)) LIMIT 1").get(task.id, value.sourceAttemptId ?? '') ||
           Number(this.db.prepare("SELECT count(*) AS count FROM attempts WHERE task_id = ? AND id NOT IN (SELECT attempt_id FROM events WHERE kind = 'profile.limited')").get(task.id)!.count) >= config.maxAttemptsPerTask;
         if (unavailable || task.objectiveId !== null) {
           if (value.taskId !== undefined) throw new StorageError('conflict', task.objectiveId !== null ? 'Objective-linked tasks are not supported' : 'Task is not eligible for reservation');
@@ -744,6 +779,7 @@ export class Database {
         const holder = { databaseId: identity.databaseId, contextId: identity.contextId, taskId: task.id, attemptId: id };
         const specification: JsonObject = { version: 1, ...holder, number, task: object(task),
           definitionRevision: task.definitionRevision, decisionRevision: task.decisionRevision, criteria: task.criteria,
+          ...(value.sourceAttemptId === undefined ? {} : { sourceAttemptId: value.sourceAttemptId, handover: value.handover! }),
           objectiveId: null, delivery: object({ ...value.delivery, baseRef: config.baseBranch, startingCommit: value.startingCommit, outputBranch: outputRef }),
           baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit: value.startingCommit,
           resultPath: join(String(identity.stateDirectory), 'attempts', id, 'result.json'),
@@ -774,7 +810,7 @@ export class Database {
     const expected = { ...executor }, actor = object(caller);
     return this.write(() => {
       const attempt = this.attemptRow(attemptId), command = this.decodeRequest(this.requestRow(requestId));
-      if (command.category !== 'command' || command.operation !== 'attempt.dispatch' || command.attemptId !== attemptId || json(command.caller) !== json(actor)) {
+      if (command.category !== 'command' || !['attempt.dispatch', 'attempt.continue'].includes(command.operation) || command.attemptId !== attemptId || json(command.caller) !== json(actor)) {
         throw new StorageError('conflict', 'Acquisition must match its reservation command and caller');
       }
       const existing = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'workspace.acquire'").get(attemptId);
@@ -786,6 +822,7 @@ export class Database {
       if (blockers.length) throw new StorageError('conflict', `Admission blocked: ${json(blockers)}`);
       if (attempt.phase !== 'reserved' || attempt.launch_state !== 'pending' || attempt.allocation !== null || attempt.lease_state !== 'none') throw new StorageError('conflict', 'Attempt is not reserved');
       const specification = object(JSON.parse(String(attempt.specification)));
+      if (typeof specification.sourceAttemptId === 'string') this.continuationSource(specification.sourceAttemptId, String(attempt.task_id), attemptId);
       const input = { workspace: specification.workspace!, repository: specification.repository!, outputRef: specification.outputRef!, startingCommit: specification.startingCommit! };
       const recorded = this.recordEffectInTransaction({ requestKey: `workspace.acquire:${attemptId}`, operation: 'workspace.acquire',
         parentId: requestId, attemptId, caller: actor, executor: expected,
@@ -889,7 +926,7 @@ export class Database {
   }
 
   private dispatchCommand(attemptId: string): StoredRequest {
-    const row = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND category = 'command' AND operation = 'attempt.dispatch'").get(attemptId);
+    const row = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND category = 'command' AND operation IN ('attempt.dispatch', 'attempt.continue')").get(attemptId);
     if (!row) throw new StorageError('conflict', 'Dispatch command is missing');
     return this.decodeRequest(row);
   }
@@ -2043,7 +2080,7 @@ export class Database {
     const claim = this.activeClaim(value.executor);
     if (value.operation === 'worker.prepare' || value.operation === 'worker.activate') {
       if (!value.attemptId || value.requestKey !== `${value.operation}:${value.attemptId}`
-        || parent.operation !== 'attempt.dispatch' || parent.attemptId !== value.attemptId || value.target.kind !== 'worker') {
+        || !['attempt.dispatch', 'attempt.continue'].includes(parent.operation) || parent.attemptId !== value.attemptId || value.target.kind !== 'worker') {
         throw new StorageError('conflict', 'Worker effects must use the attempt dispatch and its unique effect key');
       }
       const attempt = this.attemptRow(value.attemptId);

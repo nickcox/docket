@@ -41,6 +41,11 @@ function outputSchema(name: string): JsonSchema {
     const skippedTasks = { type: 'array', items: object({ taskId: id, reason: string }) };
     variants.push(object({ taskId: id, skippedTasks, steps }), object({ attempt: view, leaseReturn, skippedTasks, steps }), object({ attempt: view, leaseReturn, replayed: bool, skippedTasks, steps }));
   }
+  else if (name === 'attempt.continue') {
+    const skippedTasks = { type: 'array', items: object({ taskId: id, reason: string }) };
+    variants.push(object({ taskId: id, skippedTasks, steps, startingCommit: string, subject: { type: 'string' } }),
+      object({ attempt: view, leaseReturn, skippedTasks, steps }), object({ attempt: view, leaseReturn, replayed: bool, skippedTasks, steps }));
+  }
   else if (['attempt.accept', 'attempt.return', 'attempt.discard'].includes(name)) {
     variants.push(object({ attempt: view, leaseReturn, steps }), object({ attempt: view, leaseReturn }));
   }
@@ -69,6 +74,9 @@ export const coreOperations: OperationDefinition[] = [
   operation('task.reorder', 'Reorder the tasks in this scope.', { orderedTaskIds: { type: 'array', items: id, uniqueItems: true } }),
   ...['done', 'reopen'].map(action => operation(`task.${action}`, `Record a ${action} judgement without inventing acceptance evidence.`, { taskId: id, note: nullable(string) })),
   operation('attempt.dispatch', 'Dispatch a ready task and wait in the foreground through completion and checks.', { taskId: nullable(id), profile: nullable(string), dryRun: bool }),
+  operation('attempt.continue', 'Continue a terminal settled source in a new attempt without accepting its work.', {
+    sourceAttemptId: uuid, sourceCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }),
+    profile: nullable(string), note: nullable(string), dryRun: bool }, true, ['person']),
   operation('attempt.show', 'Read full attempt identity and evidence.', attempt, false),
   operation('attempt.accept', 'Accept an exact retained candidate and apply finalisation policy.', { ...planAttempt, candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), overrideReason: nullable(string) }),
   operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt, true, ['person']),

@@ -59,6 +59,14 @@ A `provider_limit` failure limits the profile until a person runs `profile clear
 
 Plan dispatch with `{"taskId":"notes","profile":null,"dryRun":true}`. Change only `dryRun` to false to execute. Dispatch reserves, acquires, starts, prepares, binds, permits and activates one worker, waits for its turn, fences it and observes direct-child exit, validates its result, records completion and runs the trusted checks. It does not accept output. After recording a held or failed outcome it checks whether the lease can be returned automatically. A replay inspects progress and never launches another worker.
 
+## Continuation
+
+A person can plan `attempt.continue` with `{"sourceAttemptId":"<UUID>","sourceCommit":null,"profile":null,"note":null,"dryRun":true}`. The source identifies the task. Release any task hold first. The plan reports `startingCommit` and its subject. Execute with `dryRun:false`; the new attempt uses the source output ref's commit at reservation, even without a source candidate. A person may instead supply an exact `sourceCommit` between the source's starting commit and its current output head, inclusive.
+
+The source must be terminal and settled, with a retained output ref and no unresolved effect. Its held workspace must be clean, including untracked files, or continuation refuses with `workspace_dirty`. Other workers and leases for the task block continuation; only the source's held lease is exempt. Readiness, attempt limits, capacity and profile limits still apply. Continuing neither accepts the source's work nor prompts its worker again.
+
+The new attempt has its own output ref, lease and session. Its immutable handover includes source identity, candidate, outcome and failure, criteria, recorded checks and your note. Review findings and questions remain empty until those operations are implemented. The worker must verify inherited work against the task. A private ref pins the recorded start before workspace acquisition; conditional cleanup preserves a moved ref and records uncertain cleanup for resolution. Source lease return follows the ordinary safe-return rules. Reuse the same request ID and input after a lost response: replay returns the original attempt without allocation or activation.
+
 ## Acceptance and return
 
 If acceptance needs checks but their slot is occupied, it refuses with `checks_waiting`, not `check_failed`. Data includes `checkRequest` (its internal `id`, public `requestId`, state and evidence key) and `slotHolders` (claim, attempt, check request and owner identities). A claimed run also reports `checks_waiting` with its actual state. Follow `nextAction` to retry acceptance after the slot is free; the pending checks then run and acceptance continues if they pass. `check_failed` means a recorded result failed; missing checks report `check_missing` and uncertain checks report `effect_uncertain` with the request to inspect.

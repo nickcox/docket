@@ -162,6 +162,12 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'task.done': return { task: await db.markTaskDone(id, caller, command) };
       case 'task.reopen': return { task: await db.reopenTask(id, caller, command) };
       case 'attempt.show': return attemptView(db, String(args.attemptId));
+      case 'attempt.continue': {
+        const previous = db.requests().find(r => r.requestKey === requestKey);
+        const taskId = previous ? previous.input.taskId as string | null : db.attempt(String(args.sourceAttemptId)).taskId;
+        return await dispatch(db, { taskId, profile: args.profile as string | null, dryRun: Boolean(args.dryRun),
+          sourceAttemptId: String(args.sourceAttemptId), sourceCommit: args.sourceCommit as string | null, note: args.note as string | null }, caller, requestKey, await services(), progress);
+      }
       case 'attempt.dispatch': return await dispatch(db, args as unknown as Parameters<typeof dispatch>[1], caller, requestKey, await services(), progress);
       case 'attempt.rebase': {
         const completion = (await services()).completion;

@@ -314,8 +314,8 @@ export function piWorkerPrompt(binding: WorkerBinding): string {
     taskId: binding.taskId, attemptId: binding.attemptId, leaseId: binding.allocation.leaseId, sessionId: binding.sessionId },
     workspace: binding.allocation.path, startingCommit: binding.allocation.startingCommit, outputRef: binding.allocation.outputRef,
     instructions: task.instructions, criteria: specification.criteria, delivery: specification.delivery,
-    reviewTarget: specification.reviewTarget ?? null, resultPath, questionsDirectory, artefactsDirectory };
-  return ['Complete this one assigned task in the exact leased workspace. Do not launch other agents, mutate task records or leases, merge, push or publish.',
+    reviewTarget: specification.reviewTarget ?? null, handover: specification.handover ?? null, resultPath, questionsDirectory, artefactsDirectory };
+  return ['Complete this one assigned task in the exact leased workspace. Do not launch other agents, mutate task records or leases, merge, push or publish. Check any inherited work in the handover against the task and its criteria rather than trusting it. This is a new attempt, not acceptance of the source work.',
     'Use this immutable worker protocol version 1 input:', JSON.stringify(protocol),
     'Write one JSON result to resultPath using the write tool, with exactly these fields: version:1, identity (the exact supplied object), startingCommit, outputRef, outcome (completed|held|failed), summary, reason (null for completed, otherwise a nonblank string), criteriaReport, evidence, workReferences. Copy startingCommit and outputRef exactly from the input.',
     'evidence is an array of {name,summary}. workReferences contains {kind:"git",name,branch,commit} (branch equals outputRef, commit is the exact retained candidate) or {kind:"artefact",name,path,description} (path is relative to the result file directory). Include every required evidence and deliverable name. Store retained artefacts in artefactsDirectory.',
