@@ -18,6 +18,15 @@ function progress(db: Database, input: RebaseInput): StoredEvent | undefined {
     || canonicalJson(command.caller) !== canonicalJson(input.caller))) throw new StorageError('request_input_mismatch', 'Request input differs');
   return command && db.events().find(e => e.sourceKey === `rebase.authorised:${command.id}`);
 }
+function replayUpstream(db: Database, attemptId: string, commit?: string): string {
+  const attempt = db.attempt(attemptId);
+  const previousRebase = db.events().findLast(e => e.attemptId === attemptId && e.kind === 'output.rebased'
+    && (commit === undefined || e.payload.rebased === commit));
+  if (previousRebase) return String(previousRebase.payload.target);
+  const startingCommit = String(attempt.specification.startingCommit);
+  const sourceAttemptId = attempt.specification.sourceAttemptId;
+  return typeof sourceAttemptId === 'string' ? replayUpstream(db, sourceAttemptId) : startingCommit;
+}
 async function prerequisites(db: Database, input: RebaseInput, services: CompletionServices, plan?: JsonObject, detached = false, moved = false) {
   taskActor(input.caller);
   const attempt = db.attempt(input.attemptId), candidate = attempt.candidate, allocation = attempt.allocation;
@@ -41,8 +50,7 @@ async function prerequisites(db: Database, input: RebaseInput, services: Complet
     if (pin.state !== 'present' || pin.commit !== plan!.pinnedCommit) refuse('Original candidate is not retained by the pinned ref');
   }
   const outputRef = String(candidate!.outputRef), original = String(candidate!.commit);
-  const previousRebase = db.events().findLast(e => e.attemptId === attempt.id && e.kind === 'output.rebased' && e.payload.rebased === original);
-  const upstream = String(previousRebase ? previousRebase.payload.target : attempt.specification.startingCommit);
+  const upstream = replayUpstream(db, attempt.id, original);
   const output = known(await services.repository.inspectRef(outputRef));
   const workspace = known(await services.repository.inspectWorkspace(allocation!.path));
   if (!workspace.clean) refuse('Workspace has uncommitted or untracked work');

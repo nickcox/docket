@@ -65,11 +65,12 @@ function receive(line: string) {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       writeFileSync(protocol.resultPath, 'invalid JSON');
     }
-    if (['result', 'code-result', 'held-result', 'failed-result', 'review-dirty-untracked', 'review-dirty-tracked'].includes(mode ?? '')) {
+    if (['result', 'code-result', 'continuation-result', 'held-result', 'failed-result', 'review-dirty-untracked', 'review-dirty-tracked'].includes(mode ?? '')) {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       let commit = 'b'.repeat(40);
       if (mode !== 'result' && !protocol.reviewTarget) {
-        writeFileSync(join(process.cwd(), 'implementation.txt'), 'Synthetic implementation\n');
+        if (mode === 'continuation-result') appendFileSync(join(process.cwd(), 'implementation.txt'), 'Continuation change\n');
+        else writeFileSync(join(process.cwd(), 'implementation.txt'), 'Synthetic implementation\n');
         const git = (...args: string[]) => execFileSync('git', args, { cwd: process.cwd(), encoding: 'utf8' }).trim();
         git('add', 'implementation.txt');
         git('-c', 'user.name=Synthetic peer', '-c', 'user.email=peer@example.invalid', 'commit', '-qm', 'Implement task');

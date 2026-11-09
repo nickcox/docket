@@ -56,6 +56,57 @@ test('R27/R30: moved targets name exact commits and rebase action; target restri
   assert.equal(returned.data.attempt.leaseState, 'returned');
 });
 
+for (const scenario of ['unaccepted source', 'continued source', 'later accepted source', 'rebased source']) {
+  test(`R12/R14: rebase preserves a continuation with ${scenario}`, async t => {
+    const f = await fixture(t);
+    const success = (result: ReturnType<typeof f.invoke>) => {
+      assert.equal(result.status, 0, JSON.stringify(result.envelope) + result.stderr);
+      return result.data;
+    };
+    success(f.invoke('task.add', { id: 'feature', definition, objectiveId: null }));
+    const source = success(f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false })).attempt;
+    let upstream = source.specification.startingCommit;
+    if (scenario === 'rebased source') {
+      await writeFile(join(f.repo, 'README'), 'First target\n');
+      f.git('commit', '-qam', 'First target');
+      upstream = f.git('rev-parse', 'HEAD');
+      success(f.invoke('attempt.rebase', { attemptId: source.id, dryRun: false }, 'source-rebase'));
+    }
+    let previous = source;
+    const depth = scenario === 'continued source' ? 2 : 1;
+    for (let index = 0; index < depth; index++) {
+      success(f.invoke('task.reopen', { taskId: 'feature', note: null }, `reopen-${index}`));
+      success(f.invoke('task.release', { taskId: 'feature' }, `release-${index}`));
+      const next = success(f.invoke('attempt.continue', { sourceAttemptId: previous.id,
+        sourceCommit: null, profile: null, note: null, dryRun: false }, `continue-${index}`, 'continuation-result')).attempt;
+      success(f.invoke('attempt.return', { attemptId: previous.id, dryRun: false }, `return-${index}`));
+      previous = next;
+    }
+    if (scenario === 'later accepted source') {
+      success(f.invoke('attempt.accept', { attemptId: source.id, candidateCommit: null, overrideReason: null, dryRun: false }, 'accept-source'));
+    }
+    // Omitting the source patch leaves a modification to a file absent from the target.
+    await writeFile(join(f.repo, 'README'), 'Final target\n');
+    f.git('commit', '-qam', 'Final target');
+    const target = f.git('rev-parse', 'HEAD');
+    const before = await snapshot(f.home);
+    const plan = success(f.invoke('attempt.rebase', { attemptId: previous.id, dryRun: true }));
+    assert.deepEqual(await snapshot(f.home), before);
+    const result = success(f.invoke('attempt.rebase', { attemptId: previous.id, dryRun: false }, 'continuation-rebase'));
+    assert.deepEqual(result.steps, plan.steps);
+    const commit = result.attempt.candidate.commit;
+    assert.equal(f.git('show', `${commit}:implementation.txt`),
+      ['Synthetic implementation', ...Array<string>(depth).fill('Continuation change')].join('\n'));
+    assert.equal(f.git('show', `${commit}:README`), 'Final target');
+    assert.equal(f.git('rev-list', '--count', `${target}..${commit}`), String(depth + (scenario === 'later accepted source' ? 0 : 1)));
+    using db = await Database.open(f.config.databasePath, { readOnly: true,
+      location: { retainedRoot: f.config.stateDirectory, recyclableRoots: [f.config.workspace.poolRoot] } });
+    const event = db.events().findLast(e => e.kind === 'output.rebased' && e.attemptId === previous.id)!;
+    assert.deepEqual([event.payload.original, event.payload.upstream, event.payload.target, event.payload.rebased],
+      [previous.candidate.commit, upstream, target, commit]);
+  });
+}
+
 for (const sameLines of [false, true]) {
   test(`R14: repeated rebase excludes conflicting target history${sameLines ? ' when later target changes touch the same lines' : ''}`, async t => {
     const f = await fixture(t);
