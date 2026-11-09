@@ -1945,6 +1945,60 @@ export class Database {
     });
   }
 
+  /** Diagnostic retention never removes authoritative rows or retained output. */
+  checkDiagnosticsEligible(attemptId: string, root: string): void {
+    if (!this.db.isTransaction) return this.snapshot(() => this.checkDiagnosticsEligible(attemptId, root));
+    this.checkDiagnosticsEligibleInTransaction(attemptId, root);
+  }
+
+  private checkDiagnosticsEligibleInTransaction(attemptId: string, root: string): void {
+    const attempt = this.completionGuard(attemptId);
+    const specification = object(JSON.parse(String(attempt.specification)));
+    if (root !== join(dirname(String(specification.resultPath)), 'diagnostics')) throw new StorageError('conflict', 'Diagnostic directory differs from attempt identity');
+    if (attempt.lease_state !== 'returned') throw new StorageError('conflict', 'Diagnostics require a returned lease');
+    if (this.db.prepare(`SELECT 1 FROM claims WHERE attempt_id = ? AND released_at IS NULL
+      AND id NOT IN (SELECT claim_id FROM requests WHERE operation = 'completion.diagnostics' AND claim_id IS NOT NULL)`).get(attemptId)) {
+      throw new StorageError('conflict', 'Diagnostic worker owner is unresolved');
+    }
+    if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
+      AND (category = 'effect' OR operation = 'checks.run') AND operation <> 'completion.diagnostics'`).get(attemptId)) {
+      throw new StorageError('conflict', 'Attempt has an unresolved effect');
+    }
+    const referenced = (value: unknown): boolean => {
+      if (typeof value === 'string') return value === root || value.startsWith(`${root}/`);
+      if (Array.isArray(value)) return value.some(referenced);
+      return value !== null && typeof value === 'object' && Object.values(value).some(referenced);
+    };
+    for (const event of this.db.prepare('SELECT * FROM events ORDER BY seq').all().map(row => this.decodeEvent(row))) {
+      const diagnosticEffect = event.requestId && this.db.prepare("SELECT 1 FROM requests WHERE id = ? AND operation = 'completion.diagnostics'").get(event.requestId);
+      if (!diagnosticEffect && !event.kind.startsWith('diagnostics.') && referenced(event.payload)) {
+        throw new StorageError('conflict', 'Diagnostic directory is referenced by authoritative evidence');
+      }
+    }
+    for (const row of this.db.prepare('SELECT * FROM attempts').all()) {
+      const result = this.validatedResultInTransaction(String(row.id));
+      const spec = object(JSON.parse(String(row.specification)));
+      const references = result?.content.workReferences as JsonObject[] | undefined;
+      if (references?.some(ref => ref.kind === 'artefact' && referenced(join(dirname(String(spec.resultPath)), String(ref.path))))) {
+        throw new StorageError('conflict', 'Diagnostic directory contains retained output');
+      }
+    }
+  }
+
+  async authoriseDiagnostics(attemptId: string, root: string, manifest: JsonObject, caller: TaskActor, requestId: string): Promise<StoredEvent> {
+    taskActor(caller);
+    if (caller.kind !== 'person') throw new StorageError('conflict', 'Person required');
+    return this.write(() => {
+      this.checkDiagnosticsEligible(attemptId, root);
+      if (manifest.root !== root || !Array.isArray(manifest.entries)) throw new StorageError('conflict', 'Invalid diagnostic manifest');
+      const key = `diagnostics.authorised:${attemptId}`;
+      const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
+      if (previous) return this.decodeEvent(previous);
+      this.completionEvent(key, 'diagnostics.authorised', attemptId, caller, manifest, requestId);
+      return this.decodeEvent(this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key)!);
+    });
+  }
+
   /** Reserve a single executor and immutable intent for a completion effect. */
   async beginCompletionEffect(authorisation: StoredEvent, operation: import('./rebase.ts').CompletionEffect, input: JsonObject): Promise<{ request: StoredRequest; executor: ClaimIdentity }> {
     const value = object(input);
@@ -1961,7 +2015,11 @@ export class Database {
         if (json(request.input) !== json(value) || request.parentId !== stored.requestId) throw new StorageError('conflict', 'Completion effect input differs from authorisation');
         return { request, executor: { claimId: claim.id, generation: claim.generation } };
       }
-      if ((rebasing && stored.kind !== 'rebase.authorised') || (operation === 'integrate' && stored.kind !== 'candidate.accepted') || (!rebasing && operation !== 'integrate' && stored.kind !== 'return.authorised')) throw new StorageError('conflict', 'Wrong completion authorisation');
+      if ((operation === 'diagnostics' && stored.kind !== 'diagnostics.authorised') || (rebasing && stored.kind !== 'rebase.authorised') || (operation === 'integrate' && stored.kind !== 'candidate.accepted') || (!rebasing && !['integrate', 'diagnostics'].includes(operation) && stored.kind !== 'return.authorised')) throw new StorageError('conflict', 'Wrong completion authorisation');
+      if (operation === 'diagnostics') {
+        this.checkDiagnosticsEligible(attemptId, String(value.root));
+        if (json(value) !== json(stored.payload)) throw new StorageError('conflict', 'Diagnostic manifest differs');
+      }
       if (operation === 'integrate' && Number(this.taskRow(String(attempt.task_id)).decision_revision) !== stored.payload.decisionRevision) {
         throw new StorageError('conflict', 'A newer person decision prevents integration');
       }
@@ -2004,7 +2062,7 @@ export class Database {
       const executor = { claimId: claim!.id, generation };
       const request = this.recordEffectInTransaction({ requestKey: key, operation: `completion.${operation}`, caller: stored.actor,
         input: value, fingerprint: json(value), parentId: stored.requestId!, executor, attemptId, ...this.attemptObjectiveScope(attemptId),
-        target: { kind: ['return', 'rebase', 'attach'].includes(operation) ? 'workspace' : 'repository', reference: value } });
+        target: { kind: operation === 'diagnostics' ? 'diagnostics' : ['return', 'rebase', 'attach'].includes(operation) ? 'workspace' : 'repository', reference: value } });
       return { request, executor };
     });
   }
@@ -2020,6 +2078,7 @@ export class Database {
       if (!row || candidate?.id !== this.decodeEvent(row).payload.candidateId || attempt.lease_state !== 'held'
         || this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'candidate.accepted'").get(request.attemptId!)) throw new StorageError('conflict', 'Rebase candidate changed or accepted');
     }
+    if (request.operation === 'completion.diagnostics') this.checkDiagnosticsEligible(request.attemptId!, String(request.input.root));
     if (request.operation === 'completion.integrate') {
       const accepted = this.db.prepare("SELECT * FROM events WHERE request_id = ? AND kind = 'candidate.accepted'").get(request.parentId!);
       if (!accepted || Number(this.taskRow(String(attempt.task_id)).decision_revision) !== this.decodeEvent(accepted).payload.decisionRevision) {

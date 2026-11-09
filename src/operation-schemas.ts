@@ -34,6 +34,10 @@ const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', 
 function outputSchema(name: string): JsonSchema {
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
+  if (name === 'diagnostics.clean') return { type: 'object', anyOf: [object({ steps }), object({ steps, manifest: object({
+    root: string, entries: { type: 'array', items: object({ path: { type: 'string' }, kind: { enum: ['file', 'directory'] },
+      digest: nullable({ type: 'string', pattern: '^[a-f0-9]{64}$' }), size: { type: 'integer', minimum: 0 } }) }, removedAt: string,
+  }) })] };
   if (name === 'profile.clear') return object({ profile: string, steps });
   if (name === 'request.show') {
     const identity = { id: uuid, requestId: string, operation: string,
@@ -115,6 +119,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt, true, ['person']),
   operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),
   operation('attempt.discard', 'Discard output and return the exact lease after scoped confirmations.', { ...planAttempt, confirmDiscard: bool, reason: string }, true, ['person']),
+  operation('diagnostics.clean', 'Remove only unreferenced diagnostics of a terminal attempt with a returned lease.', { ...attempt, noProcesses: bool, dryRun: bool }, true, ['person']),
   operation('claim.resolve', 'Resolve exact owner scope with stopped-owner confirmation and evidence, never age alone.', { claimId: uuid, confirmStopped: bool, evidence: string, dryRun: bool }, true, ['person']),
   operation('effect.resolve', 'Resolve an uncertain effect with owner evidence and stopped-owner confirmation.', { effectId: uuid, outcome: { enum: ['happened', 'not_happened'] }, evidence: string, confirmStopped: bool, dryRun: bool }, true, ['person']),
 ];

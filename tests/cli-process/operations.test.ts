@@ -297,6 +297,24 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
   assert.equal(returned.data.attempt.leaseState, 'returned');
   assert.equal(f.invoke('task.show', { taskId: 'feature' }).data.task.state, 'done');
+  // A58/R40: the CLI cleans only diagnostics and old dispatch replay stays read-only.
+  const diagnostics = join(f.config.stateDirectory, 'attempts', attempt.id, 'diagnostics');
+  await mkdir(diagnostics);
+  await writeFile(join(diagnostics, 'transcript'), 'Diagnostic text');
+  const cleanArgs = { attemptId: attempt.id, noProcesses: true, dryRun: true };
+  const beforeClean = await snapshot(f.home);
+  const cleanPlan = f.invoke('diagnostics.clean', cleanArgs);
+  assert.equal(cleanPlan.status, 0, JSON.stringify(cleanPlan.envelope));
+  assert.deepEqual(await snapshot(f.home), beforeClean);
+  const cleaned = f.invoke('diagnostics.clean', { ...cleanArgs, dryRun: false }, 'clean');
+  assert.equal(cleaned.status, 0, JSON.stringify(cleaned.envelope));
+  assert.deepEqual(cleaned.data.steps, cleanPlan.data.steps);
+  assert.equal(cleaned.data.manifest.entries[0].path, 'transcript');
+  await assert.rejects(readdir(diagnostics), { code: 'ENOENT' });
+  const replayed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+  assert.equal(replayed.data.attempt.id, attempt.id);
+  assert.equal(replayed.data.attempt.leaseState, 'returned');
+  assert.deepEqual(f.invoke('diagnostics.clean', { ...cleanArgs, dryRun: false }, 'clean').data.manifest, cleaned.data.manifest);
   const records = (await readFile(join(f.home, 'peer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.equal(records.filter(r => r.type === 'prompt').length, 1);
 });

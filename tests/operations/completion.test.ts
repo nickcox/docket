@@ -1,7 +1,13 @@
 import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile, unlink } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { dispatch } from '../../src/dispatch.ts';
+import type { Runtime } from '../../src/runtime.ts';
+import { cleanDiagnostics } from '../../src/diagnostics.ts';
+import { DiagnosticsDirectory } from '../../src/adapters/diagnostics.ts';
+import type { DiagnosticManifest } from '../../src/adapters/diagnostics.ts';
 import { acceptCandidate, returnAttempt, selectCandidate, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason } from '../../src/completion.ts';
 import { rebaseAttempt, planAttemptRebase } from '../../src/rebase.ts';
 import { originalCandidateRef } from '../../src/storage/rebase.ts';
@@ -70,6 +76,113 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
     dirty: () => { clean = false; }, cleanWorkspace: () => { clean = true; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
     loseRetention: () => { retained = false; } };
 }
+
+async function diagnosticFixture(t: Parameters<typeof checkFixture>[0]) {
+  const f = await fixture(t);
+  for (const claim of f.db.claims().filter(c => c.attemptId === f.a.id && !c.releasedAt)) {
+    await f.db.releaseClaim({ claimId: claim.id, generation: claim.generation }, { terminal: true }, host);
+  }
+  return f;
+}
+
+test('A58/R40/R04: diagnostic deletion keeps exact evidence and old reservation replay', async t => {
+  const f = await diagnosticFixture(t);
+  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  const root = join(dirname(f.a.binding.resultPath), 'diagnostics');
+  await mkdir(join(root, 'nested'), { recursive: true });
+  await writeFile(join(root, 'nested', 'transcript.txt'), 'Diagnostic only');
+  const resultBefore = await readFile(f.a.binding.resultPath, 'utf8');
+  await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean'), /returned lease/);
+  await returnAttempt(f.db, f.returns, f.services);
+  const eventsBefore = f.db.events(), requestsBefore = f.db.requests();
+  const plan = await cleanDiagnostics(f.db, { ...input, dryRun: true }, person, 'plan-clean');
+  assert.equal(plan.steps[0]?.operation, 'diagnostics.delete');
+  assert.deepEqual(f.db.events(), eventsBefore);
+  assert.deepEqual(f.db.requests(), requestsBefore);
+  await cleanDiagnostics(f.db, input, person, 'clean');
+  await assert.rejects(readdir(root), { code: 'ENOENT' });
+  assert.equal(await readFile(f.a.binding.resultPath, 'utf8'), resultBefore);
+  const intent = f.db.events().find(e => e.kind === 'diagnostics.authorised')!;
+  const entries = intent.payload.entries as unknown as DiagnosticManifest['entries'];
+  assert.deepEqual(entries.map(e => e.path), ['nested/transcript.txt', 'nested', '']);
+  assert.equal(entries[0]!.size, 15);
+  assert.match(entries[0]!.digest!, /^[a-f0-9]{64}$/);
+  assert.ok(f.db.requests().find(r => r.operation === 'completion.diagnostics')!.result);
+  for (const event of eventsBefore) assert.deepEqual(f.db.events().find(e => e.id === event.id), event);
+  for (const request of requestsBefore) assert.deepEqual(f.db.request(request.id), request);
+  const recorded = f.db.requests().find(r => r.requestKey === 'dispatch:task')!;
+  const replay = await f.db.reserveAttempt({ taskId: 'task', requestKey: recorded.requestKey, caller: person } as Parameters<Database['reserveAttempt']>[0]);
+  assert.equal(replay.attempt.id, f.a.id);
+  assert.equal(replay.attempt.leaseState, 'returned');
+  const noCalls = new Proxy({} as Runtime, { get() { throw new Error('Dispatch replay must not call an external owner'); } });
+  const progress = await dispatch(f.db, { taskId: 'task', profile: null, dryRun: false }, person, recorded.requestKey, noCalls, () => {});
+  assert.equal(progress.attempt!.id, f.a.id);
+  assert.equal(progress.replayed, true);
+  assert.equal((await cleanDiagnostics(f.db, input, person, 'clean')).steps.length, 0);
+  assert.equal((await cleanDiagnostics(f.db, { ...input, dryRun: true }, person, 'plan-clean')).steps.length, 0);
+});
+
+test('A58/R09: interrupted diagnostic deletion resumes the exact manifest after reopening SQLite', async t => {
+  const f = await diagnosticFixture(t);
+  await returnAttempt(f.db, f.returns, f.services);
+  const root = join(dirname(f.a.binding.resultPath), 'diagnostics');
+  await mkdir(root);
+  await writeFile(join(root, 'a'), 'first');
+  await writeFile(join(root, 'b'), 'second');
+  class Interrupted extends DiagnosticsDirectory {
+    override async remove(_manifest: DiagnosticManifest) {
+      await unlink(join(root, 'a'));
+      throw new Error('Interrupted after first unlink');
+    }
+  }
+  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean', new Interrupted()), /did not succeed/);
+  const intent = f.db.events().find(e => e.kind === 'diagnostics.authorised')!;
+  const noCalls = new Proxy({} as Runtime, { get() { throw new Error('Uncertain cleanup must not cause a dispatch owner call'); } });
+  const replay = await dispatch(f.db, { taskId: 'task', profile: null, dryRun: false }, person, 'dispatch:task', noCalls, () => {});
+  assert.equal(replay.replayed, true);
+  assert.equal(await readFile(join(root, 'b'), 'utf8'), 'second');
+  assert.equal(f.db.requests().find(r => r.operation === 'completion.diagnostics')!.state, 'uncertain');
+  f.db.close();
+  const db = await Database.open(f.path, f.options);
+  defer(t, () => db.close());
+  await cleanDiagnostics(db, input, person, 'clean');
+  await assert.rejects(readdir(root), { code: 'ENOENT' });
+  assert.deepEqual(db.events().find(e => e.id === intent.id), intent);
+  assert.equal(db.requests().filter(r => r.operation === 'completion.diagnostics').length, 1);
+  assert.equal(db.requests().find(r => r.operation === 'completion.diagnostics')!.state, 'succeeded');
+});
+
+test('A58/R40: returned diagnostics still refuse an unresolved owner or effect', async t => {
+  const f = await fixture(t);
+  await returnAttempt(f.db, f.returns, f.services);
+  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean'), /owner is unresolved/);
+  for (const claim of f.db.claims().filter(c => c.attemptId === f.a.id && !c.releasedAt)) {
+    await f.db.releaseClaim({ claimId: claim.id, generation: claim.generation }, { terminal: true }, host);
+  }
+  const executor = f.db.claims().find(c => c.resourceKey === 'dispatch')!;
+  const parent = await f.db.recordCommand({ requestKey: 'unresolved-parent', operation: 'test', caller: person, fingerprint: 'test', input: {} });
+  await f.db.recordEffect({ requestKey: 'unresolved', operation: 'test.effect', caller: person, fingerprint: 'test', input: {},
+    parentId: parent.id, attemptId: f.a.id, executor: { claimId: executor.id, generation: executor.generation },
+    target: { kind: 'diagnostics', reference: {} } });
+  await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean'), /unresolved effect/);
+  assert.equal(f.db.events().some(e => e.kind === 'diagnostics.authorised'), false);
+});
+
+test('A58/R40: diagnostics refuse missing confirmation and authoritative references', async t => {
+  const f = await diagnosticFixture(t);
+  await returnAttempt(f.db, f.returns, f.services);
+  const root = join(dirname(f.a.binding.resultPath), 'diagnostics');
+  await mkdir(root);
+  await writeFile(join(root, 'log'), 'keep');
+  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  await assert.rejects(cleanDiagnostics(f.db, { ...input, noProcesses: false }, person, 'clean'), e => e instanceof CommandFailure && e.code === 'process_confirmation_required');
+  await f.db.appendEvents([{ sourceKey: 'retained-diagnostic', kind: 'deliverable.retained', payloadVersion: 1,
+    correlationId: 'retained-diagnostic', actor: person, occurredAt: new Date().toISOString(), payload: { path: join(root, 'log') } }]);
+  await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean'), /referenced/);
+  assert.equal(await readFile(join(root, 'log'), 'utf8'), 'keep');
+});
 
 test('R11: person discards terminal missing/invalid results without retention and frees execution capacity', async t => {
   for (const invalid of [false, true]) {

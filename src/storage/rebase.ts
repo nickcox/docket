@@ -5,4 +5,4 @@ export function originalCandidateRef(specification: JsonObject): string {
   return `refs/docket/original/${String(specification.databaseId)}/${String(specification.attemptId)}`;
 }
 export type RebaseEffect = 'pin' | 'rebase' | 'move' | 'attach';
-export type CompletionEffect = 'integrate' | 'return' | 'cleanup' | 'cleanup-pin' | RebaseEffect;
+export type CompletionEffect = 'integrate' | 'return' | 'cleanup' | 'cleanup-pin' | 'diagnostics' | RebaseEffect;

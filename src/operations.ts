@@ -1,3 +1,4 @@
+import { cleanDiagnostics } from './diagnostics.ts';
 import { userInfo } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { canonicalJson, ConfigurationError } from './configuration.ts';
@@ -98,6 +99,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   try {
     const id = String(args.taskId);
     switch (operation.name) {
+      case 'diagnostics.clean': return await cleanDiagnostics(db, args as unknown as Parameters<typeof cleanDiagnostics>[1], caller, requestKey);
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
       case 'status.show': {
         const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!));

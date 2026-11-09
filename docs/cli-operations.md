@@ -121,6 +121,12 @@ Use `request.show` with `{"requestId":"<public replay key>"}` to follow a refusa
 
 The read changes nothing and is not planable, so it has no `dryRun` field. A person can inspect every request. The storage read keeps objective scope explicit for later supervisor bindings; unscoped context commands remain person-only. Credentials and environment fields are redacted recursively, including diagnostic credential patterns. Large input and result objects become marked, bounded summaries (128 KiB and 32 KiB respectively); stored inputs and results are not changed.
 
+## Diagnostic retention
+
+A person can plan `diagnostics.clean` with `{"attemptId":"<UUID>","noProcesses":true,"dryRun":true}` and execute with `dryRun:false`. `noProcesses:true` is the person's confirmation that no processes depend on the diagnostics; it is not a launcher observation. The attempt must also be terminal and settled, its lease returned, its worker claims released and its other effects resolved.
+
+Only `attempts/<attemptId>/diagnostics/` beneath the state directory is eligible. Results, required artefacts and retained output must stay outside it. Linked or non-regular files, changed contents and references from authoritative evidence refuse deletion. The immutable deletion intent lists every file's relative path, size and SHA-256 digest, and every directory. The effect result records this manifest and the completion time. Interrupted deletion resumes only that manifest; new or changed files are never removed. Reuse the original request ID and input to resume. No task, attempt, request mapping, claim, result or evidence row is deleted, and old dispatch replay still returns recorded progress without launching work.
+
 ## Resolving uncertainty
 
 `claim.resolve` names the exact claim UUID; `effect.resolve` names the exact effect UUID and `happened` or `not_happened`. Both require person authority, nonblank scoped evidence and `confirmStopped:true`. A stale heartbeat is diagnostic only and never resolves anything. Specialised owner reads must not contradict the person's resolution. Resolving an effect does not silently take over its owner claim, relaunch a worker, acquire another workspace or retry the effect. Inspect the remaining status and resolve each exact scope separately.
