@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { checkFixture, person, head, start, host } from '../helpers/check-attempt.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
@@ -56,7 +57,7 @@ async function fixture(t: Parameters<typeof checkFixture>[0], candidate = true) 
       assert.equal([...pins.values()][0], input.startingCommit);
       if (movedPin) for (const ref of pins.keys()) pins.set(ref, 'd'.repeat(40));
       output = 'c'.repeat(40); // The source ref moves after reservation.
-      const allocation = { ...source.allocation, leaseId: `lease:${input.attemptId}`, path: `${source.allocation.pool}/${input.attemptId}`,
+      const allocation = { ...source.allocation, leaseId: `lease:${input.attemptId}`, path: join(source.allocation.pool, input.attemptId),
         startingCommit: input.startingCommit, outputRef: `refs/heads/${input.branch}`, holder: JSON.parse(input.holder) };
       allocations.push(allocation);
       return confirmed(allocation);
