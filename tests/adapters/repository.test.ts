@@ -51,10 +51,10 @@ test("R32/R08 ref reads distinguish absence from failed, corrupt and truncated r
   const commands: string[][] = [];
   const lookup: Runner = async (_program, args) => {
     commands.push(args);
-    return { code: 0, complete: true, stdout: `refs/heads/prefix/child ${f.head}\n`, stderr: '' };
+    return { code: 0, complete: true, stdout: `refs/heads/prefix/child ${f.head} commit\n`, stderr: '' };
   };
   assert.deepEqual(value(await new GitRepository({ repository: f.path, run: lookup }).inspectRef('refs/heads/prefix')), { state: 'absent' });
-  assert.deepEqual(commands, [['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/prefix']]);
+  assert.deepEqual(commands, [['for-each-ref', '--format=%(refname) %(objectname) %(objecttype)', 'refs/heads/prefix']]);
   const failed: Runner = async () => ({ code: 1, complete: true, stdout: '', stderr: 'lookup failed' });
   assert.equal((await new GitRepository({ repository: f.path, run: failed }).inspectRef('refs/heads/prefix')).status, 'uncertain');
   assert.equal((await new GitRepository({ repository: join(f.root, "missing") }).inspectRef("refs/heads/main")).status, "uncertain");
@@ -112,6 +112,69 @@ test("R32 workspace inspection separates tracked and untracked changes; changed 
   assert.deepEqual(value(await f.repo.changedPaths(f.base, f.head)).sort(), ["file", "new file – café"].sort());
   assert.equal(value(await f.repo.compare(f.base, f.head)), true);
   assert.equal(value(await f.repo.compare(f.head, f.base)), false);
+});
+
+test('R32/R09: combined owner reads reduce processes without reusing mutable state across calls', async t => {
+  const f = await fixture(t), commands: string[][] = [];
+  const repo = new GitRepository({ repository: f.path, run: async (program, args, cwd, input) => {
+    commands.push(args);
+    return f.run(program, args, cwd, input);
+  } });
+  assert.equal(value(await repo.inspectRef('refs/heads/main')).state, 'present');
+  assert.equal(commands.length, 1, 'commit ref and object type come from one read');
+  commands.length = 0;
+  assert.equal(value(await repo.inspectWorkspace(f.path)).clean, true);
+  assert.equal(commands.length, 1, 'HEAD, branch and dirt come from one read');
+  await writeFile(join(f.path, 'file'), 'changed after the first read');
+  assert.equal(value(await repo.inspectWorkspace(f.path)).clean, false, 'the next guard reads current dirt');
+  assert.equal(commands.length, 2);
+  await f.git('update-ref', 'refs/heads/main', f.head, f.base);
+  assert.deepEqual(value(await repo.inspectRef('refs/heads/main')), { state: 'present', commit: f.head });
+  commands.length = 0;
+  value(await repo.verifyRetention({ references: [{ ref: 'refs/heads/main', commit: f.head }], artefacts: [], recyclableRoots: [] }));
+  assert.equal(commands.length, 1, 'an exact retained commit needs no ancestry read');
+  await f.git('tag', '-am', 'annotated', 'annotated', f.head);
+  await f.git('tag', '-am', 'nested', 'nested', 'annotated');
+  assert.deepEqual(value(await repo.inspectRef('refs/tags/nested')), { state: 'present', commit: f.head });
+  await f.git('update-ref', 'refs/tags/blob', await f.git('rev-parse', `${f.head}:file`));
+  assert.equal((await repo.inspectRef('refs/tags/blob')).status, 'uncertain');
+});
+
+test('R32: workspace branch identity preserves literal status markers and symbolic HEAD outside heads', async t => {
+  const f = await fixture(t);
+  for (const ref of ['refs/heads/(detached)', 'refs/heads/(null)', 'refs/custom/output']) {
+    await f.git('update-ref', ref, f.base);
+    await f.git('symbolic-ref', 'HEAD', ref);
+    assert.equal(value(await f.repo.inspectWorkspace(f.path)).branch, ref);
+  }
+  await f.git('switch', '--detach', f.base);
+  assert.equal(value(await f.repo.inspectWorkspace(f.path)).branch, null);
+});
+
+test('R32: porcelain v2 preserves unusual paths, renames, conflicts and detached HEAD; incomplete reads refuse', async () => {
+  const head = 'a'.repeat(40);
+  const headers = `# branch.oid ${head}\0# branch.head main\0`;
+  const tracked = `1 .M N... 100644 100644 100644 ${head} ${head} line\nfile\0`;
+  const rename = `2 R. N... 100644 100644 100644 ${head} ${head} R100 new name\0old\nname\0`;
+  const conflict = `u UU N... 100644 100644 100644 100644 ${head} ${head} ${head} conflict\0`;
+  let output = headers + tracked + rename + conflict + '? untracked\nfile\0';
+  let complete = true;
+  const repo = new GitRepository({ repository: '.', run: async (_program, args) => args[0] === 'symbolic-ref'
+    ? { code: 1, complete: true, stdout: '', stderr: '' }
+    : { code: 0, complete, stdout: output, stderr: '' } });
+  assert.deepEqual(value(await repo.inspectWorkspace('.')), {
+    head, branch: 'refs/heads/main', clean: false,
+    uncommitted: ['line\nfile', 'new name', 'conflict'], untracked: ['untracked\nfile'],
+  });
+  output = `# branch.oid ${head}\0# branch.head (detached)\0`;
+  assert.equal(value(await repo.inspectWorkspace('.')).branch, null);
+  for (const malformed of [headers.slice(0, -1), headers + rename.slice(0, rename.indexOf('old')), '# branch.head main\0',
+    headers + '# branch.head other\0', headers.replace(head, '(initial)'), headers + 'unknown\0']) {
+    output = malformed;
+    assert.equal((await repo.inspectWorkspace('.')).status, 'uncertain', JSON.stringify(output));
+  }
+  output = headers; complete = false;
+  assert.equal((await repo.inspectWorkspace('.')).status, 'uncertain');
 });
 
 test('R32: changed-path parsing preserves newline-containing names without requiring an OS to create them', async () => {

@@ -44,16 +44,18 @@ export class GitRepository {
   }
   async inspectRef(ref: string): Promise<Result<RefState>> {
     if (!isRef(ref)) return rejected("Invalid full ref name", ref);
-    const exists = await this.command(["for-each-ref", "--format=%(refname) %(objectname)", ref]);
+    const exists = await this.command(["for-each-ref", "--format=%(refname) %(objectname) %(objecttype)", ref]);
     if (!exists.complete || exists.code !== 0 || exists.stderr.trim() !== '') return uncertain("Ref lookup failed", exists);
     if (exists.stdout !== '' && !exists.stdout.endsWith('\n')) return uncertain("Truncated ref lookup", exists);
     const lines = exists.stdout.split('\n').filter(Boolean);
-    if (lines.some(line => !/^refs\/\S+ [a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(line))) return uncertain("Malformed ref lookup", exists);
+    if (lines.some(line => !/^refs\/\S+ [a-f0-9]{40}(?:[a-f0-9]{24})? (commit|tag|tree|blob)$/.test(line))) return uncertain("Malformed ref lookup", exists);
     // for-each-ref takes a prefix pattern, not an exact name.
     const exact = lines.filter(line => line.split(' ')[0] === ref);
     if (exact.length === 0) return confirmed({ state: "absent" });
     if (exact.length !== 1) return uncertain("Ambiguous ref lookup", exists);
-    const objectId = exact[0]!.split(' ')[1]!;
+    const [, objectId, objectType] = exact[0]!.split(' ');
+    if (objectType === 'commit') return confirmed({ state: 'present', commit: objectId! });
+    if (objectType !== 'tag') return uncertain('Ref does not point to a commit', exists);
     const read = await this.command(["rev-parse", "--verify", `${objectId}^{commit}`]);
     const commit = read.stdout.trim();
     if (!read.complete || read.code !== 0 || !isCommit(commit)) return uncertain("Ref commit could not be read", read);
@@ -73,11 +75,12 @@ export class GitRepository {
     return parseCheckPolicy(sourceCommit, content.stdout, context);
   }
   async inspectWorkspace(path: string, forChecks = false, ignoredGeneratedPaths: readonly string[] = []): Promise<Result<WorkspaceState>> {
-    const head = await this.command(["rev-parse", "--verify", "HEAD^{commit}"], path);
-    const branch = await this.command(["symbolic-ref", "--quiet", "HEAD"], path);
-    const status = await this.command(forChecks
-      ? ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none']
-      : ["status", "--porcelain=v1", "-z", "--untracked-files=all"], path);
+    // One owner read supplies HEAD, branch and dirt, without caching across effects.
+    const status = await this.command([
+      ...(forChecks ? ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false'] : []),
+      'status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all',
+      ...(forChecks ? ['--ignore-submodules=none'] : []),
+    ], path);
     if (forChecks) {
       const files = await this.command(['ls-files', '-v', '-z'], path);
       if (!files.complete || files.code !== 0 || (files.stdout !== '' && !files.stdout.endsWith('\0'))) return uncertain('Check index could not be read');
@@ -90,18 +93,36 @@ export class GitRepository {
         file === pattern || file.startsWith(pattern.endsWith('/') ? pattern : `${pattern}/`) || matchesGlob(file, pattern)));
       if (undeclared.length) return rejected('Workspace has ignored files not allowed by the execution profile');
     }
-    if (!head.complete || head.code !== 0 || !isCommit(head.stdout.trim()) || !branch.complete || ![0, 1].includes(branch.code!) || !status.complete || status.code !== 0) return uncertain("Workspace could not be read", { head, branch, status });
-    if (branch.code === 0 && !isRef(branch.stdout.trim())) return uncertain("Malformed workspace branch", branch);
+    if (!status.complete || status.code !== 0) return uncertain('Workspace could not be read', status);
+    let head: string | undefined, branch: string | null | undefined;
     const uncommitted: string[] = [], untracked: string[] = [];
     const entries = status.stdout.split("\0");
     if (entries.pop() !== "") return uncertain("Truncated workspace status", status);
     for (let index = 0; index < entries.length; index++) {
       const entry = entries[index]!;
-      if (entry.length < 4 || entry[2] !== " ") return uncertain("Malformed workspace status", status);
-      (entry.startsWith("?? ") ? untracked : uncommitted).push(entry.slice(3));
-      if (/[RC]/.test(entry.slice(0, 2)) && entries[++index] === undefined) return uncertain("Truncated rename status", status);
+      if (entry.startsWith('# branch.oid ') && head === undefined) { head = entry.slice(13); continue; }
+      if (entry.startsWith('# branch.head ') && branch === undefined) {
+        const name = entry.slice(14);
+        branch = name === '(detached)' ? null : `refs/heads/${name}`;
+        // These markers can also be literal branch names; (null) can mean a non-heads ref.
+        if (name === '(null)' || name === '(detached)') {
+          const symbolic = await this.command(['symbolic-ref', '--quiet', 'HEAD'], path);
+          if (!symbolic.complete || ![0, 1].includes(symbolic.code!) || (symbolic.code === 0 && !isRef(symbolic.stdout.trim()))) return uncertain('Workspace branch could not be read', symbolic);
+          branch = symbolic.code === 0 ? symbolic.stdout.trim() : null;
+        }
+        continue;
+      }
+      if (/^# branch\.(upstream|ab) /.test(entry)) continue;
+      if (entry.startsWith('? ') && entry.length > 2) { untracked.push(entry.slice(2)); continue; }
+      // v2 has fixed metadata fields, followed by an unquoted path (which may contain spaces/newlines).
+      const fields = entry.startsWith('1 ') ? 8 : entry.startsWith('2 ') ? 9 : entry.startsWith('u ') ? 10 : 0;
+      const match = fields ? new RegExp(`^(?:[^ ]+ ){${fields}}(.+)$`, 's').exec(entry) : null;
+      if (!match) return uncertain('Malformed workspace status', status);
+      uncommitted.push(match[1]!);
+      if (entry.startsWith('2 ') && !entries[++index]) return uncertain('Truncated rename status', status);
     }
-    return confirmed({ head: head.stdout.trim(), branch: branch.code === 0 ? branch.stdout.trim() : null, clean: entries.length === 0, uncommitted, untracked });
+    if (head === undefined || !isCommit(head) || branch === undefined || (branch !== null && !isRef(branch))) return uncertain('Malformed workspace identity', status);
+    return confirmed({ head, branch, clean: uncommitted.length === 0 && untracked.length === 0, uncommitted, untracked });
   }
   async compare(ancestor: string, descendant: string): Promise<Result<boolean>> {
     if (!isCommit(ancestor) || !isCommit(descendant)) return rejected("Expected exact commits");
@@ -209,6 +230,8 @@ export class GitRepository {
       const ref = await this.inspectRef(reference.ref);
       if (ref.status !== "confirmed") return ref;
       if (ref.value.state === "absent") return rejected("Retaining ref is absent", reference);
+      // The ref read already proved this exact object is a commit. Equality needs no ancestry process.
+      if (reference.commit === ref.value.commit) continue;
       const contains = await this.compare(reference.commit, ref.value.commit);
       if (contains.status !== "confirmed") return contains;
       if (!contains.value) return rejected("Exact commit is not retained by ref", reference);

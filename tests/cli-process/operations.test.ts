@@ -185,6 +185,21 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(records.filter(r => r.type === 'prompt').length, 1);
 });
 
+test('R09/R32: explicit return rechecks a kept lease after untracked work is retained elsewhere', async t => {
+  const f = await fixture(t);
+  f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+  const attempt = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }).data.attempt;
+  const untracked = join(attempt.allocation.path, 'untracked');
+  await writeFile(untracked, 'Keep this work');
+  const accepted = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false });
+  assert.equal(accepted.data.leaseReturn.state, 'kept');
+  await writeFile(join(f.home, 'retained-work'), await readFile(untracked));
+  await rm(untracked);
+  const returned = f.invoke('attempt.return', { attemptId: attempt.id, dryRun: false });
+  assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
+  assert.equal(returned.data.attempt.leaseState, 'returned');
+});
+
 test('R11: held and failed dispatches automatically return clean leases with retained output', async t => {
   for (const outcome of ['held', 'failed']) {
     const f = await fixture(t, `${outcome}-result`);
