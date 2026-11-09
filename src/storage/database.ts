@@ -592,7 +592,7 @@ export class Database {
     return this.writeTask(command, () => {
       const before = this.decodeTask(this.taskRow(id));
       const state = operation === 'done' ? 'done' : operation === 'reopen' ? 'queued' : before.state;
-      const holdReason = operation === 'hold' ? reason! : operation === 'release' ? null : before.holdReason;
+      const holdReason = operation === 'hold' ? reason! : operation === 'release' || operation === 'done' ? null : before.holdReason;
       if (state === before.state && holdReason === before.holdReason) return before;
       this.changed(this.db.prepare(`UPDATE tasks SET state = ?, hold_reason = ?, decision_revision = decision_revision + 1
         WHERE id = ? AND state = ? AND decision_revision = ?`).run(state, holdReason, id, before.state, before.decisionRevision));

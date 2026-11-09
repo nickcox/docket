@@ -101,11 +101,13 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
           const checksState = String(checks?.result?.status ?? checks?.state ?? 'missing');
           const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
+          const resolved = a.leaseState === 'returned' || db.task(a.taskId).state === 'done'
+            || db.events().some(e => e.attemptId === a.id && e.kind === 'return.authorised' && e.payload.discard);
           const currentReturnReason = a.allocation && a.leaseState !== 'returned'
             ? await leaseReturnReason(db, a.id, caller, (await services()).completion) : null;
-          const returnReason = currentReturnReason === 'Lease is ready to return.' && a.candidate && !accepted
+          const returnReason = currentReturnReason === 'Lease is ready to return.' && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;
-          const reason = returnReason ?? (['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
+          const reason = returnReason ?? (resolved ? null : ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
             : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
             : a.leaseState === 'held' ? 'Lease is held.'
             : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null);

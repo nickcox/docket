@@ -176,17 +176,43 @@ test('A04/R03: effective holds, releases, done and reopen increment only decisio
     await operation();
     assert.deepEqual(snapshot(db), before);
   }
-  // Hold and state are independent: neither done nor reopen silently releases a hold.
+  // A person's done decision clears the hold; reopening does not restore it.
   await db.holdTask('a', 'Still held', person);
   await db.markTaskDone('a', person);
   await db.reopenTask('a', person);
-  assert.equal(db.task('a').holdReason, 'Still held');
+  assert.equal(db.task('a').holdReason, null);
   assert.equal(db.task('a').state, 'queued');
-  assert.deepEqual(db.readyTasks(), []);
+  assert.deepEqual(ids(db.readyTasks()), ['a']);
   const doneEvents = db.events().filter(event => event.payload.operation === 'task.done');
   assert.ok(doneEvents.every(event => event.payload.judgement === 'person' && event.actor.kind === 'person'));
   assert.ok(db.events().every(event => !event.kind.startsWith('output.') && !event.kind.startsWith('attempt.')));
 });
+
+for (const reason of ['awaiting_acceptance', 'checks_failed']) {
+  test(`R03: done clears ${reason} with one decision revision and explanatory event`, async t => {
+    const { db } = await fixture(t);
+    await db.addTask({ id: 'a', title: 'A' }, person);
+    await db.holdTask('a', reason, person);
+    const before = db.task('a');
+    const count = db.events().length;
+    const done = await db.markTaskDone('a', person);
+    assert.deepEqual(done, { ...before, state: 'done', holdReason: null, decisionRevision: before.decisionRevision + 1 });
+    assert.equal(db.events().length, count + 1);
+    const event = db.events().at(-1)!;
+    assert.equal(event.payload.operation, 'task.done');
+    assert.equal(event.payload.judgement, 'person');
+    assert.deepEqual(event.actor, person);
+    assert.deepEqual(event.payload.before, before);
+    assert.deepEqual(event.payload.after, done);
+    await db.markTaskDone('a', person);
+    assert.equal(db.events().length, count + 1);
+    assert.deepEqual(db.task('a'), done);
+    const reopened = await db.reopenTask('a', person);
+    assert.equal(reopened.holdReason, null);
+    assert.equal(reopened.state, 'queued');
+    assert.equal(reopened.decisionRevision, done.decisionRevision + 1);
+  });
+}
 
 test('R02/R25: strict task inputs and single-line bounded hold reasons refuse without changes', async t => {
   const { db } = await fixture(t);

@@ -297,7 +297,43 @@ test('R27/A52: failed checks appear in compact attention status with a reason an
   assert.equal(attempt.nextAction.operation, 'attempt.show');
   assert.equal(status.data.tasks.items[0].holdReason, 'checks_failed');
   assert.equal(JSON.stringify(status.data).includes(definition.instructions), false);
+  const done = f.invoke('task.done', { taskId: 'feature', note: 'Person judgement' });
+  assert.equal(done.status, 0, JSON.stringify(done.envelope));
+  assert.equal(done.data.task.holdReason, null);
+  const after = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data;
+  assert.deepEqual(after.tasks.items, []);
+  assert.deepEqual(after.attempts.items, []);
 });
+
+for (const decision of ['done', 'discard', 'return']) {
+  test(`R03/R27: ${decision} removes an unaccepted candidate from attention status`, async t => {
+    const f = await fixture(t);
+    f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
+    const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false });
+    assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope));
+    const attemptId = dispatched.data.attempt.id;
+    assert.equal(f.invoke('task.show', { taskId: 'feature' }).data.task.holdReason, 'awaiting_acceptance');
+    if (decision === 'done') {
+      const done = f.invoke('task.done', { taskId: 'feature', note: 'Person judgement' });
+      assert.equal(done.status, 0, JSON.stringify(done.envelope));
+      assert.equal(done.data.task.state, 'done');
+      assert.equal(done.data.task.holdReason, null);
+    }
+    if (decision === 'discard' || decision === 'return') {
+      const result = decision === 'discard'
+        ? f.invoke('attempt.discard', { attemptId, confirmDiscard: true, reason: 'Not needed', dryRun: false })
+        : f.invoke('attempt.return', { attemptId, dryRun: false });
+      assert.equal(result.status, 0, JSON.stringify(result.envelope));
+      assert.equal(result.data.attempt.leaseState, 'returned');
+    }
+    const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data;
+    assert.equal(status.attempts.items[0].reason, null);
+    assert.equal(status.attempts.items[0].nextAction, null);
+    const attention = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data;
+    assert.deepEqual(attention.attempts.items, []);
+    if (decision === 'done') assert.deepEqual(attention.tasks.items, []);
+  });
+}
 
 test('R11: CLI discards terminal missing/invalid output, refuses dirty work and frees capacity after the exact lease returns', async t => {
   for (const mode of ['missing-result', 'invalid-result']) {

@@ -410,7 +410,7 @@ test('R11: a non-terminal worker and unresolved check effect refuse return, incl
   await assert.rejects(acceptCandidate(f.db, { ...f.accept, requestKey: 'override', overrideReason: 'Accept failure' }, f.services), /unresolved effect/);
 });
 
-test('R11: discard returns once, holds unfinished work and preserves a newer done decision', async t => {
+test('R03/R11: discard returns once, holds unfinished work and preserves a newer done decision', async t => {
   for (const done of [false, true]) {
     const f = await fixture(t);
     if (done) await f.db.markTaskDone('task', person);
@@ -418,7 +418,7 @@ test('R11: discard returns once, holds unfinished work and preserves a newer don
     await returnAttempt(f.db, input, f.services);
     await returnAttempt(f.db, input, f.services);
     assert.equal(f.db.task('task').state, done ? 'done' : 'queued');
-    assert.equal(f.db.task('task').holdReason, done ? 'awaiting_acceptance' : 'discarded');
+    assert.equal(f.db.task('task').holdReason, done ? null : 'discarded');
     assert.deepEqual(f.calls, ['return', 'cleanup']);
   }
 });
