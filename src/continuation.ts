@@ -34,8 +34,8 @@ export function continuationHandover(db: Database, sourceId: string, startingCom
       ?? db.events().findLast(e => e.attemptId === sourceId && e.kind === 'attempt.completed')?.payload ?? null,
     criteria: source.specification.criteria!,
     checks: db.requests().filter(r => r.attemptId === sourceId && r.operation === 'checks.run').map(r => ({ requestId: r.id, state: r.state, result: r.result })),
-    // R13 and R21 add review findings and questions; neither is implemented yet.
-    reviewFindings: [], openQuestions: [], answeredQuestions: [], note };
+    // R21 will add question history.
+    reviewFindings: db.reviewEvidence(sourceId).findings.map(event => event.payload), openQuestions: [], answeredQuestions: [], note };
   if (JSON.stringify(handover).length > 262144) throw new CommandFailure('policy_refused', { reason: 'Continuation handover exceeds 262144 characters' });
   return handover;
 }

@@ -48,6 +48,13 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   const preview = await db.reserveAttempt(input, true);
   const task = db.task(preview.attempt.taskId);
   input.delivery.kind = task.kind === 'report' ? 'report' : 'code';
+  const reviewTarget = task.reviewTarget;
+  if (reviewTarget) {
+    starting.commit = String(reviewTarget.commit);
+    input.startingCommit = starting.commit;
+    known(await runtime.repository.verifyRetention({ references: [{ ref: String(reviewTarget.outputRef), commit: starting.commit }],
+      artefacts: [], recyclableRoots: [] }));
+  }
   input.expectedDefinitionRevision = task.definitionRevision;
   input.expectedDecisionRevision = task.decisionRevision;
   const profile = preview.attempt.specification.profile as JsonObject;
@@ -56,9 +63,9 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   // Recorded acquisition uncertainty is checked by the same reservation builder.
   // Treehouse status initialises owner metadata on an empty pool, so it is not a
   // read-only prerequisite. Acquisition itself verifies the live pool identity.
-  const steps = ['attempt.reserve', ...(inherited ? ['continuation.pin'] : []), 'workspace.acquire',
-    ...(inherited ? ['continuation.cleanup-pin'] : []), 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
-    'worker.activate', 'worker.wait', 'worker.fence', 'attempt.complete', 'checks.run'].map(operation => step(operation, task.id,
+  const steps = ['attempt.reserve', ...(inherited || reviewTarget ? ['continuation.pin'] : []), 'workspace.acquire',
+    ...(inherited || reviewTarget ? ['continuation.cleanup-pin'] : []), 'attempt.start', 'worker.prepare', 'worker.bind', 'worker.permit',
+    'worker.activate', 'worker.wait', 'worker.fence', 'attempt.complete', ...(reviewTarget ? [] : ['checks.run'])].map(operation => step(operation, task.id,
       operation === 'attempt.reserve' ? ['ready', 'capacity', 'resolved_owners'] : ['current_authority'], operation === 'checks.run'));
   if (args.dryRun) return { taskId: task.id, skippedTasks: preview.skippedTasks, steps,
     ...(inherited ? { startingCommit: starting.commit, subject: inherited.subject } : {}) };
@@ -135,7 +142,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     if (!cleanup) known<unknown>(result);
   };
   try {
-    if (inherited) await pinEffect(false);
+    if (inherited || reviewTarget) await pinEffect(false);
     await recheck();
     progress('workspace.acquire');
     const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, caller);
@@ -151,7 +158,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       await db.recordUncertainAcquisition(id, acquisition.effect.id, executor, { reason: 'Workspace acquisition could not be confirmed' });
       throw error;
     }
-    if (inherited) await pinEffect(true);
+    if (inherited || reviewTarget) await pinEffect(true);
     await recheck();
     await refresh();
     progress('attempt.start'); await db.startAttempt(id, caller);
@@ -216,7 +223,8 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const leaseReturn = ['held', 'failed'].includes(attempt.outcome ?? '')
       ? await automaticReturn(db, id, caller, runtime.completion) : null;
     return { attempt: leaseReturn?.attempt ?? attempt,
-      leaseReturn: leaseReturn ? { state: leaseReturn.state, reason: leaseReturn.reason } : { state: 'kept', reason: 'Candidate is awaiting acceptance.' },
+      leaseReturn: leaseReturn ? { state: leaseReturn.state, reason: leaseReturn.reason }
+        : { state: 'kept', reason: reviewTarget ? 'Review is complete; the lease is kept until return.' : 'Candidate is awaiting acceptance.' },
       skippedTasks: reservation.skippedTasks, steps };
   } finally {
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);

@@ -68,7 +68,7 @@ function receive(line: string) {
     if (['result', 'code-result', 'held-result', 'failed-result'].includes(mode ?? '')) {
       const protocol = JSON.parse(request.message.split('\n\n')[2]);
       let commit = 'b'.repeat(40);
-      if (mode !== 'result') {
+      if (mode !== 'result' && !protocol.reviewTarget) {
         writeFileSync(join(process.cwd(), 'implementation.txt'), 'Synthetic implementation\n');
         const git = (...args: string[]) => execFileSync('git', args, { cwd: process.cwd(), encoding: 'utf8' }).trim();
         git('add', 'implementation.txt');
@@ -81,7 +81,8 @@ function receive(line: string) {
         summary: 'Synthetic result', reason: mode === 'held-result' || mode === 'failed-result' ? 'Cannot finish' : null,
         criteriaReport: protocol.criteria.map((criterion: string, index: number) => ({ position: index + 1, criterion, status: 'met', evidence: 'Synthetic check' })),
         evidence: [{ name: 'tests', summary: 'Synthetic tests pass' }],
-        workReferences: [{ kind: 'git', name: 'code', branch: protocol.outputRef, commit }] }));
+        workReferences: protocol.reviewTarget ? [{ kind: 'reviewed-output', name: 'review', target: protocol.reviewTarget }]
+          : [{ kind: 'git', name: 'code', branch: protocol.outputRef, commit }] }));
     }
     if (mode !== 'running') {
       active = false;

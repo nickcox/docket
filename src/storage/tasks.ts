@@ -20,6 +20,7 @@ export interface Task extends TaskDefinition {
   definitionRevision: number;
   decisionRevision: number;
   blockerIds: string[];
+  reviewTarget: JsonObject | null;
 }
 
 export interface AddTaskInput {
@@ -82,6 +83,7 @@ export function addTaskInput(value: AddTaskInput): void {
   if ('id' in value) taskText(id);
   if ('blockerIds' in value) taskIds(blockerIds);
   taskDefinition(definition);
+  if (value.kind === 'review') throw new TypeError('Only attempt.review creates review tasks');
 }
 
 export function taskActor(value: TaskActor): void {

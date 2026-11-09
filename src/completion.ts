@@ -70,6 +70,8 @@ export async function retainedOutput(db: Database, attemptId: string, services: 
     const pinned = known(await services.repository.inspectRef(pinnedRef));
     if (pinned.state === 'present' && known(await services.repository.compare(reference.commit, pinned.commit))) reference.ref = pinnedRef;
   }
+  const reviewTarget = attempt.specification.reviewTarget as JsonObject | undefined;
+  if (reviewTarget) references.push({ ref: String(reviewTarget.outputRef), commit: String(reviewTarget.commit) });
   if (attempt.candidate && !references.some(item => item.commit === (candidateCommit ?? attempt.candidate!.commit))) {
     references.push({ ref: String(attempt.candidate.outputRef), commit: candidateCommit ?? String(attempt.candidate.commit) });
   }

@@ -12,7 +12,7 @@ import { createRuntime } from './runtime.ts';
 import type { Runtime } from './runtime.ts';
 import { dispatch } from './dispatch.ts';
 import { runChecks } from './checks.ts';
-import { acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason, OwnerReadError } from './completion.ts';
+import { retainedOutput, acceptCandidate, selectCandidate, returnAttempt, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason, OwnerReadError } from './completion.ts';
 import { CommandFailure } from './response.ts';
 import { rebaseAttempt, planAttemptRebase } from './rebase.ts';
 import { known } from './operation-utils.ts';
@@ -48,6 +48,7 @@ function attemptView(db: Database, id: string) {
     terminalEvidence: db.events().filter(e => e.attemptId === id && e.kind === 'worker.observed' && e.payload.kind === 'terminal'),
     taskTransitionApplied: db.events().some(e => e.attemptId === id && e.kind === 'acceptance.finished'),
     acceptance: attempt.candidate ? db.acceptance(id, String(attempt.candidate.id)) : null,
+    review: db.reviewEvidence(id),
     effects: db.requests().filter(r => r.attemptId === id && r.category === 'effect') };
 }
 function mapStorage(error: unknown, db: Database, requestKey: string): never {
@@ -128,7 +129,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             : a.candidate && !accepted ? action('attempt.accept', { attemptId: a.id, candidateCommit: a.candidate.commit, overrideReason: null, dryRun: true }, 'Inspect the acceptance plan for this candidate.')
             : action('attempt.show', { attemptId: a.id }, 'Inspect the attempt and lease before continuing or returning it.');
           return { id: a.id, taskId: a.taskId, number: a.number, phase: a.phase, outcome: a.outcome,
-            leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, checksState, resultInvalid: invalidResult, reason, nextAction };
+            leaseState: a.leaseState, candidateCommit: a.candidate?.commit ?? null, review: db.reviewEvidence(a.id), checksState, resultInvalid: invalidResult, reason, nextAction };
         }))).filter(a => !args.attentionOnly || a.reason !== null);
         const blockers = db.admissionBlockers();
         const claims = db.claims().filter(c => !c.releasedAt).map(c => {
@@ -174,6 +175,23 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'attempt.show': return attemptView(db, String(args.attemptId));
       case 'checks.run': return await runChecks(db, { attemptId: String(args.attemptId), commit: String(args.commit),
         dryRun: Boolean(args.dryRun) }, caller, requestKey, (await services()).completion);
+      case 'attempt.review': {
+        const attemptId = String(args.attemptId);
+        const previous = db.requests().find(r => r.requestKey === requestKey);
+        if (previous && !args.dryRun) {
+          // writeTask verifies the command fingerprint before returning its original value.
+          return { task: await db.createReview(attemptId, {}, caller, command), steps: [] };
+        }
+        const source = db.reviewSource(attemptId);
+        await retainedOutput(db, attemptId, (await services()).completion);
+        const target: JsonObject = { sourceAttemptId: attemptId, candidateId: source.candidate!.id!,
+          commit: source.candidate!.commit!, outputRef: source.candidate!.outputRef!, repository: source.specification.repository!,
+          criteria: db.task(source.taskId).criteria, checkResults: db.requests().filter(r => r.attemptId === attemptId
+            && r.operation === 'checks.run' && r.input.commit === source.candidate!.commit).map(r => ({ requestId: r.id, input: r.input, state: r.state, result: r.result })) };
+        const steps = [step('task.review.create', attemptId, ['terminal', 'retained_candidate'])];
+        if (args.dryRun) return { steps };
+        return { task: await db.createReview(attemptId, target, caller, command), steps };
+      }
       case 'attempt.continue': {
         const previous = db.requests().find(r => r.requestKey === requestKey);
         const taskId = previous ? previous.input.taskId as string | null : db.attempt(String(args.sourceAttemptId)).taskId;

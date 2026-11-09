@@ -23,7 +23,7 @@ const statusTask = object({ id, title: string, state: { enum: ['queued', 'in_fli
   holdReason: nullable(string), blockedBy: { type: 'array', items: id }, ...attention });
 const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', minimum: 1 }, phase: string,
   outcome: nullable({ enum: ['completed', 'held', 'failed'] }), leaseState: string,
-  candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), checksState: string, resultInvalid: nullable(object({ message: { ...string, maxLength: 1024 } })), ...attention });
+  candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), review: view, checksState: string, resultInvalid: nullable(object({ message: { ...string, maxLength: 1024 } })), ...attention });
 function outputSchema(name: string): JsonSchema {
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
@@ -32,7 +32,7 @@ function outputSchema(name: string): JsonSchema {
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
   if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision'],
-    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'resultInvalid', 'nextAction', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'effects'].map(key => [key, {}])), additionalProperties: false };
+    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'resultInvalid', 'nextAction', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'review', 'effects'].map(key => [key, {}])), additionalProperties: false };
   if (name === 'status.show') return object({ contextId: string, databaseId: string, configurationRevision: { type: 'integer' }, migrationState: string,
     limitedProfiles: { type: 'array', items: view }, capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
     blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
@@ -46,6 +46,7 @@ function outputSchema(name: string): JsonSchema {
     variants.push(object({ taskId: id, skippedTasks, steps, startingCommit: string, subject: { type: 'string' } }),
       object({ attempt: view, leaseReturn, skippedTasks, steps }), object({ attempt: view, leaseReturn, replayed: bool, skippedTasks, steps }));
   }
+  else if (name === 'attempt.review') variants.push(object({ task: view, steps }));
   else if (['attempt.accept', 'attempt.return', 'attempt.discard'].includes(name)) {
     variants.push(object({ attempt: view, leaseReturn, steps }), object({ attempt: view, leaseReturn }));
   }
@@ -78,6 +79,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.continue', 'Continue a terminal settled source in a new attempt without accepting its work.', {
     sourceAttemptId: uuid, sourceCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }),
     profile: nullable(string), note: nullable(string), dryRun: bool }, true, ['person']),
+  operation('attempt.review', 'Create an independent review task for an exact retained candidate.', planAttempt),
   operation('attempt.show', 'Read full attempt identity and evidence.', attempt, false),
   operation('checks.run', 'Run checks for a recorded candidate of a terminal attempt, reusing matching passing evidence.', {
     ...planAttempt, commit: { type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' } }),

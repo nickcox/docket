@@ -584,6 +584,37 @@ test('A16/A49/R30: stale claim and uncertain effect block dispatch until scoped 
   assert.equal(dispatch().status, 0);
 });
 
+test('R13/A28: CLI review creation, exact dispatch and verdict views share the worker protocol', async t => {
+  const f = await fixture(t);
+  assert.equal(f.invoke('task.add', { id: 'source', definition, objectiveId: null }).status, 0);
+  const source = f.invoke('attempt.dispatch', { taskId: 'source', profile: null, dryRun: false });
+  assert.equal(source.status, 0, JSON.stringify(source.envelope));
+  const attemptId = source.data.attempt.id;
+  const before = await snapshot(f.home);
+  const plan = f.invoke('attempt.review', { attemptId, dryRun: true });
+  assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
+  assert.deepEqual(await snapshot(f.home), before, 'Review planning is read-only');
+  const created = f.invoke('attempt.review', { attemptId, dryRun: false }, 'review');
+  assert.equal(created.status, 0, JSON.stringify(created.envelope));
+  const task = created.data.task;
+  assert.deepEqual(f.invoke('attempt.review', { attemptId, dryRun: false }, 'review').data.task, task);
+  assert.equal(f.invoke('task.update', { taskId: task.id, expectedRevision: task.definitionRevision,
+    definition: { ...definition, kind: 'review', instructions: 'Replace target' } }).status, 1);
+  const review = f.invoke('attempt.dispatch', { taskId: task.id, profile: null, dryRun: false });
+  assert.equal(review.status, 0, JSON.stringify(review.envelope));
+  assert.equal(review.data.attempt.specification.startingCommit, source.data.attempt.candidate.commit);
+  assert.equal(f.invoke('task.show', { taskId: task.id }).data.task.state, 'done');
+  const shown = f.invoke('attempt.show', { attemptId }).data;
+  assert.equal(shown.review.current.payload.verdict, 'passed');
+  assert.equal(shown.review.tasks[0].id, task.id);
+  assert.equal(shown.acceptance, null);
+  assert.equal(f.invoke('task.show', { taskId: 'source' }).data.task.holdReason, 'awaiting_acceptance');
+  const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } });
+  assert.equal(status.data.attempts.items.find((a: { id: string }) => a.id === attemptId).review.current.payload.verdict, 'passed');
+  using sql = new DatabaseSync(f.config.databasePath);
+  assert.equal(sql.prepare("SELECT count(*) AS n FROM requests WHERE attempt_id = ? AND operation = 'checks.run'").get(review.data.attempt.id)!.n, 0);
+});
+
 test('R28/R27: strict task inputs, mutations, revisions, replay and paginated reads share one envelope', async t => {
   const f = await fixture(t);
   for (const id of ['first', 'second']) assert.equal(f.invoke('task.add', { id, definition, objectiveId: null }).status, 0);

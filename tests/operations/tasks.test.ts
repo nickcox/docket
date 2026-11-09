@@ -35,7 +35,7 @@ test('A03/R02: add at the end, generate readable collision-safe IDs, preserve ID
   const first = await db.addTask({ title: 'Café: build the API!' }, person);
   assert.equal(first.id, 'cafe-build-the-api');
   assert.deepEqual(first, { id: first.id, title: 'Café: build the API!', instructions: '', criteria: [],
-    kind: 'code', profile: null, objectiveId: null, position: 1, state: 'queued', holdReason: null,
+    kind: 'code', reviewTarget: null, profile: null, objectiveId: null, position: 1, state: 'queued', holdReason: null,
     definitionRevision: 1, decisionRevision: 0, blockerIds: [] });
   await db.addTask({ id: 'cafe-build-the-api-2', title: 'Explicit ID' }, person);
   const third = await db.addTask({ title: 'Café: build the API!' }, person);

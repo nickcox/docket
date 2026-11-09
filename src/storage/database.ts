@@ -407,6 +407,7 @@ export class Database {
   private decodeTask(row: Record<string, unknown>): Task {
     return { id: String(row.id), title: String(row.title), instructions: String(row.instructions),
       criteria: JSON.parse(String(row.criteria)) as string[], kind: row.kind as TaskKind,
+      reviewTarget: row.review_target === null ? null : object(JSON.parse(String(row.review_target))),
       profile: row.profile === null ? null : String(row.profile),
       objectiveId: row.objective_id === null ? null : String(row.objective_id),
       position: Number(row.position), state: row.state as TaskState,
@@ -550,6 +551,48 @@ export class Database {
       this.taskEvent('task.add', person, id, { after: object(task) });
       return task;
     });
+  }
+
+  reviewSource(attemptId: string): Attempt {
+    if (!this.db.isTransaction) return this.snapshot(() => this.reviewSource(attemptId));
+    const source = this.decodeAttempt(this.attemptRow(attemptId));
+    if (source.executionOpen || source.phase !== 'settled' || !source.outcome || !source.candidate
+      || !this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'").get(attemptId)) {
+      throw new StorageError('conflict', 'Review requires a terminal settled source candidate');
+    }
+    if (this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND (category = 'effect' OR operation = 'checks.run') AND state IN ('pending', 'claimed', 'uncertain')").get(attemptId)) throw new StorageError('conflict', 'Source has unresolved effects');
+    return source;
+  }
+
+  async createReview(attemptId: string, target: JsonObject, actor: TaskActor, command: CommandInput): Promise<Task> {
+    taskActor(actor);
+    target = structuredClone(target);
+    actor = structuredClone(actor);
+    command = structuredClone(command);
+    return this.writeTask(command, () => {
+      const source = this.reviewSource(attemptId);
+      if (source.candidate!.id !== target.candidateId || source.candidate!.commit !== target.commit
+        || source.candidate!.outputRef !== target.outputRef || target.sourceAttemptId !== attemptId
+        || json(source.specification.repository) !== json(target.repository)
+        || json(this.decodeTask(this.taskRow(source.taskId)).criteria) !== json(target.criteria)) throw new StorageError('conflict', 'Review target candidate changed');
+      const id = `review-${randomUUID()}`;
+      const instructions = 'Review the exact immutable target against every copied criterion. Inspect the recorded check results and run focused tests rather than the full suite again. Do not commit changes.';
+      const position = Number(this.db.prepare('SELECT coalesce(max(position), 0) + 1 AS position FROM tasks').get()!.position);
+      this.db.prepare(`INSERT INTO tasks (id, title, instructions, criteria, kind, position, review_target, review_source_attempt_id)
+        VALUES (?, ?, ?, ?, 'review', ?, ?, ?)`).run(id, `Review ${source.taskId}`, instructions,
+        json(target.criteria), position, json(target), attemptId);
+      const task = this.decodeTask(this.taskRow(id));
+      this.taskEvent('attempt.review', actor, id, { after: object(task) });
+      return task;
+    });
+  }
+
+  reviewEvidence(attemptId: string) {
+    const source = this.attempt(attemptId);
+    const findings = this.events().filter(e => e.kind === 'review.recorded' && e.payload.sourceAttemptId === attemptId);
+    const current = findings.findLast(e => e.payload.candidateId === source.candidate?.id
+      && e.payload.commit === source.candidate?.commit && json(e.payload.criteria) === json(this.task(source.taskId).criteria)) ?? null;
+    return { current, findings, tasks: this.tasks().filter(t => t.reviewTarget?.sourceAttemptId === attemptId) };
   }
 
   async updateTaskDefinition(id: string, patch: Partial<TaskDefinition>, actor: TaskActor, command?: CommandInput, expectedRevision?: number): Promise<Task> {
@@ -785,13 +828,16 @@ export class Database {
         const id = randomUUID(), now = new Date().toISOString();
         const number = Number(this.db.prepare('SELECT coalesce(max(number), 0) + 1 AS number FROM attempts WHERE task_id = ?').get(task.id)!.number);
         if (!Number.isSafeInteger(number)) throw new StorageError('conflict', 'Attempt number range exhausted');
+        if (task.kind === 'review' && !task.reviewTarget) throw new StorageError('conflict', 'Review requires an immutable target');
+        const startingCommit = task.reviewTarget ? String(task.reviewTarget.commit) : value.startingCommit;
         const outputRef = `refs/heads/docket/${identity.databaseId}/${id}`;
         const holder = { databaseId: identity.databaseId, contextId: identity.contextId, taskId: task.id, attemptId: id };
         const specification: JsonObject = { version: 1, ...holder, number, task: object(task),
           definitionRevision: task.definitionRevision, decisionRevision: task.decisionRevision, criteria: task.criteria,
           ...(value.sourceAttemptId === undefined ? {} : { sourceAttemptId: value.sourceAttemptId, handover: value.handover! }),
-          objectiveId: null, delivery: object({ ...value.delivery, baseRef: config.baseBranch, startingCommit: value.startingCommit, outputBranch: outputRef }),
-          baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit: value.startingCommit,
+          ...(task.reviewTarget ? { reviewTarget: task.reviewTarget } : {}),
+          objectiveId: null, delivery: object({ ...value.delivery, kind: task.kind, baseRef: config.baseBranch, startingCommit, outputBranch: outputRef }),
+          baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit,
           resultPath: join(String(identity.stateDirectory), 'attempts', id, 'result.json'),
           repository, workspace: { holder, pool: config.poolRoot },
           profile: config.profile, profileName: config.profileName, profileSource: config.profileSource,
@@ -1165,7 +1211,7 @@ export class Database {
     return { identity: { databaseId: spec.databaseId!, contextId: spec.contextId!, taskId: spec.taskId!,
       attemptId, leaseId: String(attempt.lease_id), sessionId: input.sessionId! },
       startingCommit: String(spec.startingCommit), outputRef: String(spec.outputRef), criteria: spec.criteria as string[],
-      delivery: object(spec.delivery), resultPath: String(input.resultPath),
+      delivery: object(spec.delivery), reviewTarget: spec.reviewTarget ? object(spec.reviewTarget) : null, resultPath: String(input.resultPath),
       recyclableRoots: [...new Set([...this.recyclableRoots, String(object(spec.workspace).pool)])] };
   }
 
@@ -1245,6 +1291,13 @@ export class Database {
       const retained = await repository.verifyRetention({ references: [{ ref: binding.outputRef, commit: String(reference.commit) }],
         artefacts: [], recyclableRoots: binding.recyclableRoots });
       if (retained.status !== 'confirmed') throw new StorageError('result_invalid', 'Exact candidate is not known to be retained');
+    }
+    if (!previous && value.content.outcome === 'completed' && binding.delivery.kind === 'review') {
+      const target = binding.reviewTarget as JsonObject;
+      if (!repository) throw new StorageError('result_invalid', 'Review needs repository retention evidence');
+      const retained = await repository.verifyRetention({ references: [{ ref: String(target.outputRef), commit: String(target.commit) }],
+        artefacts: [], recyclableRoots: binding.recyclableRoots });
+      if (retained.status !== 'confirmed') throw new StorageError('result_invalid', 'Reviewed output is not retained');
     }
     return this.write(() => {
       const attempt = this.attemptRow(attemptId);
@@ -1340,6 +1393,16 @@ export class Database {
       const reference = (result.content.workReferences as JsonObject[]).find(item => item.kind === 'git');
       const candidate = outcome === 'completed' && delivery.kind === 'code'
         ? { id: randomUUID(), commit: reference!.commit!, outputRef: spec.outputRef!, resultDigest: result.digest } : null;
+      if (outcome === 'completed' && delivery.kind === 'review') {
+        const target = object(spec.reviewTarget), source = this.decodeAttempt(this.attemptRow(String(target.sourceAttemptId)));
+        // Historical findings remain scoped to the captured candidate, never its replacement.
+        if (source.candidate?.id === target.candidateId && source.candidate?.commit === target.commit) {
+          const findings = result.content.criteriaReport as JsonObject[];
+          this.launchEvent(attemptId, taskId, actor, 'review.recorded', { sourceAttemptId: target.sourceAttemptId!, reviewAttemptId: attemptId,
+            reviewTaskId: taskId, candidateId: target.candidateId!, commit: target.commit!, criteria: target.criteria!,
+            verdict: findings.every(item => item.status === 'met') ? 'passed' : 'failed', findings });
+        }
+      }
       const now = new Date().toISOString();
       this.changed(this.db.prepare(`UPDATE attempts SET candidate = ?, outcome = ?, phase = 'settled', execution_open = 0,
         settled_at = ?, revision = revision + 1 WHERE id = ? AND outcome IS NULL AND revision = ?`)
@@ -1347,7 +1410,7 @@ export class Database {
       const task = this.taskRow(taskId);
       // Person decision revisions, including a reopen, always win over this automated outcome.
       if (task.decision_revision === attempt.started_decision_revision) {
-        const done = outcome === 'completed' && delivery.kind === 'report';
+        const done = outcome === 'completed' && ['report', 'review'].includes(String(delivery.kind));
         this.changed(this.db.prepare('UPDATE tasks SET state = ?, hold_reason = ? WHERE id = ? AND decision_revision = ?')
           .run(done ? 'done' : 'queued', done ? null : candidate ? 'awaiting_acceptance' : `worker_${outcome}`,
             taskId, Number(task.decision_revision)));

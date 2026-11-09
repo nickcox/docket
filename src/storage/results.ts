@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { StorageError } from './database.ts';
 import type { JsonObject } from './database.ts';
 import { commit } from './reservations.ts';
+import { canonicalJson } from '../configuration.ts';
 import { workerReference } from './launch.ts';
 import type { WorkerReference } from './launch.ts';
 
@@ -17,6 +18,7 @@ export interface ResultBinding extends JsonObject {
   outputRef: string;
   criteria: string[];
   delivery: JsonObject;
+  reviewTarget?: JsonObject | null;
   resultPath: string;
   recyclableRoots: string[];
 }
@@ -135,7 +137,7 @@ export async function readWorkerResult(binding: ResultBinding): Promise<Validate
     }
     for (const name of binding.delivery.requiredEvidence as string[]) if (!evidenceNames.has(name)) invalid(`Missing required evidence: ${name}`);
     const references = list(content.workReferences), names = new Set<string>(), artefacts: JsonObject[] = [];
-    let code = false;
+    let code = false, reviewed = false;
     for (const item of references) {
       text(item.name);
       if (names.has(item.name)) invalid('Duplicate work reference name');
@@ -143,10 +145,16 @@ export async function readWorkerResult(binding: ResultBinding): Promise<Validate
       if (item.kind === 'git') {
         fields(item, ['kind', 'name', 'branch', 'commit']);
         try { commit(item.commit); } catch { invalid('Expected exact result commit'); }
+        if (binding.delivery.kind === 'review') invalid('Reviewers must not commit changes');
         if (item.branch !== binding.outputRef) invalid('Git reference must match the retained output ref');
         if (code) invalid('Result must identify one code candidate');
         code = true;
         if (content.outcome === 'completed' && binding.delivery.kind === 'code' && item.commit === binding.startingCommit) invalid('Code candidate must move beyond the starting commit');
+      } else if (item.kind === 'reviewed-output') {
+        fields(item, ['kind', 'name', 'target']);
+        if (binding.delivery.kind !== 'review' || !binding.reviewTarget || reviewed
+          || canonicalJson(item.target) !== canonicalJson(binding.reviewTarget)) invalid('Reviewed output must match the immutable target exactly once');
+        reviewed = true;
       } else if (item.kind === 'artefact') {
         fields(item, ['kind', 'name', 'path', 'description']); text(item.path); text(item.description);
         const file = await retainedFile(root, item.path, binding.recyclableRoots);
@@ -155,6 +163,7 @@ export async function readWorkerResult(binding: ResultBinding): Promise<Validate
     }
     for (const name of binding.delivery.requiredDeliverables as string[]) if (!names.has(name)) invalid(`Missing required deliverable: ${name}`);
     if (content.outcome === 'completed' && binding.delivery.kind === 'code' && !code) invalid('Completed code result requires an exact commit');
+    if (content.outcome === 'completed' && binding.delivery.kind === 'review' && !reviewed) invalid('Completed review requires exactly one reviewed-output reference');
     // Artefact reads can take time. Do not record a source changed while they were checked.
     const finalSource = await retainedFile(root, relative(root, binding.resultPath), binding.recyclableRoots, maximumResultBytes);
     if (finalSource.digest !== source.digest) invalid('Result file changed during validation');
