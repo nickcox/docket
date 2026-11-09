@@ -14,7 +14,11 @@ const archive = Buffer.from("release archive");
 const checksum = createHash("sha256").update(archive).digest("hex");
 type Reply = number | Error | "body error";
 
-async function install(replies: Partial<Record<string, Reply[]>>, expectedChecksum = checksum) {
+async function install(
+  replies: Partial<Record<string, Reply[]>>,
+  expectedChecksum = checksum,
+  options: { cached?: Buffer; pinnedChecksum?: string; readError?: string } = {},
+) {
   const requests: string[] = [];
   const waits: number[] = [];
   const logs: string[] = [];
@@ -22,7 +26,12 @@ async function install(replies: Partial<Record<string, Reply[]>>, expectedChecks
   const writes: string[] = [];
   let error: unknown;
   try {
-    await runInNewContext(`(async () => {\n${source}\n})()`, {
+    // Substitute the fixture's digest for the real Linux archive's digest only.
+    const fixtureSource = source.replace(
+      /('linux-amd64': ')[a-f0-9]{64}/,
+      `$1${options.pinnedChecksum ?? checksum}`,
+    );
+    await runInNewContext(`(async () => {\n${fixtureSource}\n})()`, {
       Buffer, createHash, join,
       process: { platform: "linux", arch: "x64", env: { RUNNER_TEMP: "/tmp", GITHUB_PATH: "/github-path" } },
       console: { log: (message: string) => logs.push(message) },
@@ -38,6 +47,12 @@ async function install(replies: Partial<Record<string, Reply[]>>, expectedChecks
         return new Response(reply === 200
           ? (name === "checksums.txt" ? `${expectedChecksum}  ${asset}\n` : archive)
           : "temporary error", { status: reply });
+      },
+      readFile: async (path: string) => {
+        assert.equal(path, join("/tmp", "treehouse-archives", asset));
+        if (options.readError) throw Object.assign(new Error("cache read failed"), { code: options.readError });
+        if (options.cached !== undefined) return options.cached;
+        throw Object.assign(new Error("not found"), { code: "ENOENT" });
       },
       mkdtemp: async () => "/tmp/treehouse-test",
       mkdir: async () => {},
@@ -71,6 +86,7 @@ test("CI download retry: each file retries 429, 5xx, network and body errors wit
   });
   assert.match(result.logs.at(-1)!, new RegExp(`SHA-256 ${checksum}$`));
   assert.equal(result.programs.length, 2);
+  assert.equal(result.writes[0], join("/tmp", "treehouse-archives", asset));
 });
 
 for (const name of ["checksums.txt", asset]) {
@@ -95,6 +111,41 @@ for (const name of ["checksums.txt", asset]) {
     });
   }
 }
+
+test("CI archive cache: a verified cache hit installs without network access or rewriting the archive", async () => {
+  const result = await install({}, checksum, { cached: archive });
+  assert.equal(result.error, undefined);
+  assert.deepEqual(result.requests, []);
+  assert.deepEqual(result.waits, []);
+  assert.equal(result.programs.length, 2);
+  assert.ok(!result.writes.some(path => path.includes("treehouse-archives")));
+});
+
+for (const cached of [Buffer.from("corrupt archive"), Buffer.alloc(0)]) {
+  test(`CI archive cache: rejects a corrupt cache hit (${cached.length} bytes) without downloading or extracting`, async () => {
+    const result = await install({}, checksum, { cached });
+    assert.ok(String(result.error).includes(`Stored checksum mismatch for ${asset}`));
+    assert.deepEqual(result.requests, []);
+    assert.deepEqual(result.programs, []);
+    assert.deepEqual(result.writes, []);
+  });
+}
+
+test("CI archive cache: matching release checksum cannot override the stored digest on a cache miss", async () => {
+  const result = await install({}, checksum, { pinnedChecksum: "0".repeat(64) });
+  assert.ok(String(result.error).includes(`Stored checksum mismatch for ${asset}`));
+  assert.deepEqual(result.requests, ["checksums.txt", asset]);
+  assert.deepEqual(result.programs, []);
+  assert.deepEqual(result.writes, []);
+});
+
+test("CI archive cache: cache read errors other than absence do not trigger downloads", async () => {
+  const result = await install({}, checksum, { readError: "EACCES" });
+  assert.ok(String(result.error).includes("cache read failed"));
+  assert.deepEqual(result.requests, []);
+  assert.deepEqual(result.programs, []);
+  assert.deepEqual(result.writes, []);
+});
 
 test("CI download retry: a recovered download still rejects a checksum mismatch before extraction", async () => {
   const result = await install({ "checksums.txt": [504, 200], [asset]: [429, 200] }, "0".repeat(64));
