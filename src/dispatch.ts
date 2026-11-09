@@ -83,6 +83,8 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       : { state: 'kept', reason: await leaseReturnReason(db, reservation.attempt.id, caller, runtime.completion) },
     replayed: true, skippedTasks: reservation.skippedTasks, steps: [] };
   const id = reservation.attempt.id;
+  const objectiveScope = reservation.attempt.specification.objectiveId === null ? {}
+    : { objectiveId: String(reservation.attempt.specification.objectiveId) };
   const generation = randomUUID(), host: WorkerHost = { kind: 'host', id: `cli:${process.pid}:${randomUUID()}`, generation };
   const [claim] = await db.registerClaims([{ resourceKey: `dispatch:${id}`, role: 'maintenance', generation, ownerRef: caller,
     schemaFamily: applicationId, schemaVersion, configRevision: config.revision, heartbeatAt: new Date().toISOString() }], caller);
@@ -113,7 +115,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const identity = { claimId: owner.id, generation };
     const effect = await db.recordEffect({ requestKey: `fence:${id}`, operation: 'worker.fence', caller,
       fingerprint: canonicalJson(reference), input: { reference: reference! }, parentId: reservation.requestId,
-      executor: identity, attemptId: id, target: { kind: 'worker', reference: reference! } });
+      executor: identity, attemptId: id, ...objectiveScope, target: { kind: 'worker', reference: reference! } });
     if (effect.state !== 'pending') throw new CommandFailure('effect_uncertain', { attemptId: id });
     await db.claimEffect(effect.id, identity);
     const result = await runtime.launcher.fence(reference!, effect.id);
@@ -128,7 +130,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     await recheck();
     const operation = cleanup ? 'continuation.cleanup-pin' : 'continuation.pin';
     const effect = await db.recordEffect({ requestKey: `${operation}:${id}`, operation, caller, executor,
-      parentId: reservation.requestId, attemptId: id, input: { ref: pin, commit: starting.commit },
+      parentId: reservation.requestId, attemptId: id, ...objectiveScope, input: { ref: pin, commit: starting.commit },
       fingerprint: canonicalJson({ ref: pin, commit: starting.commit }), target: { kind: 'repository', reference: { ref: pin } } });
     await db.claimEffect(effect.id, executor);
     const existing = await runtime.repository.inspectRef(pin);
@@ -246,7 +248,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
         const identity = { claimId: owner.id, generation };
         const stop = await db.recordEffect({ requestKey: `emergency-stop:${id}`, operation: 'worker.emergency-stop', caller,
           input: { reference }, fingerprint: canonicalJson(reference), parentId: reservation.requestId, executor: identity,
-          attemptId: id, target: { kind: 'worker', reference } });
+          attemptId: id, ...objectiveScope, target: { kind: 'worker', reference } });
         if (stop.state === 'pending') {
           await db.claimEffect(stop.id, identity);
           const result = await runtime.launcher.fence(reference, stop.id);

@@ -159,16 +159,12 @@ test('A03/R02/R25: reorder is a complete atomic permutation with positive unique
 });
 
 test('A04/R03: each definition field increments once; multiple fields once; ordered criteria matter; no-op has no event', async t => {
-  const { db, path } = await fixture(t);
-  // Objective operations are outside this task. Seed a valid referenced objective.
-  using seed = new DatabaseSync(path);
-  seed.prepare(`INSERT INTO objectives (id, request, criteria, scope, constraints_text, permissions, budget, creator, state, created_at)
-    VALUES ('objective', 'Request', '[]', '', '', '{}', '{}', 'operator', 'open', '2026-11-08')`).run();
+  const { db } = await fixture(t);
   await db.addTask({ id: 'a', title: 'Initial' }, person);
   const patches: Partial<TaskDefinition>[] = [{ title: 'Changed' }, { instructions: 'Instructions' },
     { criteria: ['First', 'Second'] }, { criteria: ['Second', 'First'] }, { kind: 'report' },
-    { profile: 'worker' }, { objectiveId: 'objective' }, { profile: null }, { objectiveId: null },
-    { title: 'Several', instructions: 'Together', criteria: ['One'], kind: 'code', profile: 'other', objectiveId: 'objective' }];
+    { profile: 'worker' }, { profile: null },
+    { title: 'Several', instructions: 'Together', criteria: ['One'], kind: 'code', profile: 'other' }];
   let revision = 1;
   for (const patch of patches) {
     const count = db.events().length;

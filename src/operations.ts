@@ -7,6 +7,7 @@ import type { OperationDefinition } from './catalog.ts';
 import { Database, StorageError, NoEligibleTaskError } from './storage/database.ts';
 import type { JsonObject } from './storage/database.ts';
 import type { Task, TaskActor, TaskDefinition } from './storage/tasks.ts';
+import type { ObjectiveDefinition } from './storage/objectives.ts';
 import type { CommandInput } from './storage/requests.ts';
 import { createRuntime } from './runtime.ts';
 import type { Runtime } from './runtime.ts';
@@ -61,6 +62,7 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
   if (error instanceof ConfigurationError) throw error;
   if (error instanceof CommandFailure) throw new CommandFailure(error.code, { ...data, ...error.data }, error.nextAction);
   if (error instanceof OwnerReadError) throw new CommandFailure('owner_unknown', data);
+  if (error instanceof TypeError) throw new CommandFailure('invalid_input', data);
   if (!(error instanceof StorageError)) throw new CommandFailure('internal_failure', data);
   const blockers = db.admissionBlockers();
   const message = error.message;
@@ -159,9 +161,15 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             nextAction: b.kind === 'claim'
               ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
-          objectives: [], openPersonQuestions: [] };
+          objectives: db.objectives(), openPersonQuestions: [] };
       }
       case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));
+      case 'objective.add': return { objective: await db.addObjective(args as unknown as Parameters<Database['addObjective']>[0], caller, command) };
+      case 'objective.show': return { objective: db.objective(String(args.objectiveId), caller) };
+      case 'objective.update': return { objective: await db.updateObjective(String(args.objectiveId), Number(args.expectedRevision), args as unknown as ObjectiveDefinition, caller, command) };
+      case 'objective.abandon': case 'objective.reopen': return { objective: await db.closeOrReopenObjective(String(args.objectiveId),
+        operation.name === 'objective.abandon' ? 'abandon' : 'reopen', String(args.reason), caller, command) };
+      case 'task.move': return { task: await db.moveTask(id, Number(args.expectedRevision), args.objectiveId as string | null, caller, command) };
       case 'task.show': return { task: taskView(db, db.task(id)) };
       case 'task.list': return paginate(db.tasks().map(t => taskView(db, t)).filter(t => (args.state === null || t.state === args.state) && (!args.readyOnly || t.ready)), args.page as Page, t => t.id);
       case 'task.add': return { task: await db.addTask({ ...(args.definition as Omit<TaskDefinition, 'objectiveId'>),

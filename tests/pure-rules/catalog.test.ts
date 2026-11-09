@@ -10,7 +10,8 @@ function checkInputSchema(schema: JsonSchema): void {
     assert.equal(schema.additionalProperties, false, "unknown fields must refuse");
     const properties = schema.properties as Record<string, JsonSchema>;
     assert.ok(properties && typeof properties === "object");
-    assert.deepEqual([...(schema.required as string[])].sort(), Object.keys(properties).sort(), "every input property is required");
+    if (Object.hasOwn(properties, 'manageTasks')) assert.deepEqual(schema.required, [], 'R18 permissions have versioned defaults');
+    else assert.deepEqual([...(schema.required as string[])].sort(), Object.keys(properties).sort(), "every input property is required");
     for (const property of Object.values(properties)) {
       assert.equal(typeof property.description, "string");
       assert.ok((property.description as string).trim());
@@ -26,14 +27,15 @@ function checkInputSchema(schema: JsonSchema): void {
 test("R28/A52: one version-1 catalogue exposes context.init and catalog.show with complete definitions", () => {
   assert.equal(catalogue.catalogueVersion, 1);
   assert.deepEqual(catalogue.operations.map(operation => operation.name).sort(), ['catalog.show', 'context.init', 'context.configure', 'status.show',
-    'task.add', 'task.show', 'task.list', 'task.update', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
+    'objective.add', 'objective.show', 'objective.update', 'objective.abandon', 'objective.reopen',
+    'task.add', 'task.show', 'task.list', 'task.update', 'task.move', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
     'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'request.show'].sort());
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
     assert.ok(operation.roles.includes('person'));
     if (['context.init', 'context.configure', 'attempt.continue', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
-    assert.deepEqual(operation.bindingDerivedFields, operation.name === 'task.add' ? ['objectiveId'] : []);
-    assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show', 'request.show'].includes(operation.name));
+    assert.deepEqual(operation.bindingDerivedFields, ['task.add', 'objective.show', 'objective.update', 'objective.abandon', 'objective.reopen'].includes(operation.name) ? ['objectiveId'] : []);
+    assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show', 'request.show', 'objective.show'].includes(operation.name));
     assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);

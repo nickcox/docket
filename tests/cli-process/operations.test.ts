@@ -131,6 +131,47 @@ test('R07/R08/R09/R31/R35: a separate CLI stops the live dispatch owner; Pi stee
   assert.equal(peer.filter(row => ['steer', 'follow_up'].includes(row.type)).length, 0);
 });
 
+test('R18/R19/R28: objective operations replay atomically, validate budgets and dispatch linked tasks with unchanged dry-run state', async t => {
+  const f = await fixture(t);
+  const add = { id: 'goal', request: 'Implement the feature', criteria: ['Works'], scope: '', constraints: '',
+    permissions: { dispatch: false }, budget: { maxCost: 0, currency: 'AUD', maxTokens: 0, maxWorkerTimeMs: 0 }, deadline: '2020-01-01T00:00:00+10:00' };
+  const goal = f.invoke('objective.add', add, 'add-goal');
+  assert.equal(goal.status, 0, JSON.stringify(goal.envelope));
+  const recorded = await snapshot(f.home);
+  assert.deepEqual(f.invoke('objective.add', add, 'add-goal').data, goal.data);
+  assert.deepEqual(await snapshot(f.home), recorded);
+  const bad = f.invoke('objective.update', { objectiveId: 'goal', expectedRevision: 1, criteria: ['Works'], scope: '', constraints: '',
+    permissions: {}, budget: { ...add.budget, currency: null }, deadline: null });
+  assert.equal(bad.envelope.code, 'invalid_input');
+  assert.deepEqual(await snapshot(f.home), recorded);
+  const update = { objectiveId: 'goal', expectedRevision: 1, criteria: ['Works'], scope: 'Repository', constraints: '', permissions: {}, budget: add.budget, deadline: add.deadline };
+  const updated = f.invoke('objective.update', update, 'update-goal');
+  assert.equal(updated.status, 0, JSON.stringify(updated.envelope));
+  assert.deepEqual(f.invoke('objective.update', update, 'update-goal').data, updated.data);
+  assert.equal(f.invoke('task.add', { id: 'feature', definition, objectiveId: 'goal' }).status, 0);
+  assert.equal(f.invoke('task.move', { taskId: 'feature', expectedRevision: 1, objectiveId: null }, 'unlink').status, 0);
+  assert.equal(f.invoke('task.move', { taskId: 'feature', expectedRevision: 2, objectiveId: 'goal' }, 'link').status, 0);
+  const stable = await snapshot(f.home);
+  const plan = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: true });
+  assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
+  assert.deepEqual(await snapshot(f.home), stable);
+  // Budgets and deadlines are stored but not yet enforced; persons are not restricted by supervisor permissions.
+  const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch-goal');
+  assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope));
+  assert.equal(dispatched.data.attempt.specification.objectiveId, 'goal');
+  const accepted = f.invoke('attempt.accept', { attemptId: dispatched.data.attempt.id, candidateCommit: null, overrideReason: null, dryRun: false }, 'accept-goal');
+  assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
+  assert.equal(accepted.data.leaseReturn.state, 'returned');
+  const abandoned = f.invoke('objective.abandon', { objectiveId: 'goal', reason: 'Pause' }, 'abandon-goal');
+  assert.equal(abandoned.status, 0, JSON.stringify(abandoned.envelope));
+  const reopened = f.invoke('objective.reopen', { objectiveId: 'goal', reason: 'Resume' }, 'reopen-goal');
+  assert.equal(reopened.status, 0, JSON.stringify(reopened.envelope));
+  const finished = await snapshot(f.home);
+  assert.deepEqual(f.invoke('objective.reopen', { objectiveId: 'goal', reason: 'Resume' }, 'reopen-goal').data, reopened.data);
+  assert.deepEqual(await snapshot(f.home), finished);
+  assert.equal(f.invoke('objective.show', { objectiveId: 'goal' }).data.objective.state, 'open');
+});
+
 test('R29/R04/R27: unknown profiles refuse definitions, automatic dispatch reports skips and status explains the repair', async t => {
   const f = await fixture(t);
   assert.equal(f.invoke('task.add', { id: 'removed', definition: { ...definition, profile: 'worker' }, objectiveId: null }).status, 0);

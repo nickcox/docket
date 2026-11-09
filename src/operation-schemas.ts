@@ -1,4 +1,5 @@
 import type { JsonSchema, OperationDefinition, Role } from './catalog.ts';
+import { permissionNames } from './storage/objectives.ts';
 
 const string = { type: 'string', minLength: 1, maxLength: 65536, pattern: '\\S' };
 const id = { ...string, pattern: '^[A-Za-z0-9._-]+$' };
@@ -12,6 +13,12 @@ const page = object({ after: nullable(string), limit: { type: 'integer', minimum
 const definition = (review: boolean) => object({ title: string, instructions: { type: 'string', maxLength: 65536 },
   criteria: { type: 'array', maxItems: 100, items: { ...string, maxLength: 2048, pattern: '^[^\\r\\n\\u2028\\u2029]*\\S[^\\r\\n\\u2028\\u2029]*$' } },
   kind: { enum: review ? ['code', 'report', 'review'] : ['code', 'report'] }, profile: nullable(string) });
+const criteria = { type: 'array', maxItems: 100, items: { ...string, maxLength: 2048, pattern: '^[^\\r\\n\\u2028\\u2029]*\\S[^\\r\\n\\u2028\\u2029]*$' } };
+const permissions = { ...object(Object.fromEntries(permissionNames.map(name => [name, bool]))), required: [] };
+const budget = object({ maxCost: nullable({ type: 'number', minimum: 0 }), currency: nullable(string),
+  maxTokens: nullable({ type: 'integer', minimum: 0 }), maxWorkerTimeMs: nullable({ type: 'integer', minimum: 0 }) });
+const deadline = nullable({ type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$' });
+const objectiveFields = { criteria, scope: { type: 'string' }, constraints: { type: 'string' }, permissions, budget, deadline };
 const attempt = { attemptId: uuid };
 const planAttempt = { ...attempt, dryRun: bool };
 const view = { type: 'object' };
@@ -37,6 +44,7 @@ function outputSchema(name: string): JsonSchema {
       input: view, result: nullable(view), effects: { type: 'array', maxItems: 20, items: object(identity) },
       effectsTotal: { type: 'integer', minimum: 0 } });
   }
+  if (name.startsWith('objective.')) return object({ objective: view });
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
@@ -67,7 +75,7 @@ function outputSchema(name: string): JsonSchema {
 }
 function operation(name: string, description: string, properties: Record<string, JsonSchema>, mutates = true,
   roles: readonly Role[] = ['person', 'supervisor']): OperationDefinition {
-  return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: name === 'task.add' ? ['objectiveId'] : [], mutates,
+  return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: name === 'task.add' || (name.startsWith('objective.') && Object.hasOwn(properties, 'objectiveId')) ? ['objectiveId'] : [], mutates,
     plans: Object.hasOwn(properties, 'dryRun'), outputSchema: outputSchema(name),
     tool: { name: `dk_${name.replaceAll('.', '_')}`, description } };
 }
@@ -80,11 +88,19 @@ export const coreOperations: OperationDefinition[] = [
   operation('task.show', 'Read a task and its readiness.', { taskId: id }, false),
   operation('task.list', 'Read a page of tasks in queue order.', { state: { enum: ['queued', 'in_flight', 'done', null] }, readyOnly: bool, page }, false),
   operation('task.update', 'Replace task definition at the expected revision.', { taskId: id, expectedRevision: { type: 'integer', minimum: 0 }, definition: definition(true) }),
+  operation('task.move', 'Move a task to an open objective or unlink it.', { taskId: id, expectedRevision: { type: 'integer', minimum: 0 }, objectiveId: nullable(id) }, true, ['person']),
   operation('task.hold', 'Hold a task with a single-line reason.', { taskId: id, reason: { ...string, maxLength: 200, pattern: '^[^\\r\\n\\u2028\\u2029]+$' } }),
   operation('task.release', 'Release a task hold.', { taskId: id }),
   ...['block', 'unblock'].map(action => operation(`task.${action}`, `${action === 'block' ? 'Add' : 'Remove'} a task dependency.`, { taskId: id, blockerId: id })),
   operation('task.reorder', 'Reorder the tasks in this scope.', { orderedTaskIds: { type: 'array', items: id, uniqueItems: true } }),
   ...['done', 'reopen'].map(action => operation(`task.${action}`, `Record a ${action} judgement without inventing acceptance evidence.`, { taskId: id, note: nullable(string) })),
+  operation('objective.add', 'Create an open objective; null permissions and budget select all permissions and unlimited usage.',
+    { id, request: string, ...objectiveFields, permissions: nullable(permissions), budget: nullable(budget) }, true, ['person']),
+  operation('objective.show', 'Read an objective and its current closure.', { objectiveId: id }, false),
+  operation('objective.update', 'Replace objective fields at the expected revision; protected fields require the creator.',
+    { objectiveId: id, expectedRevision: { type: 'integer', minimum: 0 }, ...objectiveFields }, true, ['person']),
+  operation('objective.abandon', 'Abandon an objective without stopping workers or returning leases.', { objectiveId: id, reason: string }, true, ['person']),
+  operation('objective.reopen', 'Reopen an objective, preserving closure history.', { objectiveId: id, reason: string }),
   operation('attempt.dispatch', 'Dispatch a ready task and wait in the foreground through completion and checks.', { taskId: nullable(id), profile: nullable(string), dryRun: bool }),
   operation('attempt.continue', 'Continue a terminal settled source in a new attempt without accepting its work.', {
     sourceAttemptId: uuid, sourceCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }),
@@ -110,6 +126,7 @@ export function validateSchema(schema: JsonSchema, value: unknown, path = '$'): 
   if (schema.type === 'null') return value === null ? null : path;
   if (schema.type === 'boolean' && typeof value !== 'boolean') return path;
   if (schema.type === 'integer' && (!Number.isSafeInteger(value) || Number(value) < Number(schema.minimum ?? -Infinity) || Number(value) > Number(schema.maximum ?? Infinity))) return path;
+  if (schema.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value) || value < Number(schema.minimum ?? -Infinity) || value > Number(schema.maximum ?? Infinity))) return path;
   if (schema.type === 'string') {
     if (typeof value !== 'string' || [...value].length < Number(schema.minLength ?? 0) || [...value].length > Number(schema.maxLength ?? Infinity)
       || (typeof schema.pattern === 'string' && !new RegExp(schema.pattern, 'u').test(value))) return path;

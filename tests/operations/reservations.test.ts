@@ -220,15 +220,21 @@ test('R04/R29: automatic reservation skips a removed task profile, with identica
   assert.equal(db.task('removed').state, 'queued');
 });
 
-test('R04: objective-linked tasks refuse by name and automatic selection skips them', async t => {
+test('R18/R04: named and automatic dispatch admit linked tasks and freeze original membership', async t => {
   const { db, path } = await fixture(t);
-  await add(db, 'objective'); await add(db, 'plain');
-  using seed = new DatabaseSync(path);
-  seed.prepare(`INSERT INTO objectives (id, request, criteria, scope, constraints_text, permissions, budget, creator, state, created_at)
-    VALUES ('goal', 'Goal', '[]', 'context', '', '{}', '{}', 'person', 'open', 'now')`).run();
-  await db.updateTaskDefinition('objective', { objectiveId: 'goal' }, actor);
-  await assert.rejects(db.reserveAttempt(input('named', 'objective')), /Objective-linked/);
-  assert.equal((await db.reserveAttempt(input())).attempt.taskId, 'plain');
+  await db.addObjective({ id: 'goal', request: 'Goal', criteria: [], scope: 'context', constraints: '', permissions: null, budget: null, deadline: null }, actor);
+  await db.addTask({ id: 'objective', title: 'Linked', objectiveId: 'goal' }, actor);
+  await db.addTask({ id: 'another', title: 'Also linked', objectiveId: 'goal' }, actor);
+  const named = await db.reserveAttempt(input('named', 'objective'));
+  assert.equal(named.attempt.specification.objectiveId, 'goal');
+  const automatic = await db.reserveAttempt(input());
+  assert.equal(automatic.attempt.taskId, 'another');
+  assert.equal(automatic.attempt.specification.objectiveId, 'goal');
+  await db.moveTask('objective', 1, null, actor);
+  assert.equal(db.attempt(named.attempt.id).specification.objectiveId, 'goal');
+  using sql = new DatabaseSync(path);
+  assert.equal(sql.prepare('SELECT objective_id FROM attempts WHERE id = ?').get(named.attempt.id)!.objective_id, 'goal');
+  assert.equal(db.request(named.requestId).objectiveId, 'goal');
 });
 
 test('A16/A49/R08: stale, future and unreadable claims refuse reservation naming the claim', async t => {

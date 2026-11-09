@@ -35,10 +35,8 @@ export interface AddTaskInput {
 }
 
 /** Supplied by trusted host code, not by task text. */
-export interface TaskActor extends JsonObject {
-  kind: 'person';
-  id: string;
-}
+export type TaskActor = JsonObject & ({ kind: 'person'; id: string }
+  | { kind: 'supervisor'; id: string; objectiveId: string; sessionId: string });
 
 const definitionKeys = ['title', 'instructions', 'criteria', 'kind', 'profile', 'objectiveId'];
 

@@ -27,6 +27,22 @@ Each dependency change records the actor, before/after task and incremented `dec
 
 Lists use `page:{"after":null,"limit":100}` initially and return the next cursor. Status uses a shared cursor across its task, attempt, claim and effect sections; its `page` gives the overall count and next cursor.
 
+## Objectives
+
+`objective.add` takes `id`, `request`, ordered `criteria`, `scope`, `constraints`, `permissions`, `budget` and `deadline`. It creates an open objective owned by the calling OS user. `permissions:null` enables every R18 permission; a permission object can omit fields, which default to true. Unknown fields and non-boolean values refuse.
+
+`budget:null` selects unlimited usage: `{"maxCost":null,"currency":null,"maxTokens":null,"maxWorkerTimeMs":null}`. A budget object must contain exactly those four fields. Limits are nonnegative, tokens and worker time are integers, and a finite cost requires a nonblank currency. Unlimited cost can retain a reporting currency. `deadline` is null or an ISO timestamp with an explicit offset, such as `2026-12-01T17:00:00+11:00`.
+
+Budgets and deadlines are validated and stored as supplied, but **are not yet enforced**, including at dispatch. Objective completion (statements and evidence matching), usage accounting and supervisors remain later work. Permissions are stored for supervisor authority; they do not restrict a person's task operations.
+
+`objective.show` takes `objectiveId` and returns the current definition, revision, state and closure. `objective.update` takes `objectiveId`, `expectedRevision`, `criteria`, `scope`, `constraints`, `permissions`, `budget` and `deadline`. It replaces these fields; only the creator can change criteria, permissions, budget or deadline. Another person can change scope and constraints without changing protected fields. Supervisors cannot use this operation.
+
+`objective.abandon` takes `objectiveId` and a nonblank `reason`, and is creator-only. `objective.reopen` takes the same fields, clears the current closure and statements, and retains the prior values in objective events. A scoped supervisor reopening an objective requires `manageTasks`. Neither operation stops workers, accepts output or returns leases.
+
+Link a task when adding it by supplying `objectiveId`. `task.move` takes `taskId`, `expectedRevision` (the task's definition revision) and `objectiveId`, with null unlinking the task. It is person-only and increments the definition revision when membership changes. Both the source and destination objectives must be open before changing membership. `task.update` cannot change membership. Objective-linked tasks can be dispatched; attempts retain the objective they started under even if their task later moves.
+
+These objective operations and `task.move` use command replay records. Their contracts do not take `dryRun`; dispatch remains planable with the same linked-task prerequisites in planning and execution.
+
 ## Standalone Pi dispatch
 
 The CLI currently uses the standalone Pi launcher and real Treehouse workspaces. bb qualification and host transport are separate work; a bb profile refuses before reservation.

@@ -10,6 +10,8 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } from './tasks.ts';
+import { objectiveDefinition, permissions, unlimitedBudget } from './objectives.ts';
+import type { Objective, ObjectiveDefinition } from './objectives.ts';
 import { workerReference, workerHost } from './launch.ts';
 import type { WorkerReference, InitialPromptAdmission, LaunchDecision, WorkerHost } from './launch.ts';
 import { readWorkerResult, workerObservation } from './results.ts';
@@ -529,6 +531,123 @@ export class Database {
     return row ? this.decodeEvent(row).payload.resolved as JsonObject : {};
   }
 
+  private objectiveRow(id: string): Record<string, unknown> {
+    const row = this.db.prepare('SELECT * FROM objectives WHERE id = ?').get(id);
+    if (!row) throw new StorageError('conflict', `Unknown objective: ${id}`);
+    return row;
+  }
+
+  private decodeObjective(row: Record<string, unknown>): Objective {
+    return { id: String(row.id), revision: Number(row.revision), request: String(row.request),
+      criteria: JSON.parse(String(row.criteria)), scope: String(row.scope), constraints: String(row.constraints_text),
+      permissions: permissions(JSON.parse(String(row.permissions))), budget: JSON.parse(String(row.budget)),
+      deadline: row.deadline === null ? null : String(row.deadline), creator: String(row.creator),
+      state: row.state as Objective['state'], completion: JSON.parse(String(row.completion)),
+      createdAt: String(row.created_at), closedAt: row.closed_at === null ? null : String(row.closed_at) };
+  }
+
+  private objectiveAuthority(objective: Objective, actor: TaskActor, creator = false): void {
+    if (actor.kind === 'supervisor') {
+      if (creator) throw new CommandFailure('creator_required');
+      if (actor.objectiveId !== objective.id) throw new CommandFailure('outside_objective');
+      if (!objective.permissions.manageTasks) throw new CommandFailure('permission_denied');
+    } else taskActor(actor);
+    if (creator && actor.id !== objective.creator) throw new CommandFailure('creator_required');
+  }
+
+  objective(id: string, actor: TaskActor): Objective {
+    return this.snapshot(() => {
+      const value = this.decodeObjective(this.objectiveRow(id));
+      if (actor.kind === 'supervisor' && actor.objectiveId !== id) throw new CommandFailure('outside_objective');
+      return value;
+    });
+  }
+
+  objectives(): Objective[] {
+    return this.snapshot(() => this.db.prepare('SELECT * FROM objectives ORDER BY created_at, id').all().map(row => this.decodeObjective(row)));
+  }
+
+  private objectiveEvent(operation: string, actor: TaskActor, before: Objective | null, after: Objective, reason: string | null = null): void {
+    const id = randomUUID();
+    this.insertEvent({ sourceKey: `objective:${id}`, kind: operation, payloadVersion: 1, correlationId: id,
+      objectiveId: after.id, actor, occurredAt: new Date().toISOString(),
+      payload: { before: before === null ? null : object(before), after: object(after), reason } });
+  }
+
+  async addObjective(input: Omit<ObjectiveDefinition, 'permissions' | 'budget'> & {
+    id: string; request: string; permissions: ObjectiveDefinition['permissions'] | null; budget: ObjectiveDefinition['budget'] | null;
+  }, actor: TaskActor, command?: CommandInput): Promise<Objective> {
+    taskActor(actor);
+    if (!/^[A-Za-z0-9._-]+$/u.test(input.id)) throw new TypeError('Invalid objective ID');
+    taskText(input.request);
+    if ([...input.request].length > 65536) throw new TypeError('Objective request is too long');
+    const value = objectiveDefinition({ ...input, permissions: permissions(input.permissions ?? {}), budget: input.budget ?? unlimitedBudget });
+    const id = input.id, request = input.request, owner = object(actor) as TaskActor;
+    return this.writeTask(command, () => {
+      this.db.prepare(`INSERT INTO objectives (id, request, criteria, scope, constraints_text, permissions, budget, deadline, creator, state, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`).run(id, request, json(value.criteria), value.scope,
+        value.constraints, json(value.permissions), json(value.budget), value.deadline, owner.id, new Date().toISOString());
+      const result = this.decodeObjective(this.objectiveRow(id));
+      this.objectiveEvent('objective.add', owner, null, result);
+      return result;
+    });
+  }
+
+  async updateObjective(id: string, expectedRevision: number, input: ObjectiveDefinition, actor: TaskActor, command?: CommandInput): Promise<Objective> {
+    const value = objectiveDefinition(input);
+    return this.writeTask(command, () => {
+      const before = this.decodeObjective(this.objectiveRow(id));
+      if (actor.kind !== 'person') throw new CommandFailure('person_required');
+      const protectedChanged = ['criteria', 'permissions', 'budget', 'deadline'].some(key =>
+        canonicalJson(before[key as keyof Objective]) !== canonicalJson(value[key as keyof ObjectiveDefinition]));
+      this.objectiveAuthority(before, actor, protectedChanged);
+      if (before.revision !== expectedRevision) throw new CommandFailure('task_changed');
+      this.changed(this.db.prepare(`UPDATE objectives SET criteria = ?, scope = ?, constraints_text = ?, permissions = ?, budget = ?,
+        deadline = ?, revision = revision + 1 WHERE id = ? AND revision = ?`).run(json(value.criteria), value.scope, value.constraints,
+        json(value.permissions), json(value.budget), value.deadline, id, expectedRevision));
+      const result = this.decodeObjective(this.objectiveRow(id));
+      this.objectiveEvent('objective.update', actor, before, result);
+      return result;
+    });
+  }
+
+  async closeOrReopenObjective(id: string, action: 'abandon' | 'reopen', reason: string, actor: TaskActor, command?: CommandInput): Promise<Objective> {
+    taskText(reason);
+    return this.writeTask(command, () => {
+      const before = this.decodeObjective(this.objectiveRow(id));
+      this.objectiveAuthority(before, actor, action === 'abandon');
+      const state = action === 'abandon' ? 'abandoned' : 'open';
+      if (before.state === state) return before;
+      this.changed(this.db.prepare(`UPDATE objectives SET state = ?, closed_at = ?, completion = '[]', revision = revision + 1
+        WHERE id = ? AND revision = ?`).run(state, action === 'reopen' ? null : new Date().toISOString(), id, before.revision));
+      const result = this.decodeObjective(this.objectiveRow(id));
+      this.objectiveEvent(`objective.${action}`, actor, before, result, reason);
+      return result;
+    });
+  }
+
+  private openMembership(id: string | null): void {
+    if (id !== null && this.objectiveRow(id).state !== 'open') throw new StorageError('conflict', 'Reopen the objective before changing membership');
+  }
+
+  async moveTask(id: string, expectedRevision: number, objectiveId: string | null, actor: TaskActor, command?: CommandInput): Promise<Task> {
+    if (actor.kind !== 'person') throw new CommandFailure('person_required');
+    taskActor(actor);
+    return this.writeTask(command, () => {
+      const before = this.decodeTask(this.taskRow(id));
+      if (before.definitionRevision !== expectedRevision) throw new CommandFailure('task_changed');
+      if (before.objectiveId === objectiveId) return before;
+      this.openMembership(before.objectiveId);
+      this.openMembership(objectiveId);
+      this.changed(this.db.prepare(`UPDATE tasks SET objective_id = ?, definition_revision = definition_revision + 1
+        WHERE id = ? AND definition_revision = ?`).run(objectiveId, id, expectedRevision));
+      const result = this.decodeTask(this.taskRow(id));
+      this.taskEvent('task.move', actor, id, { before: object(before), after: object(result),
+        membershipBefore: before.objectiveId, membershipAfter: objectiveId });
+      return result;
+    });
+  }
+
   async addTask(input: AddTaskInput, actor: TaskActor, command?: CommandInput): Promise<Task> {
     addTaskInput(input);
     taskActor(actor);
@@ -536,6 +655,7 @@ export class Database {
     const person = object(actor) as TaskActor;
     return this.writeTask(command, () => {
       requireProfile(this.currentTaskConfiguration(), value.profile);
+      this.openMembership(value.objectiveId ?? null);
       let id = value.id;
       if (id === undefined) {
         const base = taskSlug(value.title);
@@ -609,6 +729,7 @@ export class Database {
         && ((value.kind !== undefined && value.kind !== before.kind) || (value.criteria !== undefined && json(value.criteria) !== json(before.criteria))
           || (value.instructions !== undefined && value.instructions !== before.instructions)))) throw new StorageError('conflict', 'Linked review definition cannot change');
       requireProfile(this.currentTaskConfiguration(), value.profile);
+      if (value.objectiveId !== undefined && value.objectiveId !== before.objectiveId) throw new StorageError('conflict', 'Use task.move to change objective membership');
       const after = { ...before, ...value };
       if (json(before) === json(after)) return before;
       this.changed(this.db.prepare(`UPDATE tasks SET title = ?, instructions = ?, criteria = ?, kind = ?,
@@ -813,8 +934,8 @@ export class Database {
             WHERE task_id = ? AND blocker.state <> 'done' LIMIT 1`).get(task.id) ||
           this.db.prepare("SELECT 1 FROM attempts WHERE task_id = ? AND (execution_open = 1 OR (lease_state IN ('held', 'unknown') AND id <> ?)) LIMIT 1").get(task.id, value.sourceAttemptId ?? '') ||
           Number(this.db.prepare("SELECT count(*) AS count FROM attempts WHERE task_id = ? AND id NOT IN (SELECT attempt_id FROM events WHERE kind = 'profile.limited')").get(task.id)!.count) >= config.maxAttemptsPerTask;
-        if (unavailable || task.objectiveId !== null) {
-          if (value.taskId !== undefined) throw new StorageError('conflict', task.objectiveId !== null ? 'Objective-linked tasks are not supported' : 'Task is not eligible for reservation');
+        if (unavailable) {
+          if (value.taskId !== undefined) throw new StorageError('conflict', 'Task is not eligible for reservation');
           continue;
         }
         if (problem) {
@@ -837,7 +958,7 @@ export class Database {
           definitionRevision: task.definitionRevision, decisionRevision: task.decisionRevision, criteria: task.criteria,
           ...(value.sourceAttemptId === undefined ? {} : { sourceAttemptId: value.sourceAttemptId, handover: value.handover! }),
           ...(task.reviewTarget ? { reviewTarget: task.reviewTarget } : {}),
-          objectiveId: null, delivery: object({ ...value.delivery, kind: task.kind, baseRef: config.baseBranch, startingCommit, outputBranch: outputRef }),
+          objectiveId: task.objectiveId, delivery: object({ ...value.delivery, kind: task.kind, baseRef: config.baseBranch, startingCommit, outputBranch: outputRef }),
           baseBranch: config.baseBranch, targetBranch: config.finalisation.targetBranch!, outputRef, startingCommit,
           resultPath: join(String(identity.stateDirectory), 'attempts', id, 'result.json'),
           repository, workspace: { holder, pool: config.poolRoot },
@@ -848,8 +969,8 @@ export class Database {
           executionOpen: true, phase: 'reserved', launchState: 'pending', specification, allocation: null,
           leaseState: 'none', outcome: null, candidate: null } };
         const requestId = this.recordCommandInTransaction(command).id;
-        this.db.prepare(`INSERT INTO attempts (id, task_id, number, phase, specification, output_ref, created_at)
-          VALUES (?, ?, ?, 'reserved', ?, ?, ?)`).run(id, task.id, number, json(specification), outputRef, now);
+        this.db.prepare(`INSERT INTO attempts (id, task_id, objective_id, number, phase, specification, output_ref, created_at)
+          VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)`).run(id, task.id, task.objectiveId, number, json(specification), outputRef, now);
         this.bindCommandInTransaction(requestId, id, { skippedTasks });
         this.insertEvent({ sourceKey: `attempt.reserved:${id}`, kind: 'attempt.reserved', payloadVersion: 1,
           correlationId: requestId, actor: value.caller, occurredAt: now, taskId: task.id, attemptId: id, requestId,
@@ -882,7 +1003,7 @@ export class Database {
       if (typeof specification.sourceAttemptId === 'string') this.continuationSource(specification.sourceAttemptId, String(attempt.task_id), attemptId);
       const input = { workspace: specification.workspace!, repository: specification.repository!, outputRef: specification.outputRef!, startingCommit: specification.startingCommit! };
       const recorded = this.recordEffectInTransaction({ requestKey: `workspace.acquire:${attemptId}`, operation: 'workspace.acquire',
-        parentId: requestId, attemptId, caller: actor, executor: expected,
+        parentId: requestId, attemptId, ...this.attemptObjectiveScope(attemptId), caller: actor, executor: expected,
         fingerprint: createHash('sha256').update(json(input)).digest('hex'), input,
         target: { kind: 'workspace', reference: object(specification.workspace) } });
       const effect = this.claimEffectInTransaction(recorded.id, expected);
@@ -991,7 +1112,7 @@ export class Database {
   private workerEffect(attemptId: string, claimId: string, generation: string, operation: string, input: JsonObject, reference: JsonObject): StoredRequest {
     const command = this.dispatchCommand(attemptId);
     return this.recordEffectInTransaction({ requestKey: `${operation}:${attemptId}`, operation, parentId: command.id,
-      attemptId, caller: command.caller, executor: { claimId, generation }, input,
+      attemptId, ...this.attemptObjectiveScope(attemptId), caller: command.caller, executor: { claimId, generation }, input,
       fingerprint: createHash('sha256').update(json(input)).digest('hex'), target: { kind: 'worker', reference } });
   }
 
@@ -1048,7 +1169,7 @@ export class Database {
         throw new StorageError('conflict', 'Attempt has not started for worker ownership');
       }
       const [claim] = this.registerClaimsInTransaction([{ resourceKey: `worker:${attemptId}`, role: 'worker_owner',
-        attemptId, generation: caller.generation, ownerRef: caller, schemaFamily: applicationId,
+        attemptId, ...this.attemptObjectiveScope(attemptId), generation: caller.generation, ownerRef: caller, schemaFamily: applicationId,
         schemaVersion, configRevision: this.configRevision(), heartbeatAt: new Date().toISOString() }], caller);
       const claimId = claim!.id;
       this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.owner_registered', { claimId });
@@ -1545,7 +1666,7 @@ export class Database {
       }
       const generation = randomUUID();
       const [claim] = this.registerClaimsInTransaction([{ resourceKey: `checks:${request.id}`, role: 'check_executor',
-        attemptId: value.attemptId, generation, ownerRef: object(value.caller), schemaFamily: applicationId,
+        attemptId: value.attemptId, ...this.attemptObjectiveScope(value.attemptId), generation, ownerRef: object(value.caller), schemaFamily: applicationId,
         schemaVersion, configRevision: this.configRevision(), heartbeatAt: new Date().toISOString() }], value.caller);
       const claimed = this.claimCommandInTransaction(request.id, { claimId: claim!.id, generation });
       this.db.prepare("UPDATE attempts SET phase = 'awaiting_checks', revision = revision + 1 WHERE id = ?").run(value.attemptId);
@@ -1878,11 +1999,11 @@ export class Database {
       if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
       const generation = randomUUID();
-      const [claim] = this.registerClaimsInTransaction([{ resourceKey: `completion:${attemptId}`, role: 'maintenance', attemptId,
+      const [claim] = this.registerClaimsInTransaction([{ resourceKey: `completion:${attemptId}`, role: 'maintenance', attemptId, ...this.attemptObjectiveScope(attemptId),
         generation, ownerRef: stored.actor, schemaFamily: applicationId, schemaVersion, configRevision: this.configRevision(), heartbeatAt: new Date().toISOString() }], stored.actor);
       const executor = { claimId: claim!.id, generation };
       const request = this.recordEffectInTransaction({ requestKey: key, operation: `completion.${operation}`, caller: stored.actor,
-        input: value, fingerprint: json(value), parentId: stored.requestId!, executor, attemptId,
+        input: value, fingerprint: json(value), parentId: stored.requestId!, executor, attemptId, ...this.attemptObjectiveScope(attemptId),
         target: { kind: ['return', 'rebase', 'attach'].includes(operation) ? 'workspace' : 'repository', reference: value } });
       return { request, executor };
     });
@@ -1965,6 +2086,11 @@ export class Database {
     text(id);
     if (!Number.isSafeInteger(revision) || revision < 1) throw new TypeError('Invalid claim revision');
     return claim;
+  }
+
+  private attemptObjectiveScope(attemptId: string): { objectiveId?: string } {
+    const row = this.attemptRow(attemptId);
+    return row.objective_id === null ? {} : { objectiveId: String(row.objective_id) };
   }
 
   private validateScope(attemptId: string | undefined, objectiveId: string | undefined): void {
@@ -2203,11 +2329,11 @@ export class Database {
     const value: CommandInput = { ...JSON.parse(json(input)) as CommandInput, caller: object(input.caller), input: object(input.input) };
     const previous = this.duplicateRequest(value, 'command');
     if (previous) return previous;
-    this.validateScope(attemptId, undefined);
+    const objectiveId = attemptId === undefined ? null : this.attemptObjectiveScope(attemptId).objectiveId ?? null;
     const id = randomUUID();
-    this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, attempt_id, created_at)
-      VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?, ?)`)
-      .run(id, value.requestKey, value.operation, json(value.caller), value.fingerprint, json(value.input), attemptId ?? null, new Date().toISOString());
+    this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, attempt_id, objective_id, created_at)
+      VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?, ?, ?)`)
+      .run(id, value.requestKey, value.operation, json(value.caller), value.fingerprint, json(value.input), attemptId ?? null, objectiveId, new Date().toISOString());
     const request = this.decodeRequest(this.requestRow(id));
     this.storageEvent('request.recorded', value.caller, { request: object(request) }, id);
     return request;
@@ -2221,10 +2347,10 @@ export class Database {
 
   private bindCommandInTransaction(id: string, attemptId: string, result: JsonObject): StoredRequest {
     const before = this.pendingCommand(id);
-    this.validateScope(attemptId, undefined);
-    this.changed(this.db.prepare(`UPDATE requests SET attempt_id = ?, result = ?, revision = revision + 1
+    const objectiveId = this.attemptObjectiveScope(attemptId).objectiveId ?? null;
+    this.changed(this.db.prepare(`UPDATE requests SET attempt_id = ?, objective_id = ?, result = ?, revision = revision + 1
       WHERE id = ? AND attempt_id IS NULL AND state = 'pending' AND revision = ?`)
-      .run(attemptId, json(result), id, before.revision));
+      .run(attemptId, objectiveId, json(result), id, before.revision));
     return this.decodeRequest(this.requestRow(id));
   }
 
