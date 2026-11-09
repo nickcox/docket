@@ -193,7 +193,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           ...(operation.name === 'attempt.discard' ? { discard: { leaseId: allocation.leaseId, confirmed: true as const, reason: String(args.reason) } } : {}) };
         const completion = (await services()).completion;
         if (returns.discard && !args.dryRun) {
-          const leaseReturn = await automaticReturn(db, attemptId, caller, completion, returns.discard);
+          const leaseReturn = await automaticReturn(db, attemptId, caller, completion, returns.discard, requestKey);
           return { attempt: leaseReturn.attempt, leaseReturn: { state: leaseReturn.state, reason: leaseReturn.reason } };
         }
         const plan = await planAttemptReturn(db, returns, completion);

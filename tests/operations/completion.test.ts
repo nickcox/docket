@@ -133,6 +133,41 @@ test('A21/R11: automatic return keeps dirty, unretained, mismatched and unresolv
   }
 });
 
+test('R11: discard records the person decision before keeping dirt, then explicit return needs no retained output', async t => {
+  const f = await fixture(t);
+  f.dirty(); f.loseRetention();
+  const discard = { leaseId: f.a.allocation.leaseId, confirmed: true as const, reason: 'No longer needed' };
+  const kept = await automaticReturn(f.db, f.a.id, person, f.services, discard, 'person-discard');
+  assert.equal(kept.state, 'kept');
+  assert.equal(f.db.task('task').holdReason, 'discarded');
+  const authorisation = f.db.events().find(e => e.kind === 'return.authorised')!;
+  assert.equal(authorisation.payload.automatic, false);
+  assert.equal(authorisation.payload.discardReason, discard.reason);
+  f.cleanWorkspace();
+  await returnAttempt(f.db, f.returns, f.services);
+  assert.equal(f.db.attempt(f.a.id).leaseState, 'returned');
+});
+
+test('R11: discard keeps an unresolved effect without losing the person decision', async t => {
+  const f = await fixture(t);
+  f.services.run = async () => ({ status: 'uncertain', exitCode: null, timedOut: false, stdout: '', stderr: '', truncated: false });
+  await runCandidateChecks(f.db, f.a.id, person, f.services, 'uncertain-before-discard');
+  const kept = await automaticReturn(f.db, f.a.id, person, f.services,
+    { leaseId: f.a.allocation.leaseId, confirmed: true, reason: 'Stop work on this task' }, 'discard-unresolved');
+  assert.equal(kept.state, 'kept');
+  assert.match(kept.reason!, /unresolved effect/);
+  assert.equal(f.db.task('task').holdReason, 'discarded');
+  assert.equal(f.calls.includes('return'), false);
+});
+
+test('R11: an invalid discard is refused rather than reported as a successful decision with a kept lease', async t => {
+  const f = await fixture(t);
+  const running = await f.attempt('running-discard', ['Criterion'], undefined, head, start, policyContent, 'validated');
+  await assert.rejects(automaticReturn(f.db, running.id, person, f.services,
+    { leaseId: running.allocation.leaseId, confirmed: true, reason: 'Not stopped' }, 'invalid-discard'), /terminal/);
+  assert.equal(f.db.events().some(e => e.attemptId === running.id && e.kind === 'return.authorised'), false);
+});
+
 test('R30: acceptance plans missing checks and conditional acceptance without writes; execution runs those checks', async t => {
   const f = await fixture(t, true);
   const events = f.db.events(), requests = f.db.requests(), claims = f.db.claims();

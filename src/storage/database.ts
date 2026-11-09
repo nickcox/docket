@@ -1475,7 +1475,7 @@ export class Database {
       const allocation = object(JSON.parse(String(attempt.allocation)));
       const command = this.decodeRequest(this.requestRow(requestId));
       if (command.operation !== (value.discard ? 'attempt.discard' : 'attempt.return') || json(command.caller) !== json(value.caller)
-        || json(command.input) !== json(value)) throw new StorageError('conflict', 'Return must match its person command');
+        || json(command.input) !== json(value)) throw new StorageError('conflict', 'Return must match its recorded command');
       if (value.automatic && value.discard) throw new StorageError('conflict', 'Automatic return cannot confirm discard');
       if (value.discard !== undefined
         && (value.discard.leaseId !== allocation.leaseId || value.discard.confirmed !== true)) {
@@ -1485,10 +1485,10 @@ export class Database {
       const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
       if (previous) {
         const recorded = this.decodeEvent(previous);
-        if (Boolean(recorded.payload.discard) !== Boolean(value.discard)) throw new StorageError('conflict', 'Return and discard decisions differ');
+        if (value.discard && !recorded.payload.discard) throw new StorageError('conflict', 'Return and discard decisions differ');
         return recorded;
       }
-      if (this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
+      if (!value.discard && this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
       if (abandonedWithoutOutcome) {
         this.db.prepare(`UPDATE attempts SET outcome = 'failed', execution_open = 0, phase = 'settled',

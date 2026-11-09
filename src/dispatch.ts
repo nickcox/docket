@@ -12,7 +12,7 @@ import { runCandidateChecks } from './checks.ts';
 import { CommandFailure } from './response.ts';
 import { step } from './plans.ts';
 import { known } from './operation-utils.ts';
-import { automaticReturn } from './completion.ts';
+import { automaticReturn, leaseReturnReason } from './completion.ts';
 
 export async function dispatch(db: Database, args: { taskId: string | null; profile: string | null; dryRun: boolean },
   caller: TaskActor, requestKey: string, runtime: Runtime, progress: (message: string) => void) {
@@ -22,7 +22,10 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const replay = await db.reserveAttempt({ requestKey, caller, ...(args.taskId === null ? {} : { taskId: args.taskId }),
       ...(args.profile === null ? {} : { profile: args.profile }), startingCommit: '', checks: {} as ReservationInput['checks'],
       delivery: {} as ReservationInput['delivery'] }, args.dryRun);
-    return { attempt: replay.attempt, replayed: true, skippedTasks: replay.skippedTasks, steps: [] };
+    const leaseReturn = replay.attempt.leaseState === 'returned'
+      ? { state: 'returned', reason: null }
+      : { state: 'kept', reason: await leaseReturnReason(db, replay.attempt.id, caller, runtime.completion) };
+    return { attempt: replay.attempt, leaseReturn, replayed: true, skippedTasks: replay.skippedTasks, steps: [] };
   }
   const config = db.checkConfiguration();
   const configured = db.events().findLast(e => e.kind === 'context.configured')!.payload.resolved as JsonObject;
@@ -50,7 +53,10 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   if (args.dryRun) return { taskId: task.id, skippedTasks: preview.skippedTasks, steps };
   progress('attempt.reserve');
   const reservation = await db.reserveAttempt(input);
-  if (reservation.replayed) return { attempt: reservation.attempt, replayed: true, skippedTasks: reservation.skippedTasks, steps: [] };
+  if (reservation.replayed) return { attempt: reservation.attempt,
+    leaseReturn: reservation.attempt.leaseState === 'returned' ? { state: 'returned', reason: null }
+      : { state: 'kept', reason: await leaseReturnReason(db, reservation.attempt.id, caller, runtime.completion) },
+    replayed: true, skippedTasks: reservation.skippedTasks, steps: [] };
   const id = reservation.attempt.id;
   const generation = randomUUID(), host: WorkerHost = { kind: 'host', id: `cli:${process.pid}:${randomUUID()}`, generation };
   const [claim] = await db.registerClaims([{ resourceKey: `dispatch:${id}`, role: 'maintenance', generation, ownerRef: caller,

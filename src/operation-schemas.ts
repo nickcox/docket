@@ -36,7 +36,7 @@ function outputSchema(name: string): JsonSchema {
   const variants: JsonSchema[] = [object({ steps })];
   if (name === 'attempt.dispatch') {
     const skippedTasks = { type: 'array', items: object({ taskId: id, reason: string }) };
-    variants.push(object({ taskId: id, skippedTasks, steps }), object({ attempt: view, leaseReturn, skippedTasks, steps }), object({ attempt: view, replayed: bool, skippedTasks, steps }));
+    variants.push(object({ taskId: id, skippedTasks, steps }), object({ attempt: view, leaseReturn, skippedTasks, steps }), object({ attempt: view, leaseReturn, replayed: bool, skippedTasks, steps }));
   }
   else if (['attempt.accept', 'attempt.return', 'attempt.discard'].includes(name)) {
     variants.push(object({ attempt: view, leaseReturn, steps }), object({ attempt: view, leaseReturn }));

@@ -291,8 +291,14 @@ export async function automaticReturn(db: Database, attemptId: string, caller: R
   discard?: ReturnInput['discard'], requestKey = `automatic-return:${attemptId}`) {
   const input: ReturnInput = { requestKey, attemptId, caller,
     ...(discard ? { discard } : { automatic: true }) };
+  // A person's discard decision must succeed before a return failure can be reported as kept.
+  if (discard) {
+    const command = await db.recordCommand({ requestKey, operation: 'attempt.discard', caller,
+      fingerprint: canonicalJson(input), input: JSON.parse(JSON.stringify(input)) as JsonObject });
+    await db.authoriseReturn(input, command.id);
+  }
   try {
-    if (!discard) await planAttemptReturn(db, input, services);
+    await planAttemptReturn(db, input, services);
     const attempt = await returnAttempt(db, input, services);
     return { state: 'returned' as const, reason: null, attempt };
   } catch (error) {

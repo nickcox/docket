@@ -169,12 +169,14 @@ test('R11: held and failed dispatches automatically return clean leases with ret
     assert.equal(result.data.attempt.outcome, outcome);
     assert.equal(result.data.attempt.leaseState, 'returned');
     assert.equal(result.data.leaseReturn.state, 'returned');
+    const replay = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+    assert.equal(replay.data.leaseReturn.state, 'returned');
     const detail = f.invoke('attempt.show', { attemptId: result.data.attempt.id }).data;
     assert.equal(f.git('rev-parse', result.data.attempt.specification.outputRef), detail.result.content.workReferences[0].commit);
   }
 });
 
-test('A21: acceptance keeps untracked work and attention status gives the reason and next action', async t => {
+test('A21: kept leases show current dirt, retention and unresolved-effect reasons with next actions', async t => {
   const f = await fixture(t);
   f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
   const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false });
@@ -189,6 +191,30 @@ test('A21: acceptance keeps untracked work and attention status gives the reason
   assert.match(attention.reason, /uncommitted or untracked/);
   assert.equal(attention.nextAction.operation, 'attempt.return');
   assert.ok(attention.nextAction.description);
+
+  // A later status read checks current retention, not just the failed automatic return.
+  f.git('update-ref', attempt.specification.outputRef, attempt.specification.startingCommit);
+  const unretained = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.attempts.items[0];
+  assert.match(unretained.reason, /retained/);
+  assert.ok(unretained.nextAction.description);
+  f.git('update-ref', attempt.specification.outputRef, attempt.candidate.commit);
+
+  const db = await Database.open(f.config.databasePath, { readOnly: false,
+    location: { retainedRoot: f.config.stateDirectory, recyclableRoots: [f.config.workspace.poolRoot] } });
+  try {
+    const caller = { kind: 'person' as const, id: String(userInfo().uid) };
+    const [claim] = await db.registerClaims([{ resourceKey: 'uncertain-return-condition', role: 'maintenance', generation: 'condition',
+      ownerRef: caller, schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], caller);
+    const command = await db.recordCommand({ requestKey: 'effect-condition', operation: 'test', caller, fingerprint: 'condition', input: {} });
+    const executor = { claimId: claim!.id, generation: claim!.generation };
+    const effect = await db.recordEffect({ requestKey: 'unresolved-condition', operation: 'workspace.test', caller, fingerprint: 'condition',
+      input: {}, parentId: command.id, executor, attemptId: attempt.id, target: { kind: 'workspace', reference: attempt.allocation } });
+    await db.claimEffect(effect.id, executor);
+    await db.recordEffectOutcome(effect.id, executor, 'uncertain', { reason: 'Lost owner response' });
+  } finally { db.close(); }
+  const unresolved = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.attempts.items[0];
+  assert.match(unresolved.reason, /unresolved effect/);
+  assert.ok(unresolved.nextAction.description);
 });
 
 test('R28/A52: return and discard reject the removed noProcesses field', async t => {
@@ -291,7 +317,7 @@ test('R11: CLI discards terminal missing/invalid output, refuses dirty work and 
     assert.match(kept.data.leaseReturn.reason, /uncommitted or untracked/);
     assert.equal(f.invoke('attempt.show', { attemptId }).data.outcome, 'failed');
     await rm(dirty);
-    const returned = f.invoke('attempt.discard', discard, 'discard');
+    const returned = f.invoke('attempt.return', { attemptId, dryRun: false }, 'return-discarded');
     assert.equal(returned.status, 0, JSON.stringify(returned.envelope));
     assert.equal(returned.data.attempt.outcome, 'failed');
     assert.equal(returned.data.attempt.executionOpen, false);
@@ -312,7 +338,7 @@ test('R07/R08/R11: a failed model turn leaves a confirmed terminal stop, a relea
   const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data;
   assert.deepEqual(status.blockers, []);
   assert.equal(status.claims.length, 0);
-  const discarded = f.invoke('attempt.discard', { attemptId, confirmDiscard: true, noProcesses: true, reason: 'Provider refused the turn', dryRun: false }, 'discard');
+  const discarded = f.invoke('attempt.discard', { attemptId, confirmDiscard: true, reason: 'Provider refused the turn', dryRun: false }, 'discard');
   assert.equal(discarded.status, 0, JSON.stringify(discarded.envelope));
   assert.equal(discarded.data.attempt.outcome, 'failed');
   assert.equal(discarded.data.attempt.leaseState, 'returned');
