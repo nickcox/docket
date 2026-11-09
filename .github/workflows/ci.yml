@@ -24,14 +24,23 @@ jobs:
         with:
           node-version-file: .node-version
 
-      - name: Cache Treehouse 3.1.4 archive
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      - name: Restore Treehouse 3.1.4 archive
+        id: restore-treehouse
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/treehouse-archives
           key: treehouse-3.1.4-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install Treehouse 3.1.4 (verified SHA-256)
+        id: install-treehouse
         run: node .github/scripts/install-treehouse.mjs
+
+      - name: Save Treehouse 3.1.4 archive
+        if: steps.restore-treehouse.outputs.cache-hit != 'true' && steps.install-treehouse.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/treehouse-archives
+          key: treehouse-3.1.4-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install dependencies
         run: npm ci
