@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { commandRunner } from '../../src/adapters/command.ts';
 import { loadExecutionProfiles } from '../../src/runtime.ts';
-import { windowsPowerShellEnvironment, windowsSettingsWritableOnlyByOwner } from '../../src/adapters/host-files.ts';
+import { windowsPowerShellEnvironment, windowsSecurePrivateDirectory, windowsSettingsWritableOnlyByOwner } from '../../src/adapters/host-files.ts';
 
 test('R29/R31: Windows PowerShell receives no inherited module path on every platform', async () => {
   const original = process.env.PSModulePath;
@@ -43,6 +43,42 @@ test('R29/R31: untrusted Windows ACLs differ from failed or incomplete verificat
     } else {
       await assert.rejects(check, { message: 'Windows owner/write ACL could not be verified' });
     }
+  }
+});
+
+test('R31/R35: private Windows directory ACL replacement removes explicit grants and refuses any unverified result', async t => {
+  for (const result of [
+    { complete: true, code: 0 }, { complete: true, code: 2 },
+    { complete: true, code: 1 }, { complete: true, code: null },
+    { complete: false, code: 0 }, { complete: true, code: 99 },
+  ]) {
+    const secure = windowsSecurePrivateDirectory('private directory', options => {
+      assert.deepEqual(options?.environment, { ...windowsPowerShellEnvironment(), DOCKET_PRIVATE_DIRECTORY: 'private directory' });
+      return async (executable, args) => {
+        assert.equal(executable, 'powershell.exe');
+        assert.deepEqual(args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-EncodedCommand']);
+        const script = Buffer.from(args[3]!, 'base64').toString('utf16le');
+        assert.ok(script.includes('[System.Security.AccessControl.DirectorySecurity]::new()'));
+        assert.ok(script.includes('SetAccessRuleProtection($true, $false)'));
+        assert.ok(script.indexOf('Set-Acl') < script.indexOf('Get-Acl'));
+        assert.ok(script.includes('$rules.Count -ne 1'));
+        return { ...result, stdout: '', stderr: '' };
+      };
+    });
+    if (result.complete && result.code === 0) await secure;
+    else await assert.rejects(secure, { message: 'Windows private directory ACL could not be secured and verified' });
+  }
+  await assert.rejects(windowsSecurePrivateDirectory('private directory', () => async () => { throw new Error('spawn failed'); }), /spawn failed/);
+  if (process.platform === 'win32') {
+    const directory = await mkdtemp(join(await realpath(tmpdir()), 'docket-private-acl-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const run = commandRunner();
+    const seeded = await run('icacls', [directory, '/grant', '*S-1-5-18:(OI)(CI)F', '*S-1-1-0:(OI)(CI)R'], directory);
+    assert.equal(seeded.complete, true); assert.equal(seeded.code, 0, seeded.stderr);
+    await windowsSecurePrivateDirectory(directory);
+    // The helper's read-back must reject either seeded explicit grant if it remains.
+    // The Pi contract independently inspects the exact DACL and its inherited home ACL.
+    await windowsSecurePrivateDirectory(directory);
   }
 });
 

@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { PiLauncher } from '../../src/adapters/pi.ts';
 import { windowsPowerShellEnvironment } from '../../src/adapters/host-files.ts';
@@ -201,14 +201,22 @@ test('R31/R33/R35: exact cwd/provider/model, controlled resources and environmen
   assert.ok(spawn.environment.HOME.startsWith(join(f.root, 'state')));
   if (process.platform === 'win32') {
     const script = '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ' +
+      '$directory = Get-Acl -LiteralPath $env:PRIVATE_DIRECTORY; ' +
       '$rules = @((Get-Acl -LiteralPath $env:PRIVATE_HOME).Access | ForEach-Object { ' +
       '@{ sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; ' +
       'allow = ($_.AccessControlType -eq "Allow"); full = (($_.FileSystemRights -band 2032127) -eq 2032127) } }); ' +
-      '@{ owner = $sid; rules = $rules } | ConvertTo-Json -Depth 4';
+      '$direct = @($directory.Access | ForEach-Object { ' +
+      '@{ sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; ' +
+      'allow = ($_.AccessControlType -eq "Allow"); full = ($_.FileSystemRights -eq 2032127); ' +
+      'inherited = $_.IsInherited; inheritance = [int]$_.InheritanceFlags; propagation = [int]$_.PropagationFlags } }); ' +
+      '@{ owner = $sid; rules = $rules; protected = $directory.AreAccessRulesProtected; direct = $direct } | ConvertTo-Json -Depth 4';
     const acl = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
       Buffer.from(script, 'utf16le').toString('base64')],
-    { env: { ...windowsPowerShellEnvironment(), PRIVATE_HOME: spawn.environment.HOME }, encoding: 'utf8' }));
-    assert.ok(acl.rules.length > 0);
+    { env: { ...windowsPowerShellEnvironment(), PRIVATE_HOME: spawn.environment.HOME,
+      PRIVATE_DIRECTORY: dirname(spawn.environment.HOME) }, encoding: 'utf8' }));
+    assert.equal(acl.protected, true);
+    assert.deepEqual(acl.direct, [{ sid: acl.owner, allow: true, full: true, inherited: false, inheritance: 3, propagation: 0 }]);
+    assert.equal(acl.rules.length, 1);
     for (const rule of acl.rules) assert.deepEqual(rule, { sid: acl.owner, allow: true, full: true });
   } else {
     assert.equal((await stat(spawn.environment.HOME)).mode & 0o077, 0);

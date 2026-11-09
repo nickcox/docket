@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import type { JsonObject } from '../storage/database.ts';
 import type { WorkerReference } from '../storage/launch.ts';
-import { commandRunner, confirmed, rejected, uncertain, type Result } from './command.ts';
+import { confirmed, rejected, uncertain, type Result } from './command.ts';
+import { windowsSecurePrivateDirectory } from './host-files.ts';
 import type { Launcher, LauncherCapabilities, MessageMode, Usage, WorkerBinding, WorkerObservation } from './launcher.ts';
 import { redactDiagnostics } from './checks.ts';
 import type { TurnFailure } from './launcher.ts';
@@ -106,16 +107,7 @@ export class PiLauncher implements Launcher {
       if (!outside(cwd, root)) return rejected('Pi state must be outside the leased workspace');
       const directory = join(root, randomUUID());
       await mkdir(directory, { mode: 0o700 });
-      if (process.platform === 'win32') {
-        // Windows ignores POSIX permission bits. Remove inherited grants and
-        // grant only the current account access to this fresh process directory.
-        const run = commandRunner();
-        const account = await run('whoami', ['/user', '/fo', 'csv', '/nh'], root);
-        const sid = account.stdout.match(/S-1-\d+(?:-\d+)+/)?.[0];
-        if (!account.complete || account.code !== 0 || !sid) throw new Error('Cannot identify the private Pi directory owner');
-        const secured = await run('icacls', [directory, '/inheritance:r', '/grant:r', `*${sid}:(OI)(CI)F`], root);
-        if (!secured.complete || secured.code !== 0) throw new Error('Cannot secure the private Pi directory');
-      }
+      if (process.platform === 'win32') await windowsSecurePrivateDirectory(directory);
       const home = join(directory, 'home'), sessions = join(directory, 'sessions');
       await mkdir(join(home, '.pi', 'agent'), { recursive: true, mode: 0o700 });
       await mkdir(sessions, { mode: 0o700 });

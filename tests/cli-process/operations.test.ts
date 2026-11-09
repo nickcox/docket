@@ -31,6 +31,12 @@ const peer = fileURLToPath(new URL('../fixtures/pi-peer.ts', import.meta.url));
 async function fixture(t: test.TestContext, mode = 'code-result') {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-operations-')));
   t.after(() => rm(home, { recursive: true, force: true }));
+  if (process.platform === 'win32') {
+    // Windows PowerShell's settings ACL probe initialises AppData\Roaming under
+    // USERPROFILE even with -NoProfile. A real Windows profile already has these
+    // folders; create them before snapshots so every other home write is detected.
+    await mkdir(join(home, 'AppData', 'Roaming'), { recursive: true });
+  }
   const repo = join(home, 'repository'); await mkdir(repo);
   const git = (...args: string[]) => {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', timeout: 5000 });
