@@ -105,7 +105,8 @@ export class GitRepository {
         const name = entry.slice(14);
         branch = name === '(detached)' ? null : `refs/heads/${name}`;
         // These markers can also be literal branch names; (null) can mean a non-heads ref.
-        if (name === '(null)' || name === '(detached)') {
+        // Git on Windows prints (NULL) where other platforms print (null).
+        if (/^\((?:null|detached)\)$/i.test(name)) {
           const symbolic = await this.command(['symbolic-ref', '--quiet', 'HEAD'], path);
           if (!symbolic.complete || ![0, 1].includes(symbolic.code!) || (symbolic.code === 0 && !isRef(symbolic.stdout.trim()))) return uncertain('Workspace branch could not be read', symbolic);
           branch = symbolic.code === 0 ? symbolic.stdout.trim() : null;
