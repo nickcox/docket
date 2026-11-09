@@ -4,6 +4,16 @@
 
 Use `--config /absolute/context.json` or a registered `--context name`, and exactly one of `--stdin` and `--input file.json`. Every command writes one version-1 envelope to stdout. Dispatch progress goes to stderr. Person mutations generate a request ID unless `--request-id key` is supplied. Reuse that key after a lost response, with the same input. Task mutations and their replay result commit together.
 
+## Questions
+
+`question.ask` takes exactly `{"text":"Which approach?","choices":["A","B"],"waiting":true}`. Only a bound worker or supervisor can ask. A worker's recipient is its task's objective supervisor, or a person when the task has no objective. A supervisor asks a person. Text, choices, waiting, asker, recipient and scope are immutable.
+
+`question.answer` takes exactly `{"questionId":"<UUID>","text":"Use A"}`. A person can answer any question; a supervisor needs `answerQuestions`, the right recipient and current task membership. Only a person answers a question addressed to a person. These two operations do not accept `dryRun`. Repeating the same answer is harmless; a different answer refuses with `question_answered`.
+
+Pi workers publish complete `{text,choices,waiting}` JSON files by atomic rename into the protocol's `questionsDirectory`. Each filename is consumed once per attempt, including malformed files, which produce one diagnostic. Use a fresh filename for each question. Answers use the file channel: an `answers` directory beside `questionsDirectory` holds `<questionId>.json`. File and message delivery have separate durable requests, recorded atomically with the answer. A recorded answer is not delivery evidence; inspect its requests with `request.show`. Uncertain deliveries are not retried automatically. Answers never restart terminal workers, and remain available in continuation handovers.
+
+`status.show` lists unanswered questions in `openPersonQuestions`, with their choices, recipient and an answer next action. Pending or uncertain answer deliveries remain in its effects section even after the question is answered.
+
 ## Configuration
 
 Edit the person-controlled configuration file, then run `context.configure` with `{"dryRun":true}` to report changed top-level fields and the next revision. Run it with `{"dryRun":false}` to apply the file. Both use the strict configuration parser and require quiescence: no execution-open attempt, unreleased claim, or claimed or uncertain effect. Refusals list every blocking item; resolve each before trying again.
@@ -99,7 +109,7 @@ A person can plan `attempt.continue` with `{"sourceAttemptId":"<UUID>","sourceCo
 
 The source must be terminal and settled, with a retained output ref and no unresolved effect. Its held workspace must be clean, including untracked files, or continuation refuses with `workspace_dirty`. Other workers and leases for the task block continuation; only the source's held lease is exempt. Readiness, attempt limits, capacity and profile limits still apply. Continuing neither accepts the source's work nor prompts its worker again.
 
-The new attempt has its own output ref, lease and session. Its immutable handover includes source identity, candidate, outcome and failure, criteria, recorded checks and your note. It also includes recorded review findings; question history remains empty until question operations are implemented. The worker must verify inherited work against the task. A private ref pins the recorded start before workspace acquisition; conditional cleanup preserves a moved ref and records uncertain cleanup for resolution. Source lease return follows the ordinary safe-return rules. Reuse the same request ID and input after a lost response: replay returns the original attempt without allocation or activation.
+The new attempt has its own output ref, lease and session. Its immutable handover includes source identity, candidate, outcome and failure, criteria, recorded checks and your note. It also includes recorded review findings and the task's current answers and unanswered questions, including questions from earlier attempts. The worker must verify inherited work against the task. A private ref pins the recorded start before workspace acquisition; conditional cleanup preserves a moved ref and records uncertain cleanup for resolution. Source lease return follows the ordinary safe-return rules. Reuse the same request ID and input after a lost response: replay returns the original attempt without allocation or activation.
 
 ## Independent review
 

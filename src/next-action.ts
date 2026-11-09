@@ -1,5 +1,5 @@
 export const nextActionOperations = [
-  'task.show', 'attempt.dispatch', 'attempt.show', 'attempt.accept', 'attempt.rebase',
+  'question.answer', 'task.show', 'attempt.dispatch', 'attempt.show', 'attempt.accept', 'attempt.rebase',
   'attempt.return', 'attempt.continue', 'checks.run', 'claim.resolve', 'request.show', 'profile.clear', 'status.show',
 ] as const;
 

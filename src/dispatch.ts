@@ -7,6 +7,7 @@ import type { ReservationInput, Allocation } from './storage/reservations.ts';
 import type { TaskActor } from './storage/tasks.ts';
 import type { TurnFailure } from './adapters/launcher.ts';
 import type { Runtime } from './runtime.ts';
+import { consumeQuestionFiles, deliverAnswers } from './questions.ts';
 import { prepareWorker, activateWorker, controlWorker } from './workers.ts';
 import type { WorkerHost, WorkerReference } from './storage/launch.ts';
 import { runCandidateChecks } from './checks.ts';
@@ -193,6 +194,8 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     let refreshed = Date.now();
     let turnFailure: TurnFailure | undefined;
     while (true) {
+      await consumeQuestionFiles(db, id);
+      await deliverAnswers(db, id, reference, host, runtime.launcher);
       await controlWorker(db, id, reference, host, runtime.launcher);
       const observation = await runtime.launcher.inspect(reference);
       if (observation.status !== 'known') throw new CommandFailure('owner_unknown', { attemptId: id });
@@ -207,6 +210,8 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     const observed = await runtime.launcher.inspect(reference);
     if (observed.status !== 'known' || !observed.terminal) throw new CommandFailure('owner_unknown', { attemptId: id });
     terminal = true;
+    await consumeQuestionFiles(db, id);
+    await deliverAnswers(db, id, reference, host, runtime.launcher);
     await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: ++sequence, attemptId: id, workerRef: reference,
       observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
       payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);

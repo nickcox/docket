@@ -25,7 +25,7 @@ export function createBinding(caller: Caller, selector: ContextSelector, options
       if (name === 'catalog.show') return structuredClone({ catalogueVersion: 1, operations: definitions });
       const input = structuredClone(args);
       if (bound.kind === 'supervisor') for (const field of operation.bindingDerivedFields) input[field] = bound.objectiveId;
-      if (bound.kind !== 'person' && bound.kind !== 'supervisor') throw new CommandFailure('person_required');
+      if (bound.kind === 'host') throw new CommandFailure('person_required');
       const core = catalogue.operations.find(item => item.name === name)!;
       return executeCoreOperation(core, input, progress, context, requestId, { ...options, caller: bound });
     },

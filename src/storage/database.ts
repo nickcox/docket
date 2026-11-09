@@ -10,6 +10,8 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } from './tasks.ts';
+import { questionInput } from './questions.ts';
+import type { Question, QuestionCaller, QuestionInput } from './questions.ts';
 import { supervisorPermissions } from '../authority.ts';
 import { objectiveDefinition, permissions, unlimitedBudget } from './objectives.ts';
 import type { Objective, ObjectiveDefinition } from './objectives.ts';
@@ -430,6 +432,7 @@ export class Database {
   }
 
   private snapshot<T>(read: () => T): T {
+    if (this.db.isTransaction) return read();
     this.db.exec('BEGIN');
     try {
       this.verifyVersion();
@@ -482,6 +485,107 @@ export class Database {
       throw new StorageError('conflict', 'Duplicate dependency');
     }
     this.db.prepare('INSERT INTO dependencies (task_id, blocker_id) VALUES (?, ?)').run(taskId, blockerId);
+  }
+
+  questions(): Question[] {
+    return this.snapshot(() => {
+      const events = this.events();
+      const answers = new Map(events.filter(e => e.kind === 'question.answered').map(e => [e.payload.questionId, e.payload]));
+      return events.filter(e => e.kind === 'question.asked').map(e => ({ ...e.payload, answer: answers.get(e.payload.id) ?? null } as Question));
+    });
+  }
+
+  async askQuestion(input: QuestionInput, caller: QuestionCaller,
+    sourceKey: string, command?: CommandInput): Promise<Question> {
+    questionInput(input);
+    const value = structuredClone(input), actor = structuredClone(caller);
+    return this.write(() => {
+      if (command) this.duplicateRequest(command, 'command');
+      const previous = this.events().find(e => e.sourceKey === sourceKey);
+      if (previous) return this.questions().find(q => q.id === previous.payload.id)!;
+      if (actor.kind !== 'worker' && actor.kind !== 'supervisor') throw new CommandFailure('person_required');
+      if (actor.kind === 'supervisor') this.checkAuthority(actor, 'question.ask');
+      const attempt = actor.kind === 'worker' ? this.attempt(actor.attemptId) : null;
+      const task = attempt ? this.task(attempt.taskId) : null;
+      const objectiveId = task?.objectiveId ?? (actor.kind === 'supervisor' ? actor.objectiveId : null);
+      const id = randomUUID();
+      const question: Question = { id, source: sourceKey, ...value, asker: actor,
+        recipient: actor.kind === 'worker' && objectiveId !== null ? { kind: 'supervisor', objectiveId } : { kind: 'person' },
+        scope: { taskId: task?.id ?? null, attemptId: attempt?.id ?? null, objectiveId }, answer: null };
+      this.insertEvent({ sourceKey, kind: 'question.asked', payloadVersion: 1, correlationId: id,
+        actor, occurredAt: new Date().toISOString(), notification: true, payload: question,
+        ...(task ? { taskId: task.id, attemptId: attempt!.id } : {}), ...(objectiveId ? { objectiveId } : {}) });
+      if (command) {
+        const request = this.recordCommandInTransaction(command, attempt?.id);
+        if (!attempt && objectiveId) this.db.prepare('UPDATE requests SET objective_id = ? WHERE id = ?').run(objectiveId, request.id);
+        this.finishPendingCommandInTransaction(request.id, 'succeeded', { questionId: id });
+      }
+      return question;
+    });
+  }
+
+  async questionDiagnostic(attemptId: string, sourceKey: string): Promise<void> {
+    await this.write(() => {
+      if (this.events().some(e => e.sourceKey === sourceKey)) return;
+      const attempt = this.attempt(attemptId);
+      this.insertEvent({ sourceKey, kind: 'question.invalid', payloadVersion: 1, correlationId: attemptId,
+        attemptId, taskId: attempt.taskId, actor: { kind: 'worker', attemptId }, occurredAt: new Date().toISOString(),
+        notification: true, payload: { message: 'Malformed worker question file.' } });
+    });
+  }
+
+  async answerQuestion(id: string, text: string, caller: TaskActor, command: CommandInput): Promise<Question> {
+    nonblank(text);
+    return this.write(() => {
+      const replay = this.duplicateRequest(command, 'command');
+      const q = this.questions().find(q => q.id === id);
+      if (!q) throw new CommandFailure('invalid_input');
+      if (caller.kind !== 'person') {
+        if (q.recipient.kind === 'person') throw new CommandFailure('recipient_mismatch');
+        if (q.recipient.objectiveId !== caller.objectiveId) throw new CommandFailure('outside_objective');
+        this.checkAuthority(caller, 'question.answer', { ...(q.scope.taskId ? { taskId: q.scope.taskId } : {}) });
+      }
+      if (q.answer) {
+        if (q.answer.text !== text) throw new CommandFailure('question_answered');
+        if (!replay) {
+          const request = this.recordCommandInTransaction(command, q.scope.attemptId ?? undefined);
+          if (!q.scope.attemptId && q.scope.objectiveId) this.db.prepare('UPDATE requests SET objective_id = ? WHERE id = ?').run(q.scope.objectiveId, request.id);
+          this.finishPendingCommandInTransaction(request.id, 'succeeded', { questionId: id });
+        }
+        return q;
+      }
+      const parent = this.recordCommandInTransaction(command, q.scope.attemptId ?? undefined);
+      if (!q.scope.attemptId && q.scope.objectiveId) this.db.prepare('UPDATE requests SET objective_id = ? WHERE id = ?').run(q.scope.objectiveId, parent.id);
+      const answer = { questionId: id, text, caller, answeredAt: new Date().toISOString() };
+      this.insertEvent({ sourceKey: `question.answer:${id}`, kind: 'question.answered', payloadVersion: 1,
+        correlationId: id, requestId: parent.id, actor: caller, occurredAt: answer.answeredAt, notification: true,
+        payload: answer, ...(q.scope.taskId ? { taskId: q.scope.taskId, attemptId: q.scope.attemptId! } : {}),
+        ...(q.scope.objectiveId ? { objectiveId: q.scope.objectiveId } : {}) });
+      if (q.scope.attemptId) {
+        const attempt = this.attempt(q.scope.attemptId);
+        const preparation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.prepare');
+        const reference = preparation?.result?.reference as JsonObject | undefined;
+        const owner = this.claims().find(c => c.attemptId === attempt.id && c.role === 'worker_owner' && !c.releasedAt);
+        const terminal = !attempt.executionOpen || this.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
+        for (const channel of (reference?.launcher === 'pi' ? ['file', 'message'] : ['message'])) {
+          const effectId = randomUUID();
+          const input = { ...answer, question: { text: q.text, source: q.source }, resultPath: preparation?.input.resultPath ?? null };
+          this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, parent_id, attempt_id, objective_id,
+            caller, fingerprint, input, target, claim_id, state, result, created_at) VALUES (?, ?, 'effect', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(effectId, `question:${id}:${channel}`, `question.deliver.${channel}`, parent.id, attempt.id, q.scope.objectiveId,
+              json(caller), canonicalJson(input), json(input), json({ kind: 'answer', reference: { questionId: id, worker: reference ?? null } }),
+              owner?.id ?? null, terminal ? 'withdrawn' : 'pending', terminal ? json({ reason: 'Worker is terminal; answer retained for continuation.' }) : null, answer.answeredAt);
+        }
+      } else {
+        const effectId = randomUUID(), input = { ...answer };
+        this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, parent_id, objective_id,
+          caller, fingerprint, input, target, created_at) VALUES (?, ?, 'effect', 'question.deliver.message', ?, ?, ?, ?, ?, ?, ?)`)
+          .run(effectId, `question:${id}:message`, parent.id, q.scope.objectiveId, json(caller), canonicalJson(input), json(input),
+            json({ kind: 'answer', reference: { questionId: id, supervisor: q.asker } }), answer.answeredAt);
+      }
+      this.finishPendingCommandInTransaction(parent.id, 'succeeded', { questionId: id });
+      return { ...q, answer };
+    });
   }
 
   private writeTask<T>(command: CommandInput | undefined, change: () => T): Promise<T> {
@@ -570,6 +674,13 @@ export class Database {
     if (permission && !objective.permissions[permission]) throw new CommandFailure('permission_denied');
     if (permission && objective.state !== 'open' && operation !== 'objective.reopen') throw new CommandFailure('policy_refused');
     if (input.objectiveId !== undefined && input.objectiveId !== actor.objectiveId) throw new CommandFailure('outside_objective');
+    if (operation === 'question.answer' && typeof input.questionId === 'string') {
+      const question = this.questions().find(q => q.id === input.questionId);
+      if (!question) throw new CommandFailure('invalid_input');
+      if (question.recipient.kind === 'person') throw new CommandFailure('recipient_mismatch');
+      if (question.recipient.objectiveId !== actor.objectiveId) throw new CommandFailure('outside_objective');
+      if (question.scope.taskId && this.taskRow(question.scope.taskId).objective_id !== actor.objectiveId) throw new CommandFailure('outside_objective');
+    }
     const taskIds = [input.taskId, input.blockerId, ...((input.orderedTaskIds ?? []) as string[])].filter((id): id is string => typeof id === 'string');
     for (const key of ['attemptId', 'sourceAttemptId']) if (typeof input[key] === 'string') taskIds.push(String(this.attemptRow(input[key] as string).task_id));
     for (const id of taskIds) if (this.taskRow(id).objective_id !== actor.objectiveId) throw new CommandFailure('outside_objective');
@@ -2429,10 +2540,17 @@ export class Database {
       fingerprint: request.fingerprint, input: request.input };
     commandInput(common);
     if (request.category === 'effect') {
-      text(request.parentId); text(request.claimId);
-      const claim = this.decodeClaim(this.claimRow(request.claimId));
-      effectInput({ ...common, parentId: request.parentId, executor: { claimId: claim.id, generation: claim.generation }, target: request.target! });
-      object(request.target!.reference);
+      text(request.parentId);
+      if (request.claimId === null && request.operation.startsWith('question.deliver.')
+        && ['pending', 'withdrawn'].includes(request.state) && request.target?.kind === 'answer') {
+        // Answer intent is durable even when the asker has no live delivery owner.
+        object(request.target.reference);
+      } else {
+        text(request.claimId);
+        const claim = this.decodeClaim(this.claimRow(request.claimId));
+        effectInput({ ...common, parentId: request.parentId, executor: { claimId: claim.id, generation: claim.generation }, target: request.target! });
+        object(request.target!.reference);
+      }
     } else if (request.category !== 'command') throw new TypeError('Invalid request category');
     if (!['pending', 'claimed', 'succeeded', 'rejected', 'withdrawn', 'uncertain'].includes(request.state)) throw new TypeError('Invalid request state');
     return request;
@@ -2702,13 +2820,7 @@ export class Database {
   }
 
   events(): StoredEvent[] {
-    this.db.exec('BEGIN');
-    try {
-      this.verifyVersion();
-      const events = this.db.prepare('SELECT * FROM events ORDER BY seq').all().map(row => this.decodeEvent(row));
-      this.db.exec('COMMIT');
-      return events;
-    } catch (error) { if (this.db.isTransaction) this.db.exec('ROLLBACK'); throw error; }
+    return this.snapshot(() => this.db.prepare('SELECT * FROM events ORDER BY seq').all().map(row => this.decodeEvent(row)));
   }
 
   close(): void { if (this.db.isOpen) this.db.close(); }

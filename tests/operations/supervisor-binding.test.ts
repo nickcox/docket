@@ -63,6 +63,31 @@ test('R17/R28/A37/A52: generated role catalogues and strict bound schemas expose
   await assert.rejects(executeCoreOperation(findOperation('task.release')!, { taskId: 'bound', caller: person }, () => {}, { config: f.file }, 'forged', { home: f.home, caller: supervisor }), code('invalid_input'));
 });
 
+test('R21/R28/A43/A44: bound question tools derive the asker, status keeps choices and next action, and person answers retain pending delivery', async t => {
+  const f = await fixture(t);
+  const args = { text: 'Approve the approach?', choices: ['Yes', 'No'], waiting: true };
+  const asked = await f.binding.execute('question.ask', args, 'ask');
+  const question = asked.question as any;
+  assert.deepEqual(question.recipient, { kind: 'person' });
+  assert.equal(question.asker.sessionId, supervisor.sessionId);
+  assert.deepEqual(await f.binding.execute('question.ask', args, 'ask'), asked);
+  await assert.rejects(f.binding.execute('question.ask', { ...args, text: 'Changed' }, 'ask'), code('request_input_mismatch'));
+  const boundPerson = createBinding(person, { config: f.file }, { home: f.home });
+  const status = await boundPerson.execute('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  const pending = (status.openPersonQuestions as any[])[0];
+  assert.deepEqual(pending.choices, args.choices);
+  assert.equal(pending.nextAction.operation, 'question.answer');
+  assert.equal(pending.nextAction.args.questionId, question.id);
+  await assert.rejects(f.binding.execute('question.answer', { questionId: question.id, text: 'Yes' }), code('recipient_mismatch'));
+  const worker = createBinding({ kind: 'worker', attemptId: 'own-attempt' }, { config: f.file }, { home: f.home });
+  await assert.rejects(worker.execute('question.answer', { questionId: question.id, text: 'Yes' }), code('person_required'));
+  await assert.rejects(worker.execute('question.ask', { ...args, attemptId: 'another-attempt' }), code('invalid_input'));
+  await boundPerson.execute('question.answer', { questionId: question.id, text: 'Yes' });
+  const answered = await boundPerson.execute('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  assert.deepEqual(answered.openPersonQuestions, []);
+  assert.equal((answered.effects as any[])[0].state, 'pending', 'Recording an answer does not prove message delivery');
+});
+
 test('R18/A36: every admitted operation checks its permission and current membership, including plans', async t => {
   const f = await fixture(t);
   await f.db.addTask({ id: 'inside', title: 'Inside', objectiveId: 'goal' }, person);

@@ -32,6 +32,7 @@ const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', 
   outcome: nullable({ enum: ['completed', 'held', 'failed', 'interrupted', 'over_budget'] }), leaseState: string,
   candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), review: view, checksState: string, resultInvalid: nullable(object({ message: { ...string, maxLength: 1024 } })), ...attention });
 function outputSchema(name: string): JsonSchema {
+  if (name.startsWith('question.')) return object({ question: view });
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
   if (name === 'diagnostics.clean') return { type: 'object', anyOf: [object({ steps }), object({ steps, manifest: object({
@@ -84,6 +85,8 @@ function operation(name: string, description: string, properties: Record<string,
     tool: { name: `dk_${name.replaceAll('.', '_')}`, description } };
 }
 export const coreOperations: OperationDefinition[] = [
+  operation('question.ask', 'Ask an immutable question with a binding-derived recipient.', { text: string, choices: nullable({ type: 'array', items: { type: 'string' } }), waiting: bool }, true, ['worker', 'supervisor']),
+  operation('question.answer', 'Record an answer and its independent delivery requests.', { questionId: uuid, text: string }),
   operation('context.configure', 'Validate and apply the selected configuration while quiescent.', { dryRun: bool }, true, ['person']),
   operation('profile.clear', 'Clear a limited profile after its provider limit resets.', { profile: string, dryRun: bool }, true, ['person']),
   operation('status.show', 'Read context status, capacity and unresolved owners.', { attentionOnly: bool, page }, false),

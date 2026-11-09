@@ -11,6 +11,7 @@ import { runCandidateChecks } from './checks.ts';
 import type { CheckServices } from './checks.ts';
 import type { TaskActor } from './storage/tasks.ts';
 import { canonicalJson } from './configuration.ts';
+import { consumeQuestionFiles } from './questions.ts';
 import { CommandFailure } from './response.ts';
 
 /** Observations are retained before result processing, so a refusal cannot lose a terminal fact. */
@@ -18,6 +19,7 @@ export async function observeWorker(db: Database, observation: WorkerObservation
   repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>,
   checks?: { caller: TaskActor; services: CheckServices }): Promise<Attempt> {
   await db.recordWorkerObservation(observation, host);
+  await consumeQuestionFiles(db, observation.attemptId);
   if (observation.kind === 'result_available') await db.validateWorkerResult(observation.attemptId, host, repository);
   // Turn-end and idle are not completion evidence. They may reconcile facts already recorded.
   if (db.validatedWorkerResult(observation.attemptId) || observation.kind === 'terminal'

@@ -27,7 +27,7 @@ import { validateSchema } from './operation-schemas.ts';
 export interface OperationOptions extends ContextOptions {
   runtime?: typeof createRuntime;
   /** Trusted host input only. Never read from operation args. */
-  caller?: TaskActor;
+  caller?: import('./storage/questions.ts').QuestionCaller;
 }
 type Page = { after: string | null; limit: number };
 function paginate<T>(items: T[], page: Page, key: (value: T) => string) {
@@ -89,8 +89,10 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   selector: ContextSelector, requestKey: string = randomUUID(), options: OperationOptions = {}): Promise<Record<string, unknown>> {
   if (validateSchema(operation.inputSchema, args)) throw new CommandFailure('invalid_input');
   args = structuredClone(args);
-  const caller: TaskActor = structuredClone(options.caller ?? { kind: 'person' as const, id: String(userInfo().uid) });
-  if (!operation.roles.includes(caller.kind)) throw new CommandFailure('person_required');
+  const bound = structuredClone(options.caller ?? { kind: 'person' as const, id: String(userInfo().uid) });
+  if (!operation.roles.includes(bound.kind)) throw new CommandFailure('person_required');
+  if (bound.kind === 'worker' && operation.name !== 'question.ask') throw new CommandFailure('person_required');
+  const caller = bound as TaskActor;
   if (operation.name === 'context.init') return initialiseContext(selector, { ...options, caller });
   if (operation.name === 'context.configure') return configureContext(selector, { ...options, caller, dryRun: args.dryRun === true });
   const context = await openContext(selector, { ...options, readOnly: !operation.mutates || args.dryRun === true });
@@ -100,10 +102,12 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   let runtime: Runtime | undefined;
   const services = async () => runtime ??= await (options.runtime ?? createRuntime)(db, context.configuration.resolved, options.home);
   try {
+    if (operation.name === 'question.ask') return { question: await db.askQuestion(input as import('./storage/questions.ts').QuestionInput, bound, `question.command:${requestKey}`, command) };
     db.checkAuthority(caller, operation.name, input);
     const visibleTask = (task: Task) => caller.kind !== 'supervisor' || task.objectiveId === caller.objectiveId;
     const id = String(args.taskId);
     switch (operation.name) {
+      case 'question.answer': return { question: await db.answerQuestion(String(args.questionId), String(args.text), caller, command) };
       case 'diagnostics.clean': return await cleanDiagnostics(db, args as unknown as Parameters<typeof cleanDiagnostics>[1], caller, requestKey);
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
       case 'status.show': {
@@ -117,7 +121,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
               : t.holdReason !== null ? action('task.show', { taskId: t.id }, 'Inspect the task hold before deciding how to proceed.')
               : ready ? action('attempt.dispatch', { taskId: t.id, profile: null, dryRun: true }, 'Plan dispatch of the ready task.') : null };
         }).filter(t => !args.attentionOnly || t.reason !== null);
-        const requests = db.requests().filter(r => caller.kind !== 'supervisor' || r.attemptId && visibleTask(db.task(db.attempt(r.attemptId).taskId)));
+        const requests = db.requests().filter(r => caller.kind !== 'supervisor' || (r.attemptId ? visibleTask(db.task(db.attempt(r.attemptId).taskId)) : r.objectiveId === caller.objectiveId));
         const attentionAttempts = (await Promise.all(attempts.map(async a => {
           const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
           const checksState = String(checks?.result?.status ?? checks?.state ?? 'missing');
@@ -148,7 +152,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           return blocker ? { ...c, reason: `Claim heartbeat is ${blocker.reason}; ownership is unresolved.`,
             nextAction: action('claim.resolve', { claimId: c.id, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.') } : null;
         }).filter(c => c !== null);
-        const effects = requests.filter(r => r.category === 'effect' && ['claimed', 'uncertain'].includes(r.state)).map(r => !args.attentionOnly ? r : {
+        const effects = requests.filter(r => r.category === 'effect' && (['claimed', 'uncertain'].includes(r.state) || r.state === 'pending' && r.operation.startsWith('question.deliver.'))).map(r => !args.attentionOnly ? r : {
           ...r, reason: `Effect is ${r.state}; its external outcome needs reconciliation.`,
           nextAction: action('request.show', { requestId: r.requestKey }, 'Inspect the effect and its owner before resolving its outcome.') });
         const entries = [...tasks.map(value => ({ key: `task:${value.id}`, kind: 'task', value })),
@@ -168,7 +172,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             nextAction: b.kind === 'claim'
               ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
-          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId), openPersonQuestions: [] };
+          objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor' || q.scope.objectiveId === caller.objectiveId)).map(q => ({ ...q,
+            nextAction: action('question.answer', { questionId: q.id, text: '<answer>' }, 'Answer this question; only a person may answer a question addressed to a person.') })) };
       }
       case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));
       case 'objective.add': return { objective: await db.addObjective(args as unknown as Parameters<Database['addObjective']>[0], caller, command) };
