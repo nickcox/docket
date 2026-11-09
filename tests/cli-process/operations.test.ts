@@ -281,6 +281,45 @@ test('R27/R30: moved targets name exact commits and rebase action; target restri
   assert.equal(returned.data.attempt.leaseState, 'returned');
 });
 
+for (const sameLines of [false, true]) {
+  test(`R14: repeated rebase excludes conflicting target history${sameLines ? ' when later target changes touch the same lines' : ''}`, async t => {
+    const f = await fixture(t);
+    assert.equal(f.invoke('task.add', { id: 'feature', definition, objectiveId: null }).status, 0);
+    const dispatched = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false });
+    assert.equal(dispatched.status, 0, JSON.stringify(dispatched.envelope));
+    const attempt = dispatched.data.attempt;
+    const original = attempt.candidate.commit;
+    const targetChange = async (text: string) => {
+      await writeFile(join(f.repo, 'README'), text + '\n');
+      f.git('add', 'README'); f.git('commit', '-qm', text);
+    };
+    // Replaying the first target patch onto the final target would conflict.
+    await targetChange('Intermediate target');
+    await targetChange('First target');
+    const firstTarget = f.git('rev-parse', 'HEAD');
+    const first = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: false }, 'first-rebase');
+    assert.equal(first.status, 0, JSON.stringify(first.envelope));
+    if (sameLines) await targetChange('Second target');
+    else f.git('commit', '--allow-empty', '-qm', 'Target advances');
+    const secondTarget = f.git('rev-parse', 'HEAD');
+    const plan = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: true });
+    assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
+    const second = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: false }, 'second-rebase');
+    assert.equal(second.status, 0, JSON.stringify(second.envelope));
+    assert.deepEqual(second.data.steps, plan.data.steps);
+    const commit = second.data.attempt.candidate.commit;
+    assert.equal(f.git('rev-list', '--count', `${secondTarget}..${commit}`), '1');
+    assert.equal(f.git('rev-parse', `${commit}^`), secondTarget);
+    assert.equal(f.git('diff', `${original}^`, original), f.git('diff', secondTarget, commit));
+    assert.equal(f.git('show', `${commit}:README`), sameLines ? 'Second target' : 'First target');
+    using db = await Database.open(f.config.databasePath, { readOnly: true,
+      location: { retainedRoot: f.config.stateDirectory, recyclableRoots: [f.config.workspace.poolRoot] } });
+    const event = db.events().findLast(e => e.kind === 'output.rebased' && e.attemptId === attempt.id)!;
+    assert.deepEqual([event.payload.original, event.payload.upstream, event.payload.target, event.payload.rebased],
+      [first.data.attempt.candidate.commit, firstTarget, secondTarget, commit]);
+  });
+}
+
 test('R27/A52: failed checks appear in compact attention status with a reason and next action', async t => {
   const f = await fixture(t);
   await mkdir(join(f.repo, '.docket'));

@@ -40,13 +40,15 @@ async function prerequisites(db: Database, input: RebaseInput, services: Complet
     const pin = known(await services.repository.inspectRef(String(plan!.pinnedRef)));
     if (pin.state !== 'present' || pin.commit !== plan!.pinnedCommit) refuse('Original candidate is not retained by the pinned ref');
   }
-  const outputRef = String(candidate!.outputRef), original = String(candidate!.commit), upstream = String(attempt.specification.startingCommit);
+  const outputRef = String(candidate!.outputRef), original = String(candidate!.commit);
+  const previousRebase = db.events().findLast(e => e.attemptId === attempt.id && e.kind === 'output.rebased' && e.payload.rebased === original);
+  const upstream = String(previousRebase ? previousRebase.payload.target : attempt.specification.startingCommit);
   const output = known(await services.repository.inspectRef(outputRef));
   const workspace = known(await services.repository.inspectWorkspace(allocation!.path));
   if (!workspace.clean) refuse('Workspace has uncommitted or untracked work');
   if (output.state !== 'present' || output.commit !== (moved ? plan!.rebased : original)
     || workspace.head !== (detached ? plan!.rebased : original) || workspace.branch !== (detached ? null : outputRef)) refuse('Workspace or output branch is not at the exact candidate');
-  if (!known(await services.repository.compare(upstream, original))) refuse('Candidate must descend from the starting commit');
+  if (!known(await services.repository.compare(upstream, original))) refuse('Candidate must descend from the rebase upstream');
   const common = await services.repository.command(['merge-base', original, target.commit]);
   if (!common.complete || common.code !== 0 || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(common.stdout.trim())) refuse('Candidate and target need a known common ancestor');
   const merges = await services.repository.command(['rev-list', '--merges', `${upstream}..${original}`]);

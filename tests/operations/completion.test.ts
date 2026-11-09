@@ -571,7 +571,7 @@ async function rebaseFixture(t: Parameters<typeof fixture>[0]) {
   };
   repository.createPinnedRef = async (ref, commit) => { f.calls.push('pin'); if (f.refs.has(ref)) return rejected('Exists'); f.refs.set(ref, commit); return confirmed({ ref, commit }); };
   repository.prepareRebase = async (_workspace, original, upstream, onto) => {
-    f.calls.push('rebase'); assert.equal(upstream, start); assert.equal(onto, f.refs.get('refs/heads/main'));
+    f.calls.push('rebase'); assert.equal(upstream, original === head ? start : target); assert.equal(onto, f.refs.get('refs/heads/main'));
     if (abortUnknown) return uncertain('Abort unknown');
     if (conflict) return rejected('rebase_conflict');
     state = { ...state, branch: null, head: original === head ? rebased : second };
@@ -659,8 +659,27 @@ test('R14/R11: target moving again permits another rebase; discard keeps a moved
   const first = f.db.attempt(f.a.id).candidate!;
   f.refs.set('refs/heads/main', 'f'.repeat(40));
   await assert.rejects(planCandidateAcceptance(f.db, { ...f.accept, candidateId: String(first.id), commit: String(first.commit) }, f.services), (e: any) => e.code === 'not_fast_forward');
-  await rebaseAttempt(f.db, { ...f.input, requestKey: 'second' }, f.services);
+  const compareBefore = f.services.repository.compare, commandBefore = f.services.repository.command;
+  const comparisons: string[][] = [], ranges: string[] = [];
+  f.services.repository.compare = async (ancestor, descendant) => {
+    comparisons.push([ancestor, descendant]);
+    return compareBefore(ancestor, descendant);
+  };
+  f.services.repository.command = async (args, cwd) => {
+    if (args[0] === 'rev-list') ranges.push(args[2]!);
+    return commandBefore(args, cwd);
+  };
+  const secondInput = { ...f.input, requestKey: 'second' };
+  await planAttemptRebase(f.db, secondInput, f.services);
+  assert.ok(comparisons.some(([ancestor, descendant]) => ancestor === f.target && descendant === f.rebased));
+  assert.deepEqual(ranges, [`${f.target}..${f.rebased}`]);
+  ranges.length = 0;
+  await rebaseAttempt(f.db, secondInput, f.services);
+  assert.ok(ranges.length > 0 && ranges.every(range => range === `${f.target}..${f.rebased}`));
   assert.equal(f.db.attempt(f.a.id).candidate!.commit, f.second);
+  const event = f.db.events().findLast(e => e.kind === 'output.rebased')!;
+  assert.deepEqual([event.payload.original, event.payload.upstream, event.payload.target, event.payload.rebased],
+    [f.rebased, f.target, 'f'.repeat(40), f.second]);
   const pin = originalCandidateRef(f.db.attempt(f.a.id).specification);
   f.refs.set(pin, f.target);
   // A moved pin may still retain the original as an ancestor, but cleanup must not delete it.
