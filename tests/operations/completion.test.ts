@@ -10,7 +10,7 @@ import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { mandatoryChecks, parseCheckPolicy } from '../../src/check-policy.ts';
 import type { TrustedChecks } from '../../src/storage/reservations.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
-import { Database } from '../../src/storage/database.ts';
+import { Database, StorageError } from '../../src/storage/database.ts';
 import { CommandFailure } from '../../src/response.ts';
 import { checkFixture, contextChecks, head, host, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
 
@@ -341,6 +341,29 @@ test('R10/R32: protected or unreadable target protection refuses local-merge and
     assert.ok(f.refs.has(f.a.binding.outputRef));
     assert.equal(f.calls.includes('integrate'), false);
     assert.notEqual(f.db.task('task').state, 'done');
+  }
+});
+
+test('R27/R30: target restrictions refuse planning and execution before divergent-target handling', async t => {
+  for (const restriction of ['protected', 'forbidden']) {
+    const f = await fixture(t, true);
+    f.refs.set('refs/heads/main', 'c'.repeat(40));
+    f.services.readPolicy = async () => confirmed({ digest: 'policy',
+      forbidden: restriction === 'forbidden', protected: restriction === 'protected' });
+    const events = f.db.events(), requests = f.db.requests();
+    const refusal = (error: unknown) => {
+      assert.ok(error instanceof StorageError);
+      assert.equal(error.code, 'conflict');
+      assert.equal(error.message, 'Protected target or finalisation policy refuses local-merge');
+      return true;
+    };
+    await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), refusal);
+    assert.deepEqual(f.db.events(), events);
+    assert.deepEqual(f.db.requests(), requests);
+    await assert.rejects(acceptCandidate(f.db, f.accept, f.services), refusal);
+    assert.equal(f.refs.get(f.a.binding.outputRef), head);
+    assert.equal(f.refs.get('refs/heads/main'), 'c'.repeat(40));
+    assert.equal(f.calls.includes('integrate'), false);
   }
 });
 
@@ -726,10 +749,16 @@ test('R14/R11: target moving again permits another rebase; discard keeps a moved
     return commandBefore(args, cwd);
   };
   const secondInput = { ...f.input, requestKey: 'second' };
-  await planAttemptRebase(f.db, secondInput, f.services);
+  const events = f.db.events(), requests = f.db.requests(), refs = [...f.refs];
+  const plan = await planAttemptRebase(f.db, secondInput, f.services);
+  assert.deepEqual(f.db.events(), events);
+  assert.deepEqual(f.db.requests(), requests);
+  assert.deepEqual([...f.refs], refs);
   assert.ok(comparisons.some(([ancestor, descendant]) => ancestor === f.target && descendant === f.rebased));
   assert.deepEqual(ranges, [`${f.target}..${f.rebased}`]);
   ranges.length = 0;
+  const secondPlan = await planAttemptRebase(f.db, secondInput, f.services);
+  assert.deepEqual(secondPlan.steps, plan.steps);
   await rebaseAttempt(f.db, secondInput, f.services);
   assert.ok(ranges.length > 0 && ranges.every(range => range === `${f.target}..${f.rebased}`));
   assert.equal(f.db.attempt(f.a.id).candidate!.commit, f.second);

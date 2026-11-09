@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, realpath, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import test from 'node:test';
+import test, { before, after } from 'node:test';
 import { configuration } from '../fixtures/configuration.ts';
 import { Database, applicationId } from '../../src/storage/database.ts';
 import { DatabaseSync } from 'node:sqlite';
@@ -28,6 +28,24 @@ async function snapshot(root: string): Promise<Record<string, string>> {
 }
 const entry = fileURLToPath(new URL('../../bin/docket.ts', import.meta.url));
 const peer = fileURLToPath(new URL('../fixtures/pi-peer.ts', import.meta.url));
+// Repository initialisation is not a CLI boundary. Copy an immutable seed so
+// each test still has independent refs, index, configuration and worktree files.
+let seed: string;
+before(async () => {
+  seed = await realpath(await mkdtemp(join(tmpdir(), 'docket-git-seed-')));
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: seed, encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git('init', '-q', '-b', 'main');
+  git('config', 'core.autocrlf', 'false');
+  git('config', 'user.name', 'Tests');
+  git('config', 'user.email', 'test@example.invalid');
+  await writeFile(join(seed, 'README'), 'Base\n');
+  git('add', '.'); git('commit', '-qm', 'Base');
+});
+after(() => rm(seed, { recursive: true, force: true }));
+
 async function fixture(t: test.TestContext, mode = 'code-result') {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-operations-')));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -37,13 +55,11 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
     // folders; create them before snapshots so every other home write is detected.
     await mkdir(join(home, 'AppData', 'Roaming'), { recursive: true });
   }
-  const repo = join(home, 'repository'); await mkdir(repo);
+  const repo = join(home, 'repository'); await cp(seed, repo, { recursive: true });
   const git = (...args: string[]) => {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', timeout: 5000 });
     assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
   };
-  git('init', '-q', '-b', 'main'); git('config', 'core.autocrlf', 'false'); git('config', 'user.name', 'Tests'); git('config', 'user.email', 'test@example.invalid');
-  await writeFile(join(repo, 'README'), 'Base\n'); git('add', '.'); git('commit', '-qm', 'Base');
   const config = configuration(home); config.repository = repo;
   config.profiles.worker.launcher = 'pi'; config.profiles.worker.executionProfile = 'pi-test'; config.profiles.worker.runMs = 10000;
   config.finalisation.kind = 'local-merge';
@@ -54,7 +70,10 @@ async function fixture(t: test.TestContext, mode = 'code-result') {
     checks: { 'node-project-v1': { id: 'node-project-v1', tools: { node: process.version }, dependencies: {} } } }), { mode: 0o600 });
   const invoke = (operation: string, args: object, key?: string) => {
     const result = spawnSync(process.execPath, [entry, ...operation.split('.'), '--config', file, '--stdin', '--json', ...(key ? ['--request-id', key] : [])], {
-      encoding: 'utf8', input: JSON.stringify(args), timeout: 20000,
+      encoding: 'utf8', input: JSON.stringify(args),
+      // A rebase verifies and retains output, runs fresh checks and reattaches
+      // the lease. Windows has taken 44 seconds at this real-process boundary.
+      timeout: operation === 'attempt.rebase' && !('dryRun' in args && args.dryRun) ? 60000 : 20000,
       env: { ...process.env, HOME: home, USERPROFILE: home, PEER_MODE: mode, PEER_RECORD: join(home, 'peer.jsonl') },
     });
     assert.ifError(result.error); assert.equal(result.signal, null);
@@ -257,12 +276,12 @@ test('R27/R30: moved targets name exact commits and rebase action; target restri
   }
   for (const restrictions of [{ forbid: [], protectedTargets: ['main'] }, { forbid: ['local-merge'], protectedTargets: [] }]) {
     await writeFile(join(f.home, '.config', 'docket', 'finalisation.json'), JSON.stringify({ version: 1, ...restrictions }));
-    for (const dryRun of [true, false]) {
-      const refused = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun });
-      assert.equal(refused.status, 1);
-      assert.equal(refused.envelope.code, 'policy_refused');
-      assert.equal(refused.envelope.nextAction, null);
-    }
+    // Planning/execution combinations run with fake owners in the operation
+    // tests; keep real CLI policy loading and refusal for each restriction here.
+    const refused = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false });
+    assert.equal(refused.status, 1);
+    assert.equal(refused.envelope.code, 'policy_refused');
+    assert.equal(refused.envelope.nextAction, null);
   }
   assert.equal(f.git('rev-parse', attempt.specification.outputRef), attempt.candidate.commit);
   assert.equal(f.git('rev-parse', 'main'), targetCommit);
@@ -297,7 +316,7 @@ for (const sameLines of [false, true]) {
     const original = attempt.candidate.commit;
     const targetChange = async (text: string) => {
       await writeFile(join(f.repo, 'README'), text + '\n');
-      f.git('add', 'README'); f.git('commit', '-qm', text);
+      f.git('commit', '-qam', text);
     };
     // Replaying the first target patch onto the final target would conflict.
     await targetChange('Intermediate target');
@@ -308,11 +327,10 @@ for (const sameLines of [false, true]) {
     if (sameLines) await targetChange('Second target');
     else f.git('commit', '--allow-empty', '-qm', 'Target advances');
     const secondTarget = f.git('rev-parse', 'HEAD');
-    const plan = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: true });
-    assert.equal(plan.status, 0, JSON.stringify(plan.envelope));
+    // Repeated-rebase planning is covered with fake owners in completion.test.ts;
+    // this boundary proves that real Git replays only the candidate's changes.
     const second = f.invoke('attempt.rebase', { attemptId: attempt.id, dryRun: false }, 'second-rebase');
     assert.equal(second.status, 0, JSON.stringify(second.envelope));
-    assert.deepEqual(second.data.steps, plan.data.steps);
     const commit = second.data.attempt.candidate.commit;
     assert.equal(f.git('rev-list', '--count', `${secondTarget}..${commit}`), '1');
     assert.equal(f.git('rev-parse', `${commit}^`), secondTarget);
@@ -426,7 +444,7 @@ test('A61/R10/R11: a failed model turn settles immediately, releases its owner a
   const status = f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data;
   assert.deepEqual(status.blockers, []);
   assert.equal(status.claims.length, 0);
-  assert.equal(f.invoke('status.show', { attentionOnly: false, page: { after: null, limit: 100 } }).data.capacity.used, 0);
+  assert.equal(status.capacity.used, 0);
 });
 
 test('A61/R08: a lost launcher connection remains owner_unknown, not a failed model outcome', async t => {
