@@ -1,4 +1,4 @@
-import { dirname, join } from 'node:path';
+import { relative } from 'node:path';
 import { canonicalJson } from './configuration.ts';
 import { DiagnosticsDirectory } from './adapters/diagnostics.ts';
 import type { DiagnosticManifest } from './adapters/diagnostics.ts';
@@ -14,26 +14,28 @@ function deletionResult(result: JsonObject | null) {
   return { ...(value.manifest as JsonObject), removedAt: value.removedAt };
 }
 
-export interface CleanInput { attemptId: string; noProcesses: boolean; dryRun: boolean }
+export interface CleanInput { attemptId: string; noProcesses: boolean; includeTranscript: boolean; dryRun: boolean }
 export async function cleanDiagnostics(db: Database, input: CleanInput, caller: TaskActor, requestKey: string,
   directory = new DiagnosticsDirectory()) {
   if (caller.kind !== 'person') throw new CommandFailure('person_required');
   if (!input.noProcesses) throw new CommandFailure('process_confirmation_required');
   const attempt = db.attempt(input.attemptId);
-  const root = join(dirname(String(attempt.specification.resultPath)), 'diagnostics');
+  const { root, transcript } = db.diagnosticPaths(attempt.id);
+  const targets = ['home', ...(input.includeTranscript ? ['sdk.json', ...(transcript ? [relative(root, transcript)] : [])] : [])];
+  const mode = input.includeTranscript ? 'transcript' : 'home';
   db.checkDiagnosticsEligible(attempt.id, root);
-  const previous = db.events().find(event => event.sourceKey === `diagnostics.authorised:${attempt.id}`);
-  const finished = db.requests().find(request => request.requestKey === `diagnostics:${attempt.id}` && request.state === 'succeeded');
+  const previous = db.events().find(event => event.sourceKey === `diagnostics.authorised:${attempt.id}:${mode}`);
+  const finished = db.requests().find(request => request.parentId === previous?.requestId && request.operation === 'completion.diagnostics' && request.state === 'succeeded');
   const plan = { steps: finished ? [] : [step('diagnostics.delete', root, ['terminal', 'returned_lease', 'no_processes', 'unreferenced', 'exact_manifest'])] };
   if (input.dryRun) {
-    if (!previous) await directory.inspect(root);
+    if (!previous) await directory.inspect(root, targets);
     return plan;
   }
   const command = await db.recordCommand({ requestKey, operation: 'diagnostics.clean', caller,
     input: { ...input }, fingerprint: canonicalJson(input) });
   if (finished) return { ...plan, manifest: deletionResult(finished.result) };
-  const manifest = previous?.payload ?? JSON.parse(JSON.stringify(await directory.inspect(root))) as JsonObject;
-  const authorisation = await db.authoriseDiagnostics(attempt.id, root, manifest, caller, command.id);
+  const manifest = previous?.payload ?? JSON.parse(JSON.stringify(await directory.inspect(root, targets))) as JsonObject;
+  const authorisation = await db.authoriseDiagnostics(attempt.id, root, manifest, caller, command.id, mode);
   const remove = async () => {
     db.checkDiagnosticsEligible(attempt.id, root);
     await directory.remove(authorisation.payload as unknown as DiagnosticManifest);

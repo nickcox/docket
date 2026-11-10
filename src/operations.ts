@@ -1,4 +1,5 @@
 import { cleanDiagnostics } from './diagnostics.ts';
+import { workerDiagnostics } from './worker-diagnostics.ts';
 import { userInfo } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { canonicalJson, ConfigurationError } from './configuration.ts';
@@ -49,7 +50,9 @@ function invalidResultAction(attemptId: string) {
 }
 function attemptView(db: Database, id: string) {
   const attempt = db.attempt(id), preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
-  return { ...attempt, identity: { databaseId: attempt.specification.databaseId, contextId: attempt.specification.contextId,
+  const stateDirectory = String(db.events().find(event => event.sourceKey === 'database.initialised')!.payload.stateDirectory);
+  const diagnostics = workerDiagnostics(stateDirectory, db.requests().filter(r => r.attemptId === id && r.operation === 'worker.prepare'));
+  return { ...attempt, sessionTranscriptPath: diagnostics?.transcript ?? null, identity: { databaseId: attempt.specification.databaseId, contextId: attempt.specification.contextId,
     taskId: attempt.taskId, attemptId: id, leaseId: attempt.allocation?.leaseId ?? null, sessionId: preparation?.input.sessionId ?? null },
     workerRef: preparation?.result?.reference ?? null, result: db.validatedWorkerResult(id),
     resultInvalid: db.invalidWorkerResult(id),

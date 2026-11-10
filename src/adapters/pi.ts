@@ -156,7 +156,7 @@ export class PiLauncher implements Launcher {
         args = [fileURLToPath(new URL('./pi-worker.ts', import.meta.url)), configPath];
       }
       const reference: WorkerReference = { launcher: 'pi', ownerId: randomUUID(), sessionId: binding.sessionId,
-        attemptId: binding.attemptId, preparationEffectId: effectId };
+        attemptId: binding.attemptId, preparationEffectId: effectId, directory };
       const rpc = new PiRpc({ executable: execution.executable, args, cwd, env: environment,
         maxRecordBytes: this.options.maxRecordBytes ?? 4 * 1024 * 1024 }, record => this.observe(worker!, record));
       worker = { reference, binding, rpc, directory, resultPath: binding.resultPath,
@@ -167,6 +167,7 @@ export class PiLauncher implements Launcher {
       await rpc.started;
       const state = await rpc.request('get_state', {}, this.requestMs);
       this.validateState(worker, state);
+      reference.sessionFile = (state as JsonObject).sessionFile!;
       await rpc.request('set_auto_retry', { enabled: false }, this.requestMs);
       worker.prepared = true;
       return confirmed(structuredClone(reference));

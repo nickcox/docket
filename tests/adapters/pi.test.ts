@@ -55,6 +55,15 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
     pauseAdmission: (hook: () => Promise<void>) => { admissionHook = hook; } };
 }
 
+test('R40/A58: Pi preparation records its actual worker directory and session transcript', async t => {
+  const f = await fixture(t);
+  assert.equal(f.prepared.status, 'confirmed');
+  const spawn = (await f.records()).find(record => record.kind === 'spawn');
+  const directory = dirname(spawn.environment.HOME);
+  assert.equal(f.reference.directory, directory);
+  assert.equal(f.reference.sessionFile, join(directory, 'sessions', 'session.jsonl'));
+});
+
 test('R31/R35/A14: prepare is non-acting; only matching committed admission sends exactly one protocol-1 prompt', async t => {
   const f = await fixture(t);
   assert.equal(f.prepared.status, 'confirmed');

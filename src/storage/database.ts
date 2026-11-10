@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { CommandFailure } from '../response.ts';
+import { workerDiagnostics, within } from '../worker-diagnostics.ts';
 import { nextAction } from '../next-action.ts';
 import type { TurnFailure } from '../adapters/launcher.ts';
 import { canonicalJson } from '../configuration.ts';
@@ -2575,6 +2576,14 @@ export class Database {
     });
   }
 
+  diagnosticPaths(attemptId: string) {
+    const identity = this.events().find(event => event.sourceKey === 'database.initialised')!;
+    const paths = workerDiagnostics(String(identity.payload.stateDirectory), this.requests().filter(request =>
+      request.attemptId === attemptId && request.operation === 'worker.prepare'));
+    if (!paths) throw new StorageError('conflict', 'Worker diagnostic directory cannot be identified exactly');
+    return paths;
+  }
+
   /** Diagnostic retention never removes authoritative rows or retained output. */
   checkDiagnosticsEligible(attemptId: string, root: string): void {
     if (!this.db.isTransaction) return this.snapshot(() => this.checkDiagnosticsEligible(attemptId, root));
@@ -2583,8 +2592,8 @@ export class Database {
 
   private checkDiagnosticsEligibleInTransaction(attemptId: string, root: string): void {
     const attempt = this.completionGuard(attemptId);
-    const specification = object(JSON.parse(String(attempt.specification)));
-    if (root !== join(dirname(String(specification.resultPath)), 'diagnostics')) throw new StorageError('conflict', 'Diagnostic directory differs from attempt identity');
+    const paths = this.diagnosticPaths(attemptId);
+    if (relative(paths.root, root) !== '') throw new StorageError('conflict', 'Diagnostic directory differs from attempt identity');
     if (attempt.lease_state !== 'returned') throw new StorageError('conflict', 'Diagnostics require a returned lease');
     if (this.db.prepare(`SELECT 1 FROM claims WHERE attempt_id = ? AND released_at IS NULL
       AND id NOT IN (SELECT claim_id FROM requests WHERE operation = 'completion.diagnostics' AND claim_id IS NOT NULL)`).get(attemptId)) {
@@ -2595,7 +2604,9 @@ export class Database {
       throw new StorageError('conflict', 'Attempt has an unresolved effect');
     }
     const referenced = (value: unknown): boolean => {
-      if (typeof value === 'string') return value === root || value.startsWith(`${root}${sep}`) || value.startsWith(`${root}/`);
+      if (typeof value === 'string') return isAbsolute(value) && within(root, value);
+      // Recorded worker identity is not a retained deliverable reference.
+      if (value && typeof value === 'object' && canonicalJson(value) === canonicalJson(paths.reference)) return false;
       if (Array.isArray(value)) return value.some(referenced);
       return value !== null && typeof value === 'object' && Object.values(value).some(referenced);
     };
@@ -2615,13 +2626,17 @@ export class Database {
     }
   }
 
-  async authoriseDiagnostics(attemptId: string, root: string, manifest: JsonObject, caller: TaskActor, requestId: string): Promise<StoredEvent> {
+  async authoriseDiagnostics(attemptId: string, root: string, manifest: JsonObject, caller: TaskActor, requestId: string, mode: 'home' | 'transcript'): Promise<StoredEvent> {
     taskActor(caller);
     if (caller.kind !== 'person') throw new CommandFailure('person_required');
     return this.write(() => {
       this.checkDiagnosticsEligible(attemptId, root);
-      if (manifest.root !== root || !Array.isArray(manifest.entries)) throw new StorageError('conflict', 'Invalid diagnostic manifest');
-      const key = `diagnostics.authorised:${attemptId}`;
+      const transcript = this.diagnosticPaths(attemptId).transcript;
+      const targets = ['home', ...(mode === 'transcript' ? ['sdk.json', ...(transcript ? [relative(root, transcript)] : [])] : [])];
+      if (manifest.root !== root || !Array.isArray(manifest.entries) || json(manifest.targets) !== json(targets)) {
+        throw new StorageError('conflict', 'Invalid diagnostic manifest');
+      }
+      const key = `diagnostics.authorised:${attemptId}:${mode}`;
       const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
       if (previous) return this.decodeEvent(previous);
       this.completionEvent(key, 'diagnostics.authorised', attemptId, caller, manifest, requestId);
@@ -2639,7 +2654,7 @@ export class Database {
       this.requestAuthority(this.decodeRequest(this.requestRow(stored.requestId!)));
       if (operation === 'integrate') this.checkIntegrationAuthority(stored.actor as TaskActor, attemptId);
       const rebasing = ['pin', 'rebase', 'move', 'attach'].includes(operation);
-      const suffix = rebasing ? `:${stored.id}` : operation === 'integrate' ? `:${String(object(stored.payload.candidate).id)}` : '';
+      const suffix = rebasing || operation === 'diagnostics' ? `:${stored.id}` : operation === 'integrate' ? `:${String(object(stored.payload.candidate).id)}` : '';
       const key = `${operation}:${attemptId}${suffix}`;
       const existing = this.db.prepare('SELECT * FROM requests WHERE request_key = ?').get(key);
       if (existing) {

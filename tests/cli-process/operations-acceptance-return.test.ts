@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { findOperation } from '../../src/catalog.ts';
 import { validateSchema } from '../../src/operation-schemas.ts';
 import { definition, fixture, snapshot } from '../helpers/cli-operations.ts';
@@ -89,10 +89,13 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   assert.equal(returned.data.attempt.leaseState, 'returned');
   assert.equal(f.invoke('task.show', { taskId: 'feature' }).data.task.state, 'done');
   // A58/R40: the CLI cleans only diagnostics and old dispatch replay stays read-only.
-  const diagnostics = join(f.config.stateDirectory, 'attempts', attempt.id, 'diagnostics');
-  await mkdir(diagnostics);
-  await writeFile(join(diagnostics, 'transcript'), 'Diagnostic text');
-  const cleanArgs = { attemptId: attempt.id, noProcesses: true, dryRun: true };
+  const directory = detail.workerRef.directory;
+  const diagnostics = join(directory, 'home');
+  assert.equal(detail.sessionTranscriptPath, detail.workerRef.sessionFile);
+  await writeFile(detail.sessionTranscriptPath, 'Transcript text');
+  await writeFile(join(directory, 'sdk.json'), 'Start-up file');
+  await writeFile(join(diagnostics, 'log'), 'Diagnostic text');
+  const cleanArgs = { attemptId: attempt.id, noProcesses: true, includeTranscript: false, dryRun: true };
   const beforeClean = await snapshot(f.home);
   const cleanPlan = f.invoke('diagnostics.clean', cleanArgs);
   assert.equal(cleanPlan.status, 0, JSON.stringify(cleanPlan.envelope));
@@ -100,8 +103,14 @@ test('M3/R27/R30: real CLI adds, plans, dispatches synthetic Pi, accepts local-m
   const cleaned = f.invoke('diagnostics.clean', { ...cleanArgs, dryRun: false }, 'clean');
   assert.equal(cleaned.status, 0, JSON.stringify(cleaned.envelope));
   assert.deepEqual(cleaned.data.steps, cleanPlan.data.steps);
-  assert.equal(cleaned.data.manifest.entries[0].path, 'transcript');
+  assert.ok(cleaned.data.manifest.entries.some((entry: { path: string }) => relative(join(directory, ...entry.path.split('/')), join(directory, 'home', 'log')) === ''));
   await assert.rejects(readdir(diagnostics), { code: 'ENOENT' });
+  assert.equal(await readFile(detail.sessionTranscriptPath, 'utf8'), 'Transcript text');
+  assert.equal(await readFile(join(directory, 'sdk.json'), 'utf8'), 'Start-up file');
+  const transcriptCleaned = f.invoke('diagnostics.clean', { ...cleanArgs, includeTranscript: true, dryRun: false }, 'clean-transcript');
+  assert.equal(transcriptCleaned.status, 0, JSON.stringify(transcriptCleaned.envelope));
+  await assert.rejects(readFile(detail.sessionTranscriptPath), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(directory, 'sdk.json')), { code: 'ENOENT' });
   const replayed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
   assert.equal(replayed.data.attempt.id, attempt.id);
   assert.equal(replayed.data.attempt.leaseState, 'returned');

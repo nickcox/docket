@@ -56,7 +56,7 @@ function outputSchema(name: string): JsonSchema {
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
   if (name === 'diagnostics.clean') return { type: 'object', anyOf: [object({ steps }), object({ steps, manifest: object({
-    root: string, entries: { type: 'array', items: object({ path: { type: 'string' }, kind: { enum: ['file', 'directory'] },
+    root: string, targets: { type: 'array', items: { type: 'string' } }, entries: { type: 'array', items: object({ path: { type: 'string' }, kind: { enum: ['file', 'directory'] },
       digest: nullable({ type: 'string', pattern: '^[a-f0-9]{64}$' }), size: { type: 'integer', minimum: 0 } }) }, removedAt: string,
   }) })] };
   if (name === 'profile.clear') return object({ profile: string, steps });
@@ -74,8 +74,8 @@ function outputSchema(name: string): JsonSchema {
   if (name === 'task.list') return paginated(view);
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
-  if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision'],
-    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'resultInvalid', 'nextAction', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'review', 'checks', 'effects'].map(key => [key, {}])), additionalProperties: false };
+  if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision', 'sessionTranscriptPath'],
+    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'sessionTranscriptPath', 'result', 'resultInvalid', 'nextAction', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'review', 'checks', 'effects'].map(key => [key, key === 'sessionTranscriptPath' ? nullable(string) : {}])), additionalProperties: false };
   if (name === 'status.show') return object({ contextId: string, databaseId: string, configurationRevision: { type: 'integer' }, migrationState: string,
     limitedProfiles: { type: 'array', items: view }, capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
     blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
@@ -161,7 +161,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.rebase', 'Rebase an unaccepted candidate onto the current target without accepting output.', planAttempt),
   operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),
   operation('attempt.discard', 'Discard output and return the exact lease after scoped confirmations.', { ...planAttempt, confirmDiscard: bool, reason: string }, true, ['person']),
-  operation('diagnostics.clean', 'Remove only unreferenced diagnostics of a terminal attempt with a returned lease.', { ...attempt, noProcesses: bool, dryRun: bool }, true, ['person']),
+  operation('diagnostics.clean', 'Remove only unreferenced diagnostics of a terminal attempt with a returned lease.', { ...attempt, noProcesses: bool, includeTranscript: bool, dryRun: bool }, true, ['person']),
   operation('claim.resolve', 'Resolve exact owner scope with stopped-owner confirmation and evidence, never age alone.', { claimId: uuid, confirmStopped: bool, evidence: string, dryRun: bool }, true, ['person']),
   operation('effect.resolve', 'Resolve an uncertain effect with owner evidence and stopped-owner confirmation.', { effectId: uuid, outcome: { enum: ['happened', 'not_happened'] }, evidence: string, confirmStopped: bool, dryRun: bool }, true, ['person']),
 ];

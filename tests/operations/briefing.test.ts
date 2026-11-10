@@ -106,6 +106,25 @@ test('R23/A46: canonical three-task/thirteen-attempt briefing preserves blockers
   assert.ok(detail.checks[0].result.output.length > 5000);
 });
 
+test('R28/R40: attempt.show reports the recorded absolute session transcript path or null', async t => {
+  const f = await fixture(t);
+  await f.add('one');
+  const reserved = await f.db.reserveAttempt({ requestKey: 'reserve', taskId: 'one', caller: person, startingCommit: hash,
+    checks: { sourceCommit: hash, digest: 'policy', fast: [], full: [] },
+    delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+  const attemptId = reserved.attempt.id;
+  assert.equal((await f.binding.execute('attempt.show', { attemptId })).sessionTranscriptPath, null);
+  const state = f.db.events().find(event => event.sourceKey === 'database.initialised')!.payload.stateDirectory as string;
+  const directory = join(state, 'workers', 'random-owner-directory');
+  const sessionFile = join(directory, 'sessions', 'owner-session.jsonl');
+  const command = await f.db.recordCommand({ requestKey: 'prepare-fixture', operation: 'worker.prepare', caller: person, input: {}, fingerprint: 'fixture' });
+  // Seed only the owner reply at the storage fixture boundary; this read never calls an owner.
+  using sql = new DatabaseSync(f.db.path);
+  sql.prepare('UPDATE requests SET attempt_id = ?, result = ? WHERE id = ?').run(attemptId,
+    JSON.stringify({ reference: { launcher: 'pi', directory, sessionFile } }), command.id);
+  assert.equal((await f.binding.execute('attempt.show', { attemptId })).sessionTranscriptPath, sessionFile);
+});
+
 test('R23/A46: compact pending counts cover the full backlog and follow durable partial handling, not delivery admission', async t => {
   const f = await fixture(t);
   await f.register();

@@ -22,8 +22,8 @@ import { checkFixture, contextChecks, head, host, person, policyContent, profile
 import { permissions, unlimitedBudget } from '../../src/storage/objectives.ts';
 import type { TaskActor } from '../../src/storage/tasks.ts';
 
-async function fixture(t: Parameters<typeof checkFixture>[0], local = false) {
-  const f = await checkFixture(t);
+async function fixture(t: Parameters<typeof checkFixture>[0], local = false, piDiagnostics = false) {
+  const f = await checkFixture(t, 1, piDiagnostics);
   if (local) {
     const config = f.db.events().find(event => event.kind === 'context.configured')!;
     const resolved = structuredClone(config.payload.resolved) as Record<string, any>;
@@ -129,7 +129,7 @@ test('R19/A38: exact accepted-output statements close only the objective, refuse
 });
 
 async function diagnosticFixture(t: Parameters<typeof checkFixture>[0]) {
-  const f = await fixture(t);
+  const f = await fixture(t, false, true);
   for (const claim of f.db.claims().filter(c => c.attemptId === f.a.id && !c.releasedAt)) {
     await f.db.releaseClaim({ claimId: claim.id, generation: claim.generation }, { terminal: true }, host);
   }
@@ -138,8 +138,8 @@ async function diagnosticFixture(t: Parameters<typeof checkFixture>[0]) {
 
 test('A58/R40/R04: diagnostic deletion keeps exact evidence and old reservation replay', async t => {
   const f = await diagnosticFixture(t);
-  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
-  const root = join(dirname(f.a.binding.resultPath), 'diagnostics');
+  const input = { attemptId: f.a.id, noProcesses: true, includeTranscript: false, dryRun: false };
+  const root = join(f.db.diagnosticPaths(f.a.id).root, 'home');
   await mkdir(join(root, 'nested'), { recursive: true });
   await writeFile(join(root, 'nested', 'transcript.txt'), 'Diagnostic only');
   const resultBefore = await readFile(f.a.binding.resultPath, 'utf8');
@@ -155,7 +155,7 @@ test('A58/R40/R04: diagnostic deletion keeps exact evidence and old reservation 
   assert.equal(await readFile(f.a.binding.resultPath, 'utf8'), resultBefore);
   const intent = f.db.events().find(e => e.kind === 'diagnostics.authorised')!;
   const entries = intent.payload.entries as unknown as DiagnosticManifest['entries'];
-  assert.deepEqual(entries.map(e => e.path), ['nested/transcript.txt', 'nested', '']);
+  assert.deepEqual(entries.map(e => e.path), ['home/nested/transcript.txt', 'home/nested', 'home']);
   assert.equal(entries[0]!.size, 15);
   assert.match(entries[0]!.digest!, /^[a-f0-9]{64}$/);
   assert.ok(f.db.requests().find(r => r.operation === 'completion.diagnostics')!.result);
@@ -173,11 +173,55 @@ test('A58/R40/R04: diagnostic deletion keeps exact evidence and old reservation 
   assert.equal((await cleanDiagnostics(f.db, { ...input, dryRun: true }, person, 'plan-clean')).steps.length, 0);
 });
 
+test('A58/R40: worker cleanup preserves attempt evidence and keeps transcripts unless explicitly included', async t => {
+  for (const includeTranscript of [false, true]) {
+    const f = await diagnosticFixture(t);
+    await returnAttempt(f.db, f.returns, f.services);
+    const { root, transcript } = f.db.diagnosticPaths(f.a.id);
+    await mkdir(join(root, 'home', 'private'), { recursive: true });
+    await mkdir(dirname(transcript!), { recursive: true });
+    await writeFile(join(root, 'home', 'private', 'credentials'), 'private');
+    await writeFile(join(root, 'sdk.json'), 'startup');
+    await writeFile(transcript!, 'transcript');
+    await writeFile(join(root, 'unrelated'), 'keep');
+    const evidenceRoot = dirname(f.a.binding.resultPath);
+    const evidence = [f.a.binding.resultPath];
+    for (const folder of ['artefacts', 'questions', 'diagnostics']) {
+      await mkdir(join(evidenceRoot, folder), { recursive: true });
+      const path = join(evidenceRoot, folder, 'evidence.json');
+      await writeFile(path, 'evidence');
+      evidence.push(path);
+    }
+    const before = await Promise.all(evidence.map(path => readFile(path, 'utf8')));
+    const input = { attemptId: f.a.id, noProcesses: true, includeTranscript, dryRun: false };
+    await cleanDiagnostics(f.db, input, person, 'clean-worker');
+    await assert.rejects(readdir(join(root, 'home')), { code: 'ENOENT' });
+    assert.deepEqual(await Promise.all(evidence.map(path => readFile(path, 'utf8'))), before);
+    assert.equal(await readFile(join(root, 'unrelated'), 'utf8'), 'keep');
+    if (!includeTranscript) {
+      assert.equal(await readFile(transcript!, 'utf8'), 'transcript');
+      assert.equal(await readFile(join(root, 'sdk.json'), 'utf8'), 'startup');
+      // A later explicit request can remove the retained transcript with its own manifest.
+      await cleanDiagnostics(f.db, { ...input, includeTranscript: true }, person, 'clean-transcript');
+      assert.equal(f.db.events().filter(e => e.kind === 'diagnostics.authorised').length, 2);
+    }
+    await assert.rejects(readFile(transcript!), { code: 'ENOENT' });
+    await assert.rejects(readFile(join(root, 'sdk.json')), { code: 'ENOENT' });
+    assert.deepEqual(await Promise.all(evidence.map(path => readFile(path, 'utf8'))), before);
+  }
+});
+
+test('A58/R40: cleanup refuses an attempt without recorded Pi directory evidence', async t => {
+  const f = await fixture(t);
+  await returnAttempt(f.db, f.returns, f.services);
+  await assert.rejects(cleanDiagnostics(f.db, { attemptId: f.a.id, noProcesses: true, includeTranscript: true, dryRun: false }, person, 'clean'), /cannot be identified exactly/);
+});
+
 test('A58/R09: interrupted diagnostic deletion resumes the exact manifest after reopening SQLite', async t => {
   const f = await diagnosticFixture(t);
   await returnAttempt(f.db, f.returns, f.services);
-  const root = join(dirname(f.a.binding.resultPath), 'diagnostics');
-  await mkdir(root);
+  const root = join(f.db.diagnosticPaths(f.a.id).root, 'home');
+  await mkdir(root, { recursive: true });
   await writeFile(join(root, 'a'), 'first');
   await writeFile(join(root, 'b'), 'second');
   class Interrupted extends DiagnosticsDirectory {
@@ -186,7 +230,7 @@ test('A58/R09: interrupted diagnostic deletion resumes the exact manifest after 
       throw new Error('Interrupted after first unlink');
     }
   }
-  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  const input = { attemptId: f.a.id, noProcesses: true, includeTranscript: false, dryRun: false };
   await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean', new Interrupted()), /did not succeed/);
   const intent = f.db.events().find(e => e.kind === 'diagnostics.authorised')!;
   const noCalls = new Proxy({} as Runtime, { get() { throw new Error('Uncertain cleanup must not cause a dispatch owner call'); } });
@@ -205,9 +249,9 @@ test('A58/R09: interrupted diagnostic deletion resumes the exact manifest after 
 });
 
 test('A58/R40: returned diagnostics still refuse an unresolved owner or effect', async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, false, true);
   await returnAttempt(f.db, f.returns, f.services);
-  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  const input = { attemptId: f.a.id, noProcesses: true, includeTranscript: false, dryRun: false };
   await assert.rejects(cleanDiagnostics(f.db, input, person, 'clean'), /owner is unresolved/);
   for (const claim of f.db.claims().filter(c => c.attemptId === f.a.id && !c.releasedAt)) {
     await f.db.releaseClaim({ claimId: claim.id, generation: claim.generation }, { terminal: true }, host);
@@ -224,10 +268,10 @@ test('A58/R40: returned diagnostics still refuse an unresolved owner or effect',
 test('A58/R40: diagnostics refuse missing confirmation and authoritative references', async t => {
   const f = await diagnosticFixture(t);
   await returnAttempt(f.db, f.returns, f.services);
-  const root = join(dirname(f.a.binding.resultPath), 'diagnostics');
-  await mkdir(root);
+  const root = join(f.db.diagnosticPaths(f.a.id).root, 'home');
+  await mkdir(root, { recursive: true });
   await writeFile(join(root, 'log'), 'keep');
-  const input = { attemptId: f.a.id, noProcesses: true, dryRun: false };
+  const input = { attemptId: f.a.id, noProcesses: true, includeTranscript: false, dryRun: false };
   await assert.rejects(cleanDiagnostics(f.db, { ...input, noProcesses: false }, person, 'clean'), e => e instanceof CommandFailure && e.code === 'process_confirmation_required');
   await f.db.appendEvents([{ sourceKey: 'retained-diagnostic', kind: 'deliverable.retained', payloadVersion: 1,
     correlationId: 'retained-diagnostic', actor: person, occurredAt: new Date().toISOString(), payload: { path: join(root, 'log') } }]);

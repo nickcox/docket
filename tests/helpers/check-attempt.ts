@@ -23,12 +23,12 @@ export const policyContent = JSON.stringify({ version: 1,
 export const retention = { compare: async () => confirmed(true), verifyRetention: async () => confirmed({ retained: true as const }) };
 
 type TestContext = { after: (fn: () => Promise<void> | void) => void };
-export async function checkFixture(t: TestContext, maximum = 1) {
+export async function checkFixture(t: TestContext, maximum = 1, piDiagnostics = false) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-checks-'));
   defer(t, () => rm(root, { recursive: true, force: true }));
   const path = join(root, 'context.sqlite');
   const options = { location: { retainedRoot: root, recyclableRoots: [join(root, 'pool')] }, retryMs: 1000, readOnly: false };
-  const workerProfile = { launcher: 'bb', provider: 'example', model: 'model', reasoning: null,
+  const workerProfile = { launcher: piDiagnostics ? 'pi' : 'bb', provider: 'example', model: 'model', reasoning: null,
     runMs: 1000, maxCost: 0, maxTokens: null, executionProfile: profile.id };
   const db = await Database.initialise(path, { contextId: 'checks', repository: { identity: 'example' },
     stateDirectory: root, createdBy: person, configuration: { revision: 1, digest: 'test', provenance: {}, resolved: {
@@ -54,7 +54,11 @@ export async function checkFixture(t: TestContext, maximum = 1) {
       outputRef: String(input.outputRef), startingCommit: initial };
     await db.recordAllocation(id, acquisition.effect.id, executor, allocation);
     await db.startAttempt(id, person);
-    const preparation = await prepareWorker(db, id, host, new FakeLauncher());
+    const launcher = new FakeLauncher();
+    if (piDiagnostics) launcher.afterPrepare = async reference => confirmed({ ...reference,
+      directory: join(root, 'workers', `owner-${id}`),
+      sessionFile: join(root, 'workers', `owner-${id}`, 'sessions', 'session.jsonl') });
+    const preparation = await prepareWorker(db, id, host, launcher);
     const reference = preparation.result!.reference as WorkerReference;
     await db.decideWorkerLaunch(id, preparation.claimId!, 'permit', host);
     const binding = db.workerResultBinding(id);
@@ -71,7 +75,7 @@ export async function checkFixture(t: TestContext, maximum = 1) {
     await writeFile(binding.resultPath, JSON.stringify(result));
     const observation = (kind: 'terminal' | 'result_available', sequence: number) => ({ sourceId: name, sourceSequence: sequence,
       attemptId: id, workerRef: reference, observedAt: new Date().toISOString(), kind, payloadVersion: 1 as const,
-      payload: kind === 'terminal' ? { terminal: true, laterTurnsRefused: true } : {} });
+      payload: kind === 'terminal' ? (piDiagnostics ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true }) : {} });
     if (stage !== 'prepared') await observeWorker(db, observation('result_available', 1), host, retention);
     if (stage === 'completed') await observeWorker(db, observation('terminal', 2), host, retention);
     return { id, allocation, binding, observation };
