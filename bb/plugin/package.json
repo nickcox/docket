@@ -1,0 +1,31 @@
+{
+  "name": "bb-plugin-docket-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "bb": "0.49.0",
+    "bbPluginSdk": "0.6.132"
+  },
+  "bb": {
+    "name": "Docket admission probe [Experimental]",
+    "description": "Isolated Q1a admission experiment – not a Docket launcher.",
+    "branding": {
+      "icon": "Shield"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "skills": []
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.6.132",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  }
+}
