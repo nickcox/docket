@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { before, after } from 'node:test';
 import { configuration } from '../fixtures/configuration.ts';
+import { defer } from './cleanup.ts';
 import { findOperation } from '../../src/catalog.ts';
 import { validateSchema } from '../../src/operation-schemas.ts';
 
@@ -46,7 +47,7 @@ after(() => rm(seed, { recursive: true, force: true }));
 
 export async function fixture(t: test.TestContext, mode = 'code-result', cliEntry = entry) {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-operations-')));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  defer(t, () => rm(home, { recursive: true, force: true }));
   if (process.platform === 'win32') {
     // Windows PowerShell's settings ACL probe initialises AppData\Roaming under
     // USERPROFILE even with -NoProfile. A real Windows profile already has these
