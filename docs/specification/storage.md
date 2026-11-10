@@ -98,6 +98,8 @@ Restoring a backup is not ordinary restart: external workers/effects can outlive
 
 **R40.** Never delete tasks, attempts, command request keys, claims, approvals, results, check/review evidence, question records or their source keys in v1. Event history remains small authoritative data; diagnostics/transcripts are separate bounded artefacts.
 
+An attempt's diagnostics are the files in its Pi worker directory under the state directory's `workers/` folder: the worker's private home, its SDK start-up file and its session transcript. Results, artefacts and question files under the attempt's own directory are evidence, never diagnostics. diagnostics.clean always removes the worker's private home; it removes the start-up file and the session transcript only when the person asks with includeTranscript, so transcripts remain available otherwise. attempt.show gives the path of the attempt's session transcript.
+
 Diagnostic retention can remove an eligible terminal attempt's diagnostic directory through a deletion effect only when no live/uncertain worker, retained lease, unresolved effect or referenced deliverable depends on it. Keep required artefacts outside that directory or refuse deletion. Its immutable manifest records what was removed and when; subsequent request replay still resolves the original attempt.
 
 Deletion interrupted after intent remains uncertain while the directory exists. Proven absence can settle it without another deletion; uncertain existing contents need inspection. Bounded Pi activity/transcripts and bb timeline references are diagnostic only and may be unavailable without altering task state.

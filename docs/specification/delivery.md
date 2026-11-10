@@ -41,6 +41,7 @@ The first release supports the following capabilities before it is ready for eve
 | Several reviews of one candidate at once, with a focus per reviewer and a combined verdict | One current verdict per candidate and criteria; the latest completed review replaces earlier verdicts |
 | Automatic fallback to another profile when a profile is limited | Dispatch on a limited profile refuses with provider_limited; a person or supervisor names another profile, and a person clears the limit with profile.clear |
 | Proof that every process a worker started has stopped | Automatic lease return depends on committed, retained work, not on process state |
+| Automatic or periodic clean-up of diagnostics | diagnostics.clean is explicit and per attempt; session transcripts are kept unless a person asks to remove them |
 | Event-history compaction, request-key expiry and permanent-identity deletion | Domain identities and evidence remain available |
 | Worker-requested full checks | Workers run fast checks; Docket runs the full checks once the worker stops |
 | Check layers other than fast and full, and check policies configured per repository | Every repository has fast and full checks only |

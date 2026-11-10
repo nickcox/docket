@@ -147,7 +147,7 @@ The operation-specific schema for ordinary task.add restricts kind to code/repor
 | host.observe | observation:Observation | Host service only; strict adapter observation |
 | host.usage | report:UsageReport | Host service only; session-bound accounting |
 | host.heartbeat / host.release | claimId:UUID, generation:UUID | Host service only; conditional ownership |
-| diagnostics.clean | attemptId:UUID, noProcesses:boolean, dryRun:boolean | Person; only eligible diagnostic artefacts |
+| diagnostics.clean | attemptId:UUID, noProcesses:boolean, includeTranscript:boolean, dryRun:boolean | Person; only eligible diagnostic artefacts (R40); the session transcript only with includeTranscript |
 
 Permissions has the R18 boolean fields. An unknown field is refused, and a missing field takes the default set by the version that introduced it. Budget has exactly maxCost:number|null, currency:String|null, maxTokens:integer|null and maxWorkerTimeMs:integer|null. Cost requires currency; unlimited cost can retain a reporting currency. UsageGap has sessionId and metrics drawn from cost,tokens,workerTimeMs. CompletionStatement has position, statement and references; each reference has kind accepted_output|review, attemptId, candidateId, candidateCommit:Commit|null, artefactDigests:String[], evidenceEventId and reviewAttemptId:UUID|null. Code references require a commit; report-only references require retained artefact digests. Candidate IDs are generated UUIDs identifying immutable selection events.
 
