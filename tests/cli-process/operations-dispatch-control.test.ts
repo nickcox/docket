@@ -56,7 +56,9 @@ test('R11: held and failed dispatches automatically return clean leases with ret
   for (const outcome of ['held', 'failed']) {
     const f = await fixture(t, `${outcome}-result`);
     f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
-    const result = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+    // Like review dispatch, automatic return adds retention and lease-safety
+    // probes. Allow for their many Git/Treehouse process starts on Windows CI.
+    const result = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch', undefined, 60000);
     assert.equal(result.status, 0, JSON.stringify(result.envelope));
     assert.equal(result.data.attempt.outcome, outcome);
     assert.equal(result.data.attempt.leaseState, 'returned');
@@ -71,7 +73,8 @@ test('R11: held and failed dispatches automatically return clean leases with ret
 test('A61/R10/R11: a failed model turn settles immediately, releases its owner and returns a clean lease', async t => {
   const f = await fixture(t, 'model-error');
   f.invoke('task.add', { id: 'feature', definition, objectiveId: null });
-  const failed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch');
+  // Failure also returns the lease, with the same slow Windows safety probes.
+  const failed = f.invoke('attempt.dispatch', { taskId: 'feature', profile: null, dryRun: false }, 'dispatch', undefined, 60000);
   assert.equal(failed.envelope.code, 'worker_failed');
   assert.equal(failed.data.failureKind, 'model_error');
   assert.equal(failed.data.profile, 'worker');
@@ -108,7 +111,9 @@ test('A61: provider limits block reservation, automatic selection reports skips,
   await writeFile(f.file, JSON.stringify(changed));
   assert.equal(f.invoke('context.configure', { dryRun: false }).status, 0);
   f.invoke('task.add', { id: 'limited', definition, objectiveId: null });
-  const failed = f.invoke('attempt.dispatch', { taskId: 'limited', profile: null, dryRun: false });
+  // Each provider failure below returns a lease. Only those live dispatches
+  // need headroom for Windows Git/Treehouse starts, not plans or refusals.
+  const failed = f.invoke('attempt.dispatch', { taskId: 'limited', profile: null, dryRun: false }, undefined, undefined, 60000);
   assert.equal(failed.envelope.code, 'worker_failed');
   assert.equal(failed.data.failureKind, 'provider_limit');
   assert.equal(failed.data.message, 'Codex error: The usage limit has been reached');
@@ -128,7 +133,7 @@ test('A61: provider limits block reservation, automatic selection reports skips,
   assert.equal(automatic.status, 0, JSON.stringify(automatic.envelope));
   assert.equal(automatic.data.taskId, 'other');
   assert.ok(automatic.data.skippedTasks.some((item: { taskId: string }) => item.taskId === 'next'));
-  const other = f.invoke('attempt.dispatch', { taskId: 'other', profile: null, dryRun: false });
+  const other = f.invoke('attempt.dispatch', { taskId: 'other', profile: null, dryRun: false }, undefined, undefined, 60000);
   assert.equal(other.envelope.code, 'worker_failed');
   assert.equal(other.data.profile, 'other');
   const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
@@ -139,7 +144,7 @@ test('A61: provider limits block reservation, automatic selection reports skips,
   assert.deepEqual(await snapshot(f.home), beforeClear);
   assert.equal(f.invoke('profile.clear', { profile: 'worker', dryRun: false }).status, 0);
   assert.equal(f.invoke('task.release', { taskId: 'limited' }).status, 0);
-  const retry = f.invoke('attempt.dispatch', { taskId: 'limited', profile: null, dryRun: false });
+  const retry = f.invoke('attempt.dispatch', { taskId: 'limited', profile: null, dryRun: false }, undefined, undefined, 60000);
   assert.equal(retry.envelope.code, 'worker_failed', JSON.stringify(retry.envelope));
   assert.notEqual(retry.data.attemptId, failed.data.attemptId);
 });

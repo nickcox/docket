@@ -21,7 +21,9 @@ test('R13/A28: CLI review creation, exact dispatch and verdict views share the w
   assert.deepEqual(f.invoke('attempt.review', { attemptId, dryRun: false }, 'review').data.task, task);
   assert.equal(f.invoke('task.update', { taskId: task.id, expectedRevision: task.definitionRevision,
     definition: { ...definition, kind: 'review', instructions: 'Replace target' } }).status, 1);
-  const review = f.invoke('attempt.dispatch', { taskId: task.id, profile: null, dryRun: false });
+  // Review dispatch pins the target, starts Pi and verifies a safe lease return.
+  // Its many Git/Treehouse process starts need headroom on Windows CI.
+  const review = f.invoke('attempt.dispatch', { taskId: task.id, profile: null, dryRun: false }, undefined, undefined, 60000);
   assert.equal(review.status, 0, JSON.stringify(review.envelope));
   assert.equal(review.data.attempt.specification.startingCommit, source.data.attempt.candidate.commit);
   assert.deepEqual(review.data.leaseReturn, { state: 'returned', reason: null });
@@ -54,7 +56,10 @@ for (const scenario of ['held', 'failed', 'replaced-candidate', 'dirty-untracked
     const mode = scenario.startsWith('dirty-') ? `review-${scenario}`
       : scenario === 'held' || scenario === 'failed' ? `${scenario}-result` : 'code-result';
     const args = { taskId: task.id, profile: null, dryRun: false };
-    const review = f.invoke('attempt.dispatch', args, 'review-dispatch', mode);
+    // The held case starts 80 Git, nine Treehouse and one Pi process directly.
+    // Target pinning and repeated return-safety checks make Windows starts slow;
+    // allow this dispatch 60 seconds, but keep its replay at the default limit.
+    const review = f.invoke('attempt.dispatch', args, 'review-dispatch', mode, 60000);
     assert.equal(review.status, 0, JSON.stringify(review.envelope));
     const attempt = review.data.attempt;
     const dirty = scenario.startsWith('dirty-');

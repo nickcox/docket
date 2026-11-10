@@ -67,12 +67,12 @@ export async function fixture(t: test.TestContext, mode = 'code-result', cliEntr
   await writeFile(join(home, '.config', 'docket', 'execution-profiles.json'), JSON.stringify({ version: 1,
     pi: { 'pi-test': { executable: process.execPath, entrypoint: peer, passEnvironment: ['PEER_MODE', 'PEER_RECORD'] } },
     checks: { 'node-project-v1': { id: 'node-project-v1', tools: { node: process.version }, dependencies: {} } } }), { mode: 0o600 });
-  const invoke = (operation: string, args: object, key?: string, peerMode = mode) => {
+  const invoke = (operation: string, args: object, key?: string, peerMode = mode, timeoutMs?: number) => {
     const result = spawnSync(process.execPath, [cliEntry, ...operation.split('.'), '--config', file, '--stdin', '--json', ...(key ? ['--request-id', key] : [])], {
       encoding: 'utf8', input: JSON.stringify(args),
       // A rebase verifies and retains output, runs fresh checks and reattaches
       // the lease. Windows has taken 44 seconds at this real-process boundary.
-      timeout: operation === 'attempt.rebase' && !('dryRun' in args && args.dryRun) ? 60000 : 20000,
+      timeout: timeoutMs ?? (operation === 'attempt.rebase' && !('dryRun' in args && args.dryRun) ? 60000 : 20000),
       env: { ...process.env, HOME: home, USERPROFILE: home, PEER_MODE: peerMode, PEER_RECORD: join(home, 'peer.jsonl') },
     });
     assert.ifError(result.error); assert.equal(result.signal, null);
