@@ -130,7 +130,7 @@ export async function runCli(
         message => io.stderr(`${message}\n`), options.selector, requestId ?? undefined, {
           signal: io.outputSignal,
           event: event => {
-            const line = `${JSON.stringify({ ...successEnvelope(operation, requestId, { event }), sequence: event.sequence })}\n`;
+            const line = `${JSON.stringify({ ...successEnvelope(definition.name, requestId, { event }), sequence: event.sequence })}\n`;
             if (Buffer.byteLength(line, 'utf8') > MAX_RESPONSE_BYTES) throw new CommandFailure('response_too_large');
             writeLine(line);
           },

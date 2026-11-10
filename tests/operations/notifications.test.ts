@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,6 +12,7 @@ import { createBinding } from '../../src/binding.ts';
 import { CommandFailure } from '../../src/response.ts';
 import { runCli } from '../../src/cli.ts';
 import { executeCoreOperation } from '../../src/operations.ts';
+import { Database } from '../../src/storage/database.ts';
 import type { StoredEvent } from '../../src/storage/database.ts';
 
 const person = { kind: 'person' as const, id: 'operator' };
@@ -154,10 +157,10 @@ test('R27/A51: status.watch streams bounded NDJSON after a sequence, ends at tim
   const exit = await runCli(['status', 'watch', '--config', f.file, '--stdin', '--json'], {
     readFile: async () => '', readStdin: async () => JSON.stringify({ afterSequence: sequence, timeoutMs: 60 }),
     stdout: text => outputs.push(text), stderr: text => errors.push(text),
-  }, async (operation, args, progress, selector, requestId) => {
+  }, async (operation, args, progress, selector, requestId, watch) => {
     if (!recorded) [recorded] = await f.db.appendEvents([{ sourceKey: 'during-watch', kind: 'test.fact', payloadVersion: 1,
       correlationId: 'watch', actor: person, occurredAt: new Date().toISOString(), payload: {} }]);
-    return executeCoreOperation(operation, args, progress, selector!, requestId, { home: f.home });
+    return executeCoreOperation(operation, args, progress, selector!, requestId, { home: f.home, watch });
   });
   assert.equal(exit, 0);
   assert.ok(Date.now() - started >= 60);
@@ -170,4 +173,93 @@ test('R27/A51: status.watch streams bounded NDJSON after a sequence, ends at tim
   assert.ok(outputs.every(line => line.endsWith('\n') && Buffer.byteLength(line) <= 256 * 1024));
   assert.deepEqual(errors, []);
   assert.equal(f.db.events().filter(e => e.kind === 'supervisor.handled').length, 0);
+});
+
+test('R22/R27: a watch opens one context, polls about every 500 ms and reads another connection without handling events', async t => {
+  const f = await fixture(t);
+  const opens = t.mock.method(Database, 'open');
+  const closes = t.mock.method(Database.prototype, 'close');
+  const pollTimes: number[] = [];
+  let watched: Database | undefined;
+  const notificationPage = Database.prototype.notificationPage;
+  t.mock.method(Database.prototype, 'notificationPage', function (this: Database, ...args: Parameters<typeof notificationPage>) {
+    watched = this;
+    pollTimes.push(performance.now());
+    return notificationPage.apply(this, args);
+  });
+  const outputs: string[] = [], errors: string[] = [];
+  const before = f.db.events();
+  let recorded: StoredEvent | undefined;
+  const started = performance.now();
+  const exit = await runCli(['status', 'watch', '--config', f.file, '--stdin'], {
+    readFile: async () => '', readStdin: async () => JSON.stringify({ afterSequence: 0, timeoutMs: 1200 }),
+    stdout: text => outputs.push(text), stderr: text => errors.push(text),
+  }, (operation, args, progress, selector, requestId, watch) => executeCoreOperation(operation, args, progress, selector!, requestId, {
+    home: f.home,
+    watch: { ...watch!, event: async event => {
+      await watch!.event(event);
+      if (!recorded) [recorded] = await f.db.appendEvents([{ sourceKey: 'another-connection', kind: 'test.fact', payloadVersion: 1,
+        correlationId: 'watch', actor: person, occurredAt: new Date().toISOString(), payload: {} }]);
+    } },
+  }));
+  assert.equal(exit, 0);
+  assert.ok(performance.now() - started >= 1200, 'The watch waits for its timeout');
+  assert.equal(opens.mock.callCount(), 1, 'One context database is opened for the whole watch');
+  assert.equal(closes.mock.calls.filter(call => call.this === watched).length, 1, 'The context database closes at timeout');
+  assert.ok(pollTimes.length >= 2 && pollTimes.length <= 3);
+  for (let i = 1; i < pollTimes.length; i++) assert.ok(pollTimes[i]! - pollTimes[i - 1]! >= 450);
+  const lines = outputs.map(line => JSON.parse(line));
+  const expected = [...before.filter(event => event.notification), recorded!];
+  assert.deepEqual(lines.slice(0, -1).map(line => line.data.event.id), expected.map(event => event.id));
+  assert.deepEqual(lines.slice(0, -1).map(line => line.sequence), expected.map(event => event.seq));
+  assert.equal(lines.at(-1).data.final, true);
+  assert.equal(lines.at(-1).sequence, recorded!.seq);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(f.db.events(), [...before, recorded!], 'A read watch records no admission or handling facts');
+});
+
+test('R27: a real watch reports exit 3 and a diagnostic when its final envelope meets a broken pipe', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../../bin/docket.ts', import.meta.url)),
+    'status', 'watch', '--config', f.file, '--stdin'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const finished = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', code => resolve(code));
+  });
+  defer(t, async () => { if (child.exitCode === null) child.kill(); await finished; });
+  let errors = '';
+  let received = false;
+  child.stderr.setEncoding('utf8').on('data', text => { errors += text; });
+  child.stdout.once('data', () => { received = true; child.stdout.destroy(); });
+  child.stdin.end(JSON.stringify({ afterSequence: 0, timeoutMs: 700 }));
+  assert.equal(await finished, 3);
+  assert.equal(received, true, 'Close the reader only after the watch starts streaming');
+  assert.match(errors, /Unable to write/u);
+});
+
+test('R22/R27: a broken output pipe during a watch wait closes the context promptly with exit 3', async t => {
+  const f = await fixture(t);
+  const closes = t.mock.method(Database.prototype, 'close');
+  const controller = new AbortController();
+  const outputs: string[] = [], errors: string[] = [];
+  let watched: Database | undefined;
+  const page = Database.prototype.notificationPage;
+  t.mock.method(Database.prototype, 'notificationPage', function (this: Database, ...args: Parameters<typeof page>) {
+    watched = this;
+    // Simulate an asynchronous stdout error after the initial read has finished.
+    setImmediate(() => controller.abort(new Error('EPIPE')));
+    return page.apply(this, args);
+  });
+  const started = performance.now();
+  const exit = await runCli(['status', 'watch', '--config', f.file, '--stdin'], {
+    outputSignal: controller.signal,
+    readFile: async () => '', readStdin: async () => JSON.stringify({ afterSequence: f.db.events().at(-1)!.seq, timeoutMs: 30000 }),
+    stdout: text => outputs.push(text), stderr: text => errors.push(text),
+  }, (operation, args, progress, selector, requestId, watch) =>
+    executeCoreOperation(operation, args, progress, selector!, requestId, { home: f.home, watch }));
+  assert.equal(exit, 3);
+  assert.ok(performance.now() - started < 2000, 'The broken pipe cancels the wait rather than waiting for the timeout');
+  assert.equal(closes.mock.calls.filter(call => call.this === watched).length, 1);
+  assert.deepEqual(outputs, []);
+  assert.deepEqual(errors, ['Unable to write the watch stream.\n']);
 });

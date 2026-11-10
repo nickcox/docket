@@ -29,11 +29,11 @@ import { startSupervisor } from './supervisor.ts';
 
 export interface WatchOutput {
   event(event: JsonObject): void | Promise<void>;
-  signal?: AbortSignal;
+  signal?: AbortSignal | undefined;
 }
 
 export interface OperationOptions extends ContextOptions {
-  watch?: WatchOutput;
+  watch?: WatchOutput | undefined;
   runtime?: typeof createRuntime;
   /** Trusted host peer factory, never supplied by operation input. */
   supervisorPeer?: () => Promise<import('./adapters/pi-supervisor.ts').SupervisorPeer>;
