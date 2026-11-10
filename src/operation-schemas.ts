@@ -30,6 +30,9 @@ const objectiveFields = { criteria, scope: { type: 'string' }, constraints: { ty
 const attempt = { attemptId: uuid };
 const planAttempt = { ...attempt, dryRun: bool };
 const view = { type: 'object' };
+const notification = object({ id: uuid, sequence: { type: 'integer', minimum: 1 }, kind: string, sourceKey: string,
+  objectiveId: nullable(id), taskId: nullable(id), attemptId: nullable(uuid), occurredAt: string, recordedAt: string });
+const notifications = { type: 'array', maxItems: 20, items: notification };
 const leaseReturn = object({ state: { enum: ['returned', 'kept'] }, reason: nullable(string) });
 const steps = { type: 'array', items: object({ operation: string, target: string, requires: { type: 'array', items: string }, conditional: bool }) };
 const paginated = (items: JsonSchema) => object({ items: { type: 'array', items }, next: nullable(string), total: { type: 'integer', minimum: 0 } });
@@ -40,6 +43,12 @@ const statusAttempt = object({ id: uuid, taskId: id, number: { type: 'integer', 
   outcome: nullable({ enum: ['completed', 'held', 'failed', 'interrupted', 'over_budget'] }), leaseState: string,
   candidateCommit: nullable({ type: 'string', pattern: '^(?:[a-f0-9]{40}|[a-f0-9]{64})$' }), review: view, checksState: string, resultInvalid: nullable(object({ message: { ...string, maxLength: 1024 } })), ...attention });
 function outputSchema(name: string): JsonSchema {
+  if (name === 'status.watch') return { type: 'object', anyOf: [object({ events: notifications, sequence: { type: 'integer', minimum: 0 } }),
+    object({ event: notification }), object({ final: { const: true, type: 'boolean' } })] };
+  if (name === 'supervisor.pending') return object({ deliveryRequestId: nullable(uuid),
+    eventIds: { type: 'array', maxItems: 20, items: uuid }, events: notifications, admitted: bool, handledSequence: { type: 'integer', minimum: 0 } });
+  if (name === 'supervisor.admitted' || name === 'supervisor.handled') return object({ deliveryRequestId: nullable(uuid),
+    eventIds: { type: 'array', maxItems: 20, items: uuid }, handledSequence: { type: 'integer', minimum: 0 } });
   if (name.startsWith('question.')) return object({ question: view });
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
@@ -89,11 +98,18 @@ function outputSchema(name: string): JsonSchema {
 }
 function operation(name: string, description: string, properties: Record<string, JsonSchema>, mutates = true,
   roles: readonly Role[] = ['person', 'supervisor']): OperationDefinition {
-  return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: name === 'task.add' || (name.startsWith('objective.') && Object.hasOwn(properties, 'objectiveId')) ? ['objectiveId'] : [], mutates,
+  return { name, description, inputSchema: object(properties), roles, bindingDerivedFields: name === 'task.add' || ((name.startsWith('objective.') || name.startsWith('supervisor.')) && Object.hasOwn(properties, 'objectiveId')) ? ['objectiveId'] : [], mutates,
     plans: Object.hasOwn(properties, 'dryRun'), outputSchema: outputSchema(name),
     tool: { name: `dk_${name.replaceAll('.', '_')}`, description } };
 }
+const sequence = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+const timeout = { type: 'integer', minimum: 0, maximum: 60000 };
+const eventIds = { type: 'array', minItems: 1, maxItems: 20, uniqueItems: true, items: uuid };
 export const coreOperations: OperationDefinition[] = [
+  operation('status.watch', 'Stream ordered notifications until the bounded timeout.', { afterSequence: sequence, timeoutMs: nullable(timeout) }, false, ['person', 'host']),
+  operation('supervisor.pending', 'Recover or reserve a durable ordered delivery batch.', { objectiveId: id, afterSequence: sequence, timeoutMs: timeout }, true, ['host']),
+  operation('supervisor.admitted', 'Confirm that the host admitted the exact delivery to its conversation.', { objectiveId: id, deliveryRequestId: uuid, eventIds }, true, ['host']),
+  operation('supervisor.handled', 'Mark a contiguous admitted batch processed by the supervisor.', { objectiveId: id, eventIds }, true, ['supervisor']),
   operation('question.ask', 'Ask an immutable question with a binding-derived recipient.', { text: string, choices: nullable({ type: 'array', items: { type: 'string' } }), waiting: bool }, true, ['worker', 'supervisor']),
   operation('question.answer', 'Record an answer and its independent delivery requests.', { questionId: uuid, text: string }),
   operation('context.configure', 'Validate and apply the selected configuration while quiescent.', { dryRun: bool }, true, ['person']),

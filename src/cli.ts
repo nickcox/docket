@@ -105,6 +105,7 @@ export async function runCli(
   let requestId: string | null = null;
   let output: string;
   let exitCode: ExitCode;
+  let watchPipeBroken = false;
   try {
     if (argv.length < 2 || argv[0]?.startsWith("-") || argv[1]?.startsWith("-")) {
       throw new CommandFailure("invalid_input");
@@ -118,6 +119,27 @@ export async function runCli(
     const args = await readArgs(options, io);
     validateArgs(definition, args);
     if (definition.mutates && args.dryRun !== true) requestId ??= randomUUID();
+    if (operation === 'status.watch') {
+      const writeLine = (line: string) => {
+        try { io.stdout(line); } catch (error) { watchPipeBroken = true; throw error; }
+      };
+      const deadline = Date.now() + Number(args.timeoutMs ?? 30000);
+      let sequence = Number(args.afterSequence);
+      do {
+        const page = await runOperation(definition, { afterSequence: sequence, timeoutMs: 0 },
+          message => io.stderr(`${message}\n`), options.selector, requestId ?? undefined);
+        for (const event of page.events as { sequence: number }[]) {
+          const line = `${JSON.stringify({ ...successEnvelope(operation, requestId, { event }), sequence: event.sequence })}\n`;
+          if (Buffer.byteLength(line, 'utf8') > MAX_RESPONSE_BYTES) throw new CommandFailure('response_too_large');
+          writeLine(line);
+          sequence = event.sequence;
+        }
+        if (Date.now() >= deadline) break;
+        await new Promise(resolve => setTimeout(resolve, Math.min(25, deadline - Date.now())));
+      } while (Date.now() < deadline);
+      writeLine(`${JSON.stringify({ ...successEnvelope(operation, requestId, { final: true }), sequence })}\n`);
+      return 0;
+    }
     const data = await runOperation(definition, args, (message) => io.stderr(`${message}\n`), options.selector, requestId ?? undefined);
     const envelope = successEnvelope(operation, requestId, data);
     exitCode = exitCodeFor(envelope.outcome);
@@ -125,6 +147,10 @@ export async function runCli(
     output = `${JSON.stringify(envelope)}\n`;
     if (Buffer.byteLength(output, "utf8") > MAX_RESPONSE_BYTES) throw new CommandFailure("response_too_large");
   } catch (error) {
+    if (watchPipeBroken) {
+      io.stderr('Unable to write the watch stream.\n');
+      return 3;
+    }
     const code = error instanceof CommandFailure ? error.code
       : error instanceof ConfigurationError ? 'invalid_configuration'
       : error instanceof ContextError ? error.code

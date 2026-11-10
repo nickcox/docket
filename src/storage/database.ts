@@ -115,6 +115,13 @@ export interface StoredEvent extends EventInput {
   recordedAt: string;
 }
 
+/** Compact notification references leave full evidence in its scoped detail operation. */
+export function notificationView(event: StoredEvent): JsonObject {
+  return { id: event.id, sequence: event.seq, kind: event.kind.slice(0, 200), sourceKey: event.sourceKey.slice(0, 1000),
+    objectiveId: event.objectiveId ?? null, taskId: event.taskId ?? null, attemptId: event.attemptId ?? null,
+    occurredAt: event.occurredAt, recordedAt: event.recordedAt };
+}
+
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && 'code' in error && error.code === code;
 }
@@ -372,8 +379,16 @@ export class Database {
   }
 
   private insertEvent(event: EventInput): StoredEvent {
-    const content = eventContent(event);
+    // The fact itself is its ordered notification, committed under the same lock.
     const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(event.sourceKey);
+    const taskId = event.taskId ?? (event.attemptId ? String(this.attemptRow(event.attemptId).task_id) : undefined);
+    const objectiveId = event.objectiveId ?? (previous ? previous.objective_id as string | null
+      : event.attemptId ? this.attemptRow(event.attemptId).objective_id as string | null
+        : taskId ? this.taskRow(taskId).objective_id as string | null
+          : typeof event.actor.objectiveId === 'string' ? event.actor.objectiveId : null);
+    event = { ...event, ...(objectiveId ? { objectiveId } : {}),
+      notification: event.notification ?? !/^(request\.(recorded|succeeded|claimed)|claim\.refreshed|supervisor\.(delivery|admitted|handled))$/u.test(event.kind) };
+    const content = eventContent(event);
     if (previous) {
       const stored = this.decodeEvent(previous);
       if (eventContent(stored, true) !== content) throw new StorageError('conflict', `Event source key has different content: ${event.sourceKey}`);
@@ -399,6 +414,109 @@ export class Database {
       return JSON.parse(json(event)) as EventInput;
     });
     return this.write(() => inputs.map(event => this.insertEvent(event)));
+  }
+
+  notificationPage(afterSequence: number, objectiveId?: string): StoredEvent[] {
+    return this.snapshot(() => this.db.prepare(`SELECT * FROM events WHERE notification = 1 AND seq > ?
+      ${objectiveId === undefined ? '' : 'AND objective_id = ?'} ORDER BY seq LIMIT 20`)
+      .all(...(objectiveId === undefined ? [afterSequence] : [afterSequence, objectiveId]))
+      .map(row => this.decodeEvent(row)));
+  }
+
+  hasPendingNotifications(objectiveId: string): boolean {
+    return this.snapshot(() => {
+      this.objectiveRow(objectiveId);
+      return this.notificationPage(this.handledSequence(objectiveId), objectiveId).length > 0;
+    });
+  }
+
+  private handledSequence(objectiveId: string): number {
+    const row = this.db.prepare("SELECT * FROM events WHERE objective_id = ? AND kind = 'supervisor.handled' ORDER BY seq DESC LIMIT 1").get(objectiveId);
+    return row ? Number(this.decodeEvent(row).payload.sequence) : 0;
+  }
+
+  private notificationControls(objectiveId: string): StoredEvent[] {
+    return this.db.prepare("SELECT * FROM events WHERE objective_id = ? AND kind IN ('supervisor.delivery', 'supervisor.admitted') ORDER BY seq")
+      .all(objectiveId).map(row => this.decodeEvent(row));
+  }
+
+  private deliveryView(delivery: StoredEvent): JsonObject {
+    const handled = this.handledSequence(delivery.objectiveId!);
+    const ids = delivery.payload.eventIds as string[];
+    const events = this.db.prepare(`SELECT * FROM events WHERE seq > ? AND id IN (${ids.map(() => '?').join(',')}) ORDER BY seq`)
+      .all(handled, ...ids).map(row => this.decodeEvent(row));
+    return { deliveryRequestId: delivery.payload.deliveryRequestId!, eventIds: events.map(e => e.id),
+      events: events.map(notificationView),
+      admitted: this.notificationControls(delivery.objectiveId!).some(e => e.kind === 'supervisor.admitted'
+        && e.payload.deliveryRequestId === delivery.payload.deliveryRequestId),
+      handledSequence: handled };
+  }
+
+  /** Reuse the oldest unfinished delivery, even after admission or a host restart. */
+  async pendingNotifications(objectiveId: string, _afterSequence: number, command: CommandInput): Promise<JsonObject> {
+    if (command.caller.kind !== 'host' || command.operation !== 'supervisor.pending' || command.input.objectiveId !== objectiveId) throw new CommandFailure('person_required');
+    return this.write(() => {
+      this.objectiveRow(objectiveId);
+      const request = this.recordCommandInTransaction(command);
+      if (request.state === 'succeeded') {
+        const delivery = this.notificationControls(objectiveId).find(e => e.kind === 'supervisor.delivery'
+          && e.payload.deliveryRequestId === request.result?.deliveryRequestId);
+        return delivery ? this.deliveryView(delivery) : request.result!;
+      }
+      const handled = this.handledSequence(objectiveId);
+      let delivery = this.notificationControls(objectiveId).find(e => e.kind === 'supervisor.delivery' && e.objectiveId === objectiveId
+        && Number(e.payload.sequence) > handled);
+      if (!delivery) {
+        // A caller's cursor cannot hide an undelivered gap in durable state.
+        const events = this.notificationPage(handled, objectiveId);
+        if (!events.length) {
+          const result = { deliveryRequestId: null, eventIds: [], events: [], admitted: false, handledSequence: handled };
+          this.finishPendingCommandInTransaction(request.id, 'succeeded', result);
+          return result;
+        }
+        delivery = this.insertEvent({ sourceKey: `supervisor.delivery:${request.id}`, kind: 'supervisor.delivery',
+          objectiveId, payloadVersion: 1, correlationId: request.id, requestId: request.id, actor: command.caller,
+          occurredAt: new Date().toISOString(), notification: false,
+          payload: { deliveryRequestId: request.id, eventIds: events.map(e => e.id), sequence: events.at(-1)!.seq } });
+      }
+      const result = this.deliveryView(delivery);
+      this.finishPendingCommandInTransaction(request.id, 'succeeded', result);
+      return result;
+    });
+  }
+
+  async acknowledgeNotifications(objectiveId: string, eventIds: string[], deliveryRequestId: string | null, command: CommandInput): Promise<JsonObject> {
+    if (deliveryRequestId === null ? command.caller.kind !== 'supervisor' || command.operation !== 'supervisor.handled'
+      : command.caller.kind !== 'host' || command.operation !== 'supervisor.admitted') throw new CommandFailure('person_required');
+    if (command.input.objectiveId !== objectiveId || json(command.input.eventIds) !== json(eventIds)
+      || deliveryRequestId !== null && command.input.deliveryRequestId !== deliveryRequestId) throw new CommandFailure('invalid_input');
+    return this.write(() => {
+      this.objectiveRow(objectiveId);
+      if (command.caller.kind === 'supervisor') this.checkAuthority(command.caller as TaskActor, command.operation, command.input);
+      const request = this.recordCommandInTransaction(command);
+      if (request.state === 'succeeded') return request.result!;
+      const events = this.notificationControls(objectiveId);
+      const handled = this.handledSequence(objectiveId);
+      let sequence = handled;
+      if (deliveryRequestId !== null) {
+        const delivery = events.find(e => e.kind === 'supervisor.delivery' && e.objectiveId === objectiveId
+          && e.payload.deliveryRequestId === deliveryRequestId);
+        if (!delivery || json(delivery.payload.eventIds) !== json(eventIds)) throw new CommandFailure('invalid_input');
+      } else {
+        const remaining = this.notificationPage(handled, objectiveId);
+        if (!eventIds.length || json(remaining.slice(0, eventIds.length).map(e => e.id)) !== json(eventIds)) throw new CommandFailure('invalid_input');
+        const admittedIds = new Set(events.filter(e => e.kind === 'supervisor.admitted' && e.objectiveId === objectiveId)
+          .flatMap(e => e.payload.eventIds as string[]));
+        if (eventIds.some(id => !admittedIds.has(id))) throw new CommandFailure('invalid_input');
+        sequence = remaining[eventIds.length - 1]!.seq;
+      }
+      this.insertEvent({ sourceKey: `${command.operation}:${request.id}`, kind: command.operation, objectiveId,
+        payloadVersion: 1, correlationId: request.id, requestId: request.id, actor: command.caller,
+        occurredAt: new Date().toISOString(), notification: false, payload: { deliveryRequestId, eventIds, sequence } });
+      const result = { handledSequence: sequence, eventIds, deliveryRequestId };
+      this.finishPendingCommandInTransaction(request.id, 'succeeded', result);
+      return result;
+    });
   }
 
   private decodeEvent(row: Record<string, unknown>): StoredEvent {
@@ -2578,8 +2696,13 @@ export class Database {
 
   private storageEvent(kind: string, actor: JsonObject, payload: JsonObject, requestId?: string): void {
     const id = randomUUID();
+    const request = requestId === undefined ? undefined : this.requestRow(requestId);
+    const claim = payload.claim as JsonObject | undefined;
+    const attemptId = payload.attemptId ?? claim?.attemptId ?? request?.attempt_id;
+    const objectiveId = payload.objectiveId ?? claim?.objectiveId ?? request?.objective_id;
     this.insertEvent({ sourceKey: `${kind}:${id}`, kind, payloadVersion: 1, correlationId: requestId ?? id,
-      actor, occurredAt: new Date().toISOString(), payload, ...(requestId === undefined ? {} : { requestId }) });
+      actor, occurredAt: new Date().toISOString(), payload, ...(requestId === undefined ? {} : { requestId }),
+      ...(typeof attemptId === 'string' ? { attemptId } : {}), ...(typeof objectiveId === 'string' ? { objectiveId } : {}) });
   }
 
   /** All resource admissions are checked under the same write lock. No expiry takeover exists. */

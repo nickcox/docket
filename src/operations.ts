@@ -5,7 +5,7 @@ import { canonicalJson, ConfigurationError } from './configuration.ts';
 import { configureContext, initialiseContext, openContext } from './context.ts';
 import type { ContextOptions, ContextSelector } from './context.ts';
 import type { OperationDefinition } from './catalog.ts';
-import { Database, StorageError, NoEligibleTaskError } from './storage/database.ts';
+import { Database, StorageError, NoEligibleTaskError, notificationView } from './storage/database.ts';
 import type { JsonObject } from './storage/database.ts';
 import type { Task, TaskActor, TaskDefinition } from './storage/tasks.ts';
 import type { ObjectiveDefinition } from './storage/objectives.ts';
@@ -111,11 +111,26 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   let runtime: Runtime | undefined;
   const services = async () => runtime ??= await (options.runtime ?? createRuntime)(db, context.configuration.resolved, options.home);
   try {
-    if (operation.name === 'question.ask') return { question: await db.askQuestion(input as import('./storage/questions.ts').QuestionInput, bound, `question.command:${requestKey}`, command) };
-    db.checkAuthority(caller, operation.name, input);
+    if (operation.name === 'question.ask') return { question: await db.askQuestion(input as import('./storage/questions.ts').QuestionInput, bound as import('./storage/questions.ts').QuestionCaller, `question.command:${requestKey}`, command) };
+    if (bound.kind === 'host') {
+      if (operation.name === 'supervisor.pending') {
+        const deadline = Date.now() + Number(args.timeoutMs);
+        while (!db.hasPendingNotifications(String(args.objectiveId)) && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, Math.min(25, deadline - Date.now())));
+        }
+        return await db.pendingNotifications(String(args.objectiveId), Number(args.afterSequence), command);
+      }
+      if (operation.name === 'supervisor.admitted') return await db.acknowledgeNotifications(String(args.objectiveId), args.eventIds as string[], String(args.deliveryRequestId), command);
+      if (operation.name !== 'status.watch') throw new CommandFailure('person_required');
+    } else db.checkAuthority(caller, operation.name, input);
     const visibleTask = (task: Task) => caller.kind !== 'supervisor' || task.objectiveId === caller.objectiveId;
     const id = String(args.taskId);
     switch (operation.name) {
+      case 'status.watch': {
+        const events = db.notificationPage(Number(args.afterSequence));
+        return { events: events.map(notificationView), sequence: events.at(-1)?.seq ?? Number(args.afterSequence) };
+      }
+      case 'supervisor.handled': return await db.acknowledgeNotifications(String(args.objectiveId), args.eventIds as string[], null, command);
       case 'question.answer': return { question: await db.answerQuestion(String(args.questionId), String(args.text), caller, command) };
       case 'diagnostics.clean': return await cleanDiagnostics(db, args as unknown as Parameters<typeof cleanDiagnostics>[1], caller, requestKey);
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));

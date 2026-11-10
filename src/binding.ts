@@ -25,6 +25,7 @@ export function createBinding(caller: Caller, selector: ContextSelector, options
       if (name === 'catalog.show') return structuredClone({ catalogueVersion: 1, operations: definitions });
       const input = structuredClone(args);
       if (bound.kind === 'supervisor') for (const field of operation.bindingDerivedFields) input[field] = bound.objectiveId;
+      if (bound.kind === 'host' && operation.mutates && !requestId) throw new CommandFailure('invalid_input');
       const core = catalogue.operations.find(item => item.name === name)!;
       return executeCoreOperation(core, input, progress, context, requestId, { ...options, caller: bound });
     },
@@ -32,7 +33,7 @@ export function createBinding(caller: Caller, selector: ContextSelector, options
 }
 
 export function catalogueForRole(role: Role, boundObjective = role === 'supervisor'): OperationDefinition[] {
-  return catalogue.operations.filter(operation => operation.roles.includes(role) && !(role !== 'person' && operation.name === 'status.watch')).map(operation => {
+  return catalogue.operations.filter(operation => operation.roles.includes(role) && !(['supervisor', 'worker'].includes(role) && operation.name === 'status.watch')).map(operation => {
     const copy = structuredClone(operation);
     if (role !== 'supervisor') return copy;
     const schema = copy.inputSchema as Record<string, unknown>, properties = schema.properties as Record<string, JsonSchema>;

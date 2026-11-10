@@ -2,6 +2,7 @@ import type { Permissions } from './storage/objectives.ts';
 
 /** An absent entry is not an implicit grant. */
 export const supervisorPermissions: Readonly<Record<string, keyof Permissions | null>> = {
+  'supervisor.handled': null,
   'question.ask': null, 'question.answer': 'answerQuestions',
   'status.show': null, 'request.show': null, 'task.show': null, 'task.list': null, 'attempt.show': null, 'objective.show': null,
   'task.add': 'manageTasks', 'task.update': 'manageTasks', 'task.hold': 'manageTasks', 'task.release': 'manageTasks',

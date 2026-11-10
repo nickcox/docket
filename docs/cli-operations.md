@@ -2,7 +2,7 @@
 
 `node bin/docket.ts catalog show --json` is the source of operation names, required JSON fields, roles and schemas. All input fields are required, including nullable fields and `dryRun` on planable operations. Unknown fields refuse. The ordinary CLI derives the person identity from the OS user; JSON cannot supply a caller or an approval role.
 
-Use `--config /absolute/context.json` or a registered `--context name`, and exactly one of `--stdin` and `--input file.json`. Every command writes one version-1 envelope to stdout. Dispatch progress goes to stderr. Person mutations generate a request ID unless `--request-id key` is supplied. Reuse that key after a lost response, with the same input. Task mutations and their replay result commit together.
+Use `--config /absolute/context.json` or a registered `--context name`, and exactly one of `--stdin` and `--input file.json`. Ordinary commands write one version-1 envelope to stdout; `status.watch` writes NDJSON envelopes. Dispatch progress goes to stderr. Person mutations generate a request ID unless `--request-id key` is supplied. Reuse that key after a lost response, with the same input. Task mutations and their replay result commit together.
 
 ## Questions
 
@@ -13,6 +13,20 @@ Use `--config /absolute/context.json` or a registered `--context name`, and exac
 Pi workers publish complete `{text,choices,waiting}` JSON files by atomic rename into the protocol's `questionsDirectory`. Each filename is consumed once per attempt, including malformed files, which produce one diagnostic. Use a fresh filename for each question. Answers use the file channel: an `answers` directory beside `questionsDirectory` holds `<questionId>.json`. File and message delivery have separate durable requests, recorded atomically with the answer. A recorded answer is not delivery evidence; inspect its requests with `request.show`. Uncertain deliveries are not retried automatically. A terminal observation withdraws any unclaimed answer deliveries in the same transaction; claimed or uncertain deliveries still need reconciliation. Answers never restart terminal workers, and remain available in continuation handovers.
 
 `status.show` lists unanswered questions in `openPersonQuestions`, with their choices, recipient, reason and an answer next action. A supervisor sees only its objective's questions for tasks still in its scope; moving a task does not change a question's immutable recipient. Pending or uncertain answer deliveries remain in its effects section even after the question is answered.
+
+## Notifications
+
+Every domain fact is its own source-keyed, ordered notification, committed in the fact's transaction. Request bookkeeping and notification acknowledgements do not recursively produce notifications. Notification views contain compact event references, not full task specifications or result evidence; use the scoped detail operations for those.
+
+`status.watch` takes `{"afterSequence":0,"timeoutMs":30000}`. Only a person or trusted host can watch; it is not a supervisor or worker tool. The ordinary CLI streams one version-1 NDJSON envelope per notification, with its recorded `sequence`, followed by a final envelope with `data.final:true` and the last sequence. It reads pages of at most 20 events. `timeoutMs:null` selects 30 seconds; explicit timeouts are 0–60,000 ms. Zero reads one available page and finishes. Each line is bounded to 256 KiB. Watching never acknowledges delivery or handling.
+
+Trusted host code uses these operations through `createBinding`, with a stable request ID for each call:
+
+- `supervisor.pending`: `{"objectiveId":"goal","afterSequence":0,"timeoutMs":30000}`. Waits up to the timeout for pending state, then returns at most 20 ordered notifications, their `eventIds`, a stable UUID `deliveryRequestId` (null for an empty poll), `admitted` and `handledSequence`. Recorded unhandled state takes precedence over the supplied cursor, so a stale or advanced cursor cannot hide a gap. Repeated polls and restarted hosts recover the oldest unfinished delivery rather than creating a replacement batch. Replaying a poll reads current admission and handled state. Use a new request ID for a new poll after an empty response.
+- `supervisor.admitted`: `{"objectiveId":"goal","deliveryRequestId":"<UUID>","eventIds":["<UUID>"]}`. Records that the host admitted the exact ordered batch to its conversation. The host uses the delivery UUID to recognise an already admitted conversation message when an acknowledgement is lost. Delivery is at least once, not an exactly-once conversation-send guarantee. An admitted batch recovered after a restart does not need another conversation prompt.
+- `supervisor.handled`: `{"objectiveId":"goal","eventIds":["<UUID>"]}`. Only the bound supervisor can call this; its tool schema omits `objectiveId`. After processing the events, it acknowledges an ordered contiguous prefix of the remaining admitted events. Foreign, missing, reordered or unadmitted events refuse without advancing the handled position. Partial handling leaves the remaining suffix pending.
+
+Admission does not advance handling. A recovered admitted batch still awaits supervisor processing, and no notification operation activates, resumes or sends another prompt to a worker. None of these operations is planable or accepts `dryRun`.
 
 ## Configuration
 

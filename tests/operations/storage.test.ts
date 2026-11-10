@@ -157,7 +157,7 @@ test('R25: logical duplicate evidence ignores JSON key order but refuses differe
   const input = { ...event('ordered'), payload: { a: 1, b: { c: true, d: null } } };
   const first = await db.appendEvents([input]);
   assert.deepEqual(await db.appendEvents([{ ...input, payload: { b: { d: null, c: true }, a: 1 } }]), first);
-  await assert.rejects(db.appendEvents([{ ...input, notification: true }]), errorCode('conflict'));
+  await assert.rejects(db.appendEvents([{ ...input, notification: false }]), errorCode('conflict'));
 });
 
 test('R24/R25: BEGIN IMMEDIATE waits asynchronously, retries after release, and is bounded under contention', async t => {
