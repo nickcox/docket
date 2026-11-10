@@ -15,7 +15,8 @@ import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { mandatoryChecks, parseCheckPolicy } from '../../src/check-policy.ts';
 import type { TrustedChecks } from '../../src/storage/reservations.ts';
-import { runCandidateChecks } from '../../src/checks.ts';
+import { runCandidateChecks, runChecks } from '../../src/checks.ts';
+import { canonicalJson } from '../../src/configuration.ts';
 import { Database, StorageError } from '../../src/storage/database.ts';
 import { CommandFailure } from '../../src/response.ts';
 import { checkFixture, contextChecks, head, host, person, policyContent, profile, start } from '../helpers/check-attempt.ts';
@@ -432,6 +433,61 @@ test('R10: acceptance reuses an explicit successful retry after the automatic ch
   await acceptCandidate(f.db, f.accept, f.services);
   assert.deepEqual(f.calls, ['fast', 'full']);
   assert.equal(f.db.task('task').state, 'done');
+});
+
+test('R08/R09/R10/R16/R30: acceptance reuses an explicit pass after exact check recovery without rerunning the withdrawn key', async t => {
+  for (const state of ['claimed', 'uncertain'] as const) {
+    const f = await fixture(t), run = f.services.run;
+    let original;
+    if (state === 'claimed') {
+      original = (await f.db.beginChecks({ attemptId: f.a.id, commit: head,
+        checks: mandatoryChecks(f.db.attempt(f.a.id).specification.checks as TrustedChecks,
+          parseCheckPolicy(start, policyContent, contextChecks)), profile, caller: person })).request;
+    } else {
+      f.services.run = async check => {
+        f.calls.push(check.name);
+        return { status: 'uncertain', exitCode: null, timedOut: false, stdout: '', stderr: 'Interrupted diagnostic', truncated: false };
+      };
+      original = await runCandidateChecks(f.db, f.a.id, person, f.services);
+      f.services.run = run;
+    }
+    await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), { code: state === 'claimed' ? 'checks_waiting' : 'effect_uncertain' });
+    await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: state === 'claimed' ? 'checks_waiting' : 'effect_uncertain' });
+    const input = { checkRequestId: original.id, confirmStopped: true, evidence: 'Inspected exact check executor and commands; all stopped', dryRun: false };
+    const command = { requestKey: 'resolve', operation: 'checks.resolve', caller: person, input, fingerprint: canonicalJson(input) };
+    const resolved = await f.db.resolveChecksByPerson(original.id, true, input.evidence, false, person, command);
+    const snapshot = () => ({ events: f.db.events(), requests: f.db.requests(), claims: f.db.claims(), attempt: f.db.attempt(f.a.id) });
+    const afterResolution = snapshot(), callsBeforeRetry = [...f.calls];
+    assert.deepEqual(await f.db.resolveChecksByPerson(original.id, true, input.evidence, false, person, command), resolved);
+    assert.deepEqual(snapshot(), afterResolution);
+    await assert.rejects(planCandidateAcceptance(f.db, f.accept, f.services), { code: 'check_missing' });
+    await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'check_missing' });
+    assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+    assert.deepEqual(f.calls, callsBeforeRetry);
+    const retryInput = { attemptId: f.a.id, commit: head, dryRun: false };
+    await runChecks(f.db, retryInput, person, 'explicit-retry', f.services);
+    const retry = f.db.requests().find(request => request.requestKey === 'explicit-retry')!;
+    assert.equal(retry.state, 'succeeded');
+    assert.equal(retry.input.evidenceKey, original.input.evidenceKey);
+    const beforePlan = snapshot();
+    assert.deepEqual((await planCandidateAcceptance(f.db, f.accept, f.services)).steps.map(step => step.operation), ['candidate.accept', 'task.complete']);
+    assert.deepEqual(snapshot(), beforePlan);
+    await acceptCandidate(f.db, f.accept, f.services);
+    const accepted = f.db.acceptance(f.a.id, f.accept.candidateId)!;
+    assert.equal(accepted.payload.checksRequestId, retry.id);
+    assert.equal(accepted.payload.overrideReason, null);
+    assert.equal(f.db.task('task').state, 'done');
+    const afterAcceptance = snapshot();
+    await acceptCandidate(f.db, f.accept, f.services);
+    await runChecks(f.db, retryInput, person, 'explicit-retry', f.services);
+    assert.equal((await runCandidateChecks(f.db, f.a.id, person, f.services)).state, 'withdrawn');
+    await assert.rejects(runChecks(f.db, retryInput, person, original.requestKey, f.services), { code: 'check_missing' });
+    assert.deepEqual(snapshot(), afterAcceptance);
+    assert.deepEqual(f.calls, [...callsBeforeRetry, 'fast', 'full']);
+    assert.equal(f.db.request(original.id).state, 'withdrawn');
+    assert.equal(f.db.request(original.id).result?.status, 'uncertain');
+    if (original.result) assert.deepEqual(f.db.request(original.id).result, original.result);
+  }
 });
 
 test('R16/R27: acceptance names waiting checks and their slot holder, then retries the pending run and accepts', async t => {

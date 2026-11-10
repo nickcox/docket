@@ -216,9 +216,10 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
     await retainedOutput(db, input.attemptId, services);
     const config = db.finalisationConfiguration();
     let checks = input.overrideReason === undefined ? await runCandidateChecks(db, input.attemptId, input.caller, services) : null;
-    if (checks && checks.state === 'rejected') {
+    if (checks && ['rejected', 'withdrawn'].includes(checks.state)) {
       checks = db.requests().findLast(request => request.operation === 'checks.run' && request.attemptId === input.attemptId
-        && request.input.evidenceKey === checks!.input.evidenceKey && request.state === 'succeeded') ?? checks;
+        && request.input.evidenceKey === checks!.input.evidenceKey && request.state === 'succeeded'
+        && request.result?.status === 'passed') ?? checks;
     }
     const plan = await planAcceptance(db, input, services);
     if (checks) {
