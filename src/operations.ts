@@ -92,8 +92,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   const bound = structuredClone(options.caller ?? { kind: 'person' as const, id: String(userInfo().uid) });
   if (!operation.roles.includes(bound.kind)) throw new CommandFailure('person_required');
   if (bound.kind === 'worker' && operation.name !== 'question.ask') throw new CommandFailure('person_required');
-  if (bound.kind === 'host') {
-    if (operation.name !== 'host.usage') throw new CommandFailure('person_required');
+  // Other host operations have passed the role check and are handled after the context opens.
+  if (bound.kind === 'host' && operation.name === 'host.usage') {
     const context = await openContext(selector, { ...options, readOnly: false });
     try {
       await context.database.recordUsage(args.report as import('./usage.ts').UsageReport, bound);
