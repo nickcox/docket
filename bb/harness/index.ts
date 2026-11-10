@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve, relative, sep } from 'node:path';
 import { createServer } from 'node:net';
 import { pluginsFrom, registrationReady, startIsolated, verifySelection, type StartupIO } from './startup.ts';
+import { controlRequest } from './http.ts';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 export const app = '/Applications/bb.app/Contents/Resources/app.asar.unpacked/node_modules/bb-app';
@@ -192,7 +193,7 @@ export class Harness {
     this.server = this.launch(join(app, 'server', 'dist', 'index.js'), 'server');
     await until(async () => {
       if (this.server?.exitCode !== null) throw new Error('Server exited');
-      const response = await fetch(`${this.url}/api/v1/system/version`, { signal: AbortSignal.timeout(1000) });
+      const response = await controlRequest(this.url, '/api/v1/system/version', undefined, 1000);
       return response.ok;
     }, value => value);
   }
@@ -209,10 +210,9 @@ export class Harness {
   }
 
   async request(path: string, body?: unknown): Promise<any> {
-    const response = await fetch(`${this.url}${path}`, { method: body === undefined ? 'GET' : 'POST', headers: { 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(60_000) });
-    const text = await response.text();
-    if (!response.ok) throw new Error(`${response.status} ${path}: ${text}`);
-    return JSON.parse(text);
+    const response = await controlRequest(this.url, path, body);
+    if (!response.ok) throw new Error(`${response.status} ${path}: ${response.text}`);
+    return JSON.parse(response.text);
   }
 
   stop(): Promise<void> {

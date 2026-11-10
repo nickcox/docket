@@ -20,6 +20,8 @@ For a controlled server restart, the daemon and its observed descendants are sto
 
 The harness routes every plugin CLI/API operation to its explicit isolated URL and private data/home. Plugin selection uses the public HTTP operations, not database edits or installed-code patches.
 
+All harness control HTTP requests, including version readiness, send `Connection: close`. Synchronous CLI installation blocks the client's event loop while the separate server can close idle sockets; pooled fetch can then reuse a stale socket and fail with `ECONNRESET`. The shared transport does not retry mutations. Fetch/body-read failures include method and path and retain the original cause, without including the request body or credentials.
+
 ### Installed contract evidence
 
 Inspected the installed code, without executing a live server or provider:
@@ -33,32 +35,38 @@ Inspected the installed code, without executing a live server or provider:
 
 The retained diagnosis at `/Users/nick/.bb/thread-storage/thr_i4r9iqub7v/keychain-diagnosis/findings.md` reports that standalone Node bundled-CA and system-CA tests both succeeded without dialogs. In bb 0.49.0, host-connect installation-status prewarming checks all enabled providers, defaulting `checkUpdates` to true. The Claude provider then runs `claude doctor`. A substitute `security` executable, refusing real Keychain access, captured its attempted `add-generic-password` for `Claude Code-doctor-probe`. Historical logs show a matching item-creation operation immediately before the dialogs; attribution of that historical operation is strongly supported, not proven by an original command-line capture.
 
-Disabling unrelated provider plugins **before host connection** addresses that startup path. Removing Node's CA flag is not a demonstrated fix. This worker did not run bb startup, provider CLIs, models or Keychain commands. The supervisor must review first, then perform exactly one monitored startup.
+Disabling unrelated provider plugins **before host connection** is the intended mitigation for that startup path, but remains unverified live. Removing Node's CA flag is not a demonstrated fix.
+
+The supervisor's one monitored startup of retained candidate `6b08e681537897c365876375400b683cdc28bb86` failed after plugin installation with `fetch failed` / `ECONNRESET`, **before any provider disable or daemon enrollment/connection**. No Keychain events or guarded provider commands were observed; zero threads existed and recorded processes and ports were stopped. Retained monitor: `/Users/nick/.bb/thread-storage/thr_i4r9iqub7v/keychain-diagnosis/startup-monitor-output.jsonl`; private root: `/private/var/folders/82/z689vjhj5f9f6xlwg34dn3vw0000gn/T/docket-bb-6KP63f`.
+
+The supervisor independently reproduced the stale idle-socket failure with a separate server event loop and a blocked fetch client; `Connection: close` succeeded (`idle-socket-reproduction.mjs` and `idle-socket-result.json` in that diagnosis directory). This repair has only local HTTP and fake-policy test evidence. This worker did not run bb startup, provider CLIs, models or Keychain commands. Successful live startup, the Keychain mitigation, Q1a and bb qualification remain unproven. Another supervised live startup requires a separate explicit decision; do not repeat it automatically.
 
 ## Build and offline checks
 
 From the repository root:
 
 ```sh
-npm ci --prefix bb/plugin --ignore-scripts --no-audit --no-fund
 npm run check
-npm run check --prefix bb/plugin
 ./node_modules/.bin/tsc -p bb/tsconfig.json
-node --test tests/bb-provider-isolation.test.ts
+node --test tests/bb-control-http.test.ts tests/bb-provider-isolation.test.ts
 
 BUILD_ROOT=$(mktemp -d -t docket-bb-build)
+cp -R bb/plugin "$BUILD_ROOT/plugin"
 mkdir "$BUILD_ROOT/home" "$BUILD_ROOT/data"
+(cd "$BUILD_ROOT/plugin" && npm ci --ignore-scripts --no-audit --no-fund && npm run check)
 env -i PATH="$PATH" HOME="$BUILD_ROOT/home" BB_DATA_DIR="$BUILD_ROOT/data" \
   BB_SERVER_URL=http://127.0.0.1:1 \
   node /Applications/bb.app/Contents/Resources/app.asar.unpacked/node_modules/bb-app/dist/bb.js \
-  plugin build bb/plugin
+  plugin build "$BUILD_ROOT/plugin"
 ```
 
-The build command is offline with respect to the bb server; first use may download the pinned build toolchain. Generated `bb/plugin/dist/` and `bb/plugin/node_modules/` remain ignored. The nine fake tests run in the ordinary root suite on all CI platforms, without bb installed or any live programs, filesystem fixtures, credentials, models or Keychain access. Live harness process handling remains macOS-only and unqualified.
+The build command is offline with respect to the bb server; first use may download the pinned build toolchain. Keep dependency/build outputs in this scratch copy, not nested in the source workspace: the person-controlled root execution profile permits only root `node_modules/`. Generated `bb/plugin/dist/` and `bb/plugin/node_modules/` remain ignored as a safeguard, not permission to leave them there.
+
+The nine fake policy tests and two local HTTP transport tests run in the ordinary root suite without bb installed, providers, credentials, models or Keychain access. The HTTP tests use only an owned local Node server process, including a deliberately blocked client interval and a reset mutation with no retry. Live harness process handling remains macOS-only and unqualified.
 
 ## Supervisor: one monitored startup only
 
-After building, from this exact workspace, run:
+Only after a separate explicit decision authorising another monitored startup: build as above, temporarily copy the scratch plugin's `dist/` into `bb/plugin/dist/` for installation, then from this exact workspace run:
 
 ```sh
 node bb/probes/startup-only.ts
