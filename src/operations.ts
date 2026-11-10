@@ -23,9 +23,13 @@ import { unknownProfile, UnknownProfileError } from './profiles.ts';
 import { requestView } from './request-view.ts';
 import { nextAction as action } from './next-action.ts';
 import { validateSchema } from './operation-schemas.ts';
+import { startSupervisor } from './supervisor.ts';
 
 export interface OperationOptions extends ContextOptions {
   runtime?: typeof createRuntime;
+  /** Trusted host peer factory, never supplied by operation input. */
+  supervisorPeer?: () => Promise<import('./adapters/pi-supervisor.ts').SupervisorPeer>;
+  keepAwake?: (warn: (message: string) => void) => () => void;
   /** Trusted host input only. Never read from operation args. */
   caller?: import('./storage/questions.ts').QuestionCaller | { kind: 'host'; id: string };
 }
@@ -131,6 +135,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         const events = db.notificationPage(Number(args.afterSequence));
         return { events: events.map(notificationView), sequence: events.at(-1)?.seq ?? Number(args.afterSequence) };
       }
+      case 'supervisor.start': return await startSupervisor(db, context.configuration.resolved, input, command, selector, options);
       case 'supervisor.handled': return await db.acknowledgeNotifications(String(args.objectiveId), args.eventIds as string[], null, command);
       case 'supervisor.briefing': return { briefing: db.supervisorBriefing(String(args.objectiveId), caller) };
       case 'supervisor.note': return { note: await db.supervisorNote(String(args.objectiveId), String(args.text), caller, command) };

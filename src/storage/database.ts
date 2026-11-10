@@ -748,6 +748,46 @@ export class Database {
       payload: { scopes, operation: command.operation, requestKey: command.requestKey } });
   }
 
+  activeSupervisor() {
+    const events = this.events();
+    return events.findLast(e => e.kind === 'session.registered' && e.payload.kind === 'supervisor'
+      && !events.some(end => ['supervisor.stopped', 'session.finished'].includes(end.kind) && end.payload.sessionId === e.payload.sessionId)) ?? null;
+  }
+
+  supervisorBudgetReason(objectiveId: string): string | null {
+    return this.snapshot(() => budgetReason(this.decodeObjective(this.objectiveRow(objectiveId)), this.usageEvents(), undefined, Date.now(), true));
+  }
+
+  async reserveSupervisor(objectiveId: string, profile: JsonObject, command: CommandInput) {
+    return this.writeTask(command, () => {
+      if (command.caller.kind !== 'person') throw new CommandFailure('person_required');
+      const objective = this.objective(objectiveId, command.caller as TaskActor);
+      if (objective.state !== 'open') throw new CommandFailure('policy_refused');
+      enforceBudget(objective, this.usageEvents(), ['tokens', 'cost', 'workerTimeMs']);
+      if (this.activeSupervisor()) throw new CommandFailure('owner_unresolved');
+      const sessionId = randomUUID();
+      this.insertEvent({ sourceKey: `session:${sessionId}`, kind: 'session.registered', payloadVersion: 1,
+        correlationId: sessionId, objectiveId, actor: command.caller, occurredAt: new Date().toISOString(),
+        payload: { sessionId, kind: 'supervisor', objectiveId, attemptId: null, registeredAt: new Date().toISOString(),
+          capabilities: ['tokens', 'cost'], host: 'pi', restricted: true, profile } });
+      return { sessionId, objectiveId, host: 'pi', restricted: true };
+    });
+  }
+
+  /** Consume before spawning or sending. A restart cannot adopt or repeat this session. */
+  async supervisorIntent(sessionId: string, key: string): Promise<boolean> {
+    return this.write(() => {
+      const sourceKey = `supervisor.intent:${sessionId}:${key}`;
+      if (this.events().some(e => e.sourceKey === sourceKey)) return false;
+      const active = this.activeSupervisor();
+      if (active?.payload.sessionId !== sessionId) throw new CommandFailure('owner_unresolved');
+      this.insertEvent({ sourceKey, kind: 'supervisor.intent', payloadVersion: 1, notification: false,
+        correlationId: sessionId, objectiveId: active.objectiveId!, actor: { kind: 'host', id: sessionId },
+        occurredAt: new Date().toISOString(), payload: { sessionId, key } });
+      return true;
+    });
+  }
+
   supervisorBriefing(objectiveId: string, actor: TaskActor) {
     return this.snapshot(() => buildBriefing(this, objectiveId, actor));
   }
@@ -816,6 +856,8 @@ export class Database {
       for (const item of this.db.prepare("SELECT id, state FROM requests WHERE category = 'effect' AND state IN ('claimed', 'uncertain') ORDER BY id").all()) {
         blockers.push({ kind: 'effect', requestId: String(item.id), state: String(item.state) });
       }
+      const supervisor = this.activeSupervisor();
+      if (supervisor) blockers.push({ kind: 'supervisor', sessionId: supervisor.payload.sessionId! });
       const changedFields = Object.keys(configuration.resolved)
         .filter(field => canonicalJson(previous[field]) !== canonicalJson(configuration.resolved[field]));
       const changed = recorded.digest !== configuration.digest;
@@ -959,6 +1001,11 @@ export class Database {
     nonblank(session.sessionId);
     if (!['worker', 'supervisor'].includes(session.kind) || !Number.isFinite(Date.parse(session.registeredAt))) throw new TypeError('Invalid session');
     await this.write(() => {
+      if (session.kind === 'supervisor') {
+        if (session.objectiveId === null || session.attemptId !== null) throw new TypeError('Invalid supervisor scope');
+        const active = this.activeSupervisor();
+        if (active && active.payload.sessionId !== session.sessionId) throw new CommandFailure('owner_unresolved');
+      }
       if (session.objectiveId !== null) this.objectiveRow(session.objectiveId);
       this.insertEvent({ sourceKey: `session:${session.sessionId}`, kind: 'session.registered', payloadVersion: 1,
         correlationId: session.sessionId, actor, occurredAt: session.registeredAt,

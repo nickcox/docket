@@ -163,6 +163,8 @@ test('R23/A47: classifications and membership are write-once, with answer and re
   const scopes = move[0]!.payload.scopes as JsonObject[];
   assert.deepEqual(scopes.find(s => s.objectiveId === 'goal')!.members, ['one']);
   assert.deepEqual(scopes.find(s => s.objectiveId === 'other')!.members, []);
+  await f.db.appendEvents([{ sourceKey: 'supervisor-stopped', kind: 'supervisor.stopped', payloadVersion: 1,
+    correlationId: 'session', objectiveId: 'goal', actor: host, occurredAt: new Date().toISOString(), payload: { sessionId: 'session' } }]);
   await f.db.registerSession({ sessionId: 'other-session', kind: 'supervisor', objectiveId: 'other', attemptId: null,
     registeredAt: new Date().toISOString(), capabilities: [] }, host);
   const input: JsonObject = { taskId: 'one' };

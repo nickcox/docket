@@ -49,6 +49,7 @@ function outputSchema(name: string): JsonSchema {
     eventIds: { type: 'array', maxItems: 20, items: uuid }, events: notifications, admitted: bool, handledSequence: { type: 'integer', minimum: 0 } });
   if (name === 'supervisor.admitted' || name === 'supervisor.handled') return object({ deliveryRequestId: nullable(uuid),
     eventIds: { type: 'array', maxItems: 20, items: uuid }, handledSequence: { type: 'integer', minimum: 0 } });
+  if (name === 'supervisor.start') return object({ session: object({ sessionId: uuid, objectiveId: id, host: { const: 'pi' }, restricted: { const: true } }) });
   if (name === 'supervisor.briefing') return object({ briefing: view });
   if (name === 'supervisor.note') return object({ note: view });
   if (name.startsWith('question.')) return object({ question: view });
@@ -109,6 +110,7 @@ const timeout = { type: 'integer', minimum: 0, maximum: 60000 };
 const eventIds = { type: 'array', minItems: 1, maxItems: 20, uniqueItems: true, items: uuid };
 export const coreOperations: OperationDefinition[] = [
   operation('status.watch', 'Stream ordered notifications until the bounded timeout.', { afterSequence: sequence, timeoutMs: nullable(timeout) }, false, ['person', 'host']),
+  operation('supervisor.start', 'Start a restricted standalone Pi supervisor bound to its objective.', { objectiveId: id, host: { enum: ['bb', 'pi'] }, profile: nullable(string), restricted: bool }, true, ['person']),
   operation('supervisor.pending', 'Recover or reserve a durable ordered delivery batch.', { objectiveId: id, afterSequence: sequence, timeoutMs: timeout }, true, ['host']),
   operation('supervisor.admitted', 'Confirm that the host admitted the exact delivery to its conversation.', { objectiveId: id, deliveryRequestId: uuid, eventIds }, true, ['host']),
   operation('supervisor.handled', 'Mark a contiguous admitted batch processed by the supervisor.', { objectiveId: id, eventIds }, true, ['supervisor']),
