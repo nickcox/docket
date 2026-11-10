@@ -27,7 +27,14 @@ function identity(request: StoredRequest) {
 
 export function requestView(db: Database, request: StoredRequest): Record<string, unknown> {
   const effects = db.requests().filter(effect => effect.parentId === request.id);
+  const interruptedCheck = request.operation === 'checks.run' && ['claimed', 'uncertain'].includes(request.state);
+  const resolution = request.operation === 'checks.run'
+    ? db.events().find(event => event.kind === 'checks.resolved' && event.requestId === request.id) : undefined;
   return { ...identity(request), category: request.category,
+    resolution: resolution ? bounded(resolution.payload, 8192) : null,
+    nextAction: interruptedCheck ? { operation: 'checks.resolve', args: { checkRequestId: request.id,
+      confirmStopped: false, evidence: 'Inspect the stopped check owner.', dryRun: true },
+      description: 'A person must confirm the owner has stopped before resolving this exact check run.' } : null,
     caller: bounded(request.caller, 4096), attemptId: request.attemptId, objectiveId: request.objectiveId,
     parent: request.parentId === null ? null : identity(db.request(request.parentId)),
     target: request.target === null ? null : { kind: request.target.kind, reference: bounded(request.target.reference, 8192) },

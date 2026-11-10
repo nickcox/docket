@@ -66,6 +66,7 @@ function outputSchema(name: string): JsonSchema {
     return object({ ...identity, category: { enum: ['command', 'effect'] }, caller: view,
       attemptId: nullable(uuid), objectiveId: nullable(id), parent: nullable(object(identity)),
       target: nullable(object({ kind: { enum: ['workspace', 'worker', 'answer', 'checks', 'repository', 'diagnostics'] }, reference: view })),
+      resolution: nullable(view), nextAction: attention.nextAction,
       input: view, result: nullable(view), effects: { type: 'array', maxItems: 20, items: object(identity) },
       effectsTotal: { type: 'integer', minimum: 0 } });
   }
@@ -94,6 +95,7 @@ function outputSchema(name: string): JsonSchema {
     variants.push(object({ attempt: view, leaseReturn, steps }), object({ attempt: view, leaseReturn }));
   }
   else if (name === 'checks.run') variants.push(object({ request: view, steps }));
+  else if (name === 'checks.resolve') variants.push(object({ request: view, steps, scope: view }));
   else if (name.startsWith('attempt.')) variants.push(object({ attempt: view, steps }));
   else if (name === 'claim.resolve') variants.push(object({ steps, scope: view }), object({ claim: view, steps, scope: view }));
   else if (name === 'effect.resolve') variants.push(object({ steps, target: nullable(view) }), object({ effect: view, steps, target: nullable(view) }));
@@ -162,6 +164,7 @@ export const coreOperations: OperationDefinition[] = [
   operation('attempt.return', 'Return the exact lease when no work could be lost.', { ...planAttempt }, true, ['person']),
   operation('attempt.discard', 'Discard output and return the exact lease after scoped confirmations.', { ...planAttempt, confirmDiscard: bool, reason: string }, true, ['person']),
   operation('diagnostics.clean', 'Remove only unreferenced diagnostics of a terminal attempt with a returned lease.', { ...attempt, noProcesses: bool, includeTranscript: bool, dryRun: bool }, true, ['person']),
+  operation('checks.resolve', 'Withdraw an exact interrupted check run after confirming its owner has stopped, retaining unknown diagnostics.', { checkRequestId: uuid, confirmStopped: bool, evidence: string, dryRun: bool }, true, ['person']),
   operation('claim.resolve', 'Resolve exact owner scope with stopped-owner confirmation and evidence, never age alone.', { claimId: uuid, confirmStopped: bool, evidence: string, dryRun: bool }, true, ['person']),
   operation('effect.resolve', 'Resolve an uncertain effect with owner evidence and stopped-owner confirmation.', { effectId: uuid, outcome: { enum: ['happened', 'not_happened'] }, evidence: string, confirmStopped: bool, dryRun: bool }, true, ['person']),
 ];

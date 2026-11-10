@@ -715,7 +715,8 @@ export class Database {
     const input = command.input, ids = new Set<string>();
     const taskIds = [input.taskId, input.blockerId, ...((input.orderedTaskIds ?? []) as string[])].filter((id): id is string => typeof id === 'string');
     const claim = typeof input.claimId === 'string' ? this.claim(input.claimId) : null;
-    const effect = typeof input.effectId === 'string' ? this.request(input.effectId) : null;
+    const effect = typeof input.effectId === 'string' ? this.request(input.effectId)
+      : typeof input.checkRequestId === 'string' ? this.request(input.checkRequestId) : null;
     if (claim?.objectiveId) ids.add(claim.objectiveId);
     if (effect?.objectiveId) ids.add(effect.objectiveId);
     for (const id of [attemptId, input.attemptId, input.sourceAttemptId, claim?.attemptId, effect?.attemptId]) {
@@ -2874,6 +2875,48 @@ export class Database {
   claim(id: string): Claim {
     text(id);
     return this.snapshot(() => this.decodeClaim(this.claimRow(id)));
+  }
+
+  async resolveChecksByPerson(id: string, confirmStopped: boolean, evidence: string, dryRun: boolean,
+    caller: TaskActor, command: CommandInput) {
+    caller = structuredClone(caller); command = structuredClone(command);
+    taskActor(caller); nonblank(evidence);
+    if (caller.kind !== 'person') throw new CommandFailure('person_required');
+    if (confirmStopped !== true) throw new CommandFailure('process_confirmation_required');
+    commandInput(command);
+    if (command.operation !== 'checks.resolve' || command.fingerprint !== canonicalJson(command.input) || json(command.caller) !== json(caller)
+      || command.input.checkRequestId !== id || command.input.confirmStopped !== confirmStopped
+      || command.input.evidence !== evidence || command.input.dryRun !== dryRun || typeof dryRun !== 'boolean') throw new StorageError('conflict', 'Check resolution scope mismatch');
+    const resolve = () => {
+      const request = this.decodeRequest(this.requestRow(id));
+      if (request.category !== 'command' || request.operation !== 'checks.run'
+        || !['claimed', 'uncertain'].includes(request.state) || !request.claimId || !request.attemptId) {
+        throw new StorageError('conflict', 'Check request is not an interrupted claimed run');
+      }
+      const claim = this.decodeClaim(this.claimRow(request.claimId));
+      if (claim.role !== 'check_executor' || claim.resourceKey !== `checks:${id}`
+        || claim.attemptId !== request.attemptId || request.input.attemptId !== request.attemptId
+        || json(claim.ownerRef) !== json(request.caller)) throw new StorageError('conflict', 'Check claim scope mismatch');
+      const scope = { checkRequestId: id, claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef };
+      const steps = [{ operation: 'checks.resolve', target: id, requires: ['person', 'stopped_owner', 'scoped_evidence'], conditional: false }];
+      if (dryRun) return { request, steps, scope };
+      const proof = { ...scope, evidence, confirmStopped: true, previousState: request.state };
+      // Withdraw execution authority, not the historical unknown outcome or diagnostics.
+      this.db.prepare("UPDATE requests SET state = 'withdrawn', result = ?, revision = revision + 1 WHERE id = ?")
+        .run(json(request.result ?? { status: 'uncertain', evidenceKey: request.input.evidenceKey,
+          commands: [], reason: 'Executor interrupted; command outcome unknown' }), id);
+      if (!claim.releasedAt) this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
+        .run(new Date().toISOString(), json(proof), claim.id);
+      this.db.prepare("UPDATE attempts SET phase = 'settled', revision = revision + 1 WHERE id = ?").run(request.attemptId);
+      this.storageEvent('checks.resolved', caller, proof, id);
+      return { request: this.decodeRequest(this.requestRow(id)), steps, scope };
+    };
+    if (dryRun) return this.snapshot(() => {
+      const previous = this.duplicateRequest(command, 'command');
+      if (previous) return { ...(previous.result!.value as unknown as ReturnType<typeof resolve>), steps: [] };
+      return resolve();
+    });
+    return this.writeTask(command, resolve);
   }
 
   async resolveClaimByPerson(id: string, evidence: string, caller: TaskActor, command: CommandInput): Promise<Claim> {

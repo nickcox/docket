@@ -30,7 +30,7 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
     'host.usage', 'objective.confirm-usage', 'supervisor.start', 'supervisor.briefing', 'supervisor.note',
     'objective.add', 'objective.show', 'objective.update', 'objective.complete', 'objective.abandon', 'objective.reopen',
     'task.add', 'task.show', 'task.list', 'task.update', 'task.move', 'task.hold', 'task.release', 'task.block', 'task.unblock', 'task.reorder', 'task.done', 'task.reopen',
-    'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'request.show', 'diagnostics.clean'].sort());
+    'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.show', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'checks.resolve', 'request.show', 'diagnostics.clean'].sort());
   for (const operation of catalogue.operations) {
     assert.ok(operation.description.trim());
     if (operation.name === 'question.ask') assert.deepEqual(operation.roles, ['worker', 'supervisor']);
@@ -39,10 +39,10 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
     else if (['supervisor.briefing', 'supervisor.note'].includes(operation.name)) assert.deepEqual(operation.roles, ['person', 'supervisor']);
     else assert.ok(operation.roles.includes(operation.name === 'host.usage' ? 'host' : 'person'));
     if (operation.name === 'host.usage') assert.deepEqual(operation.roles, ['host']);
-    if (['supervisor.start', 'context.init', 'context.configure', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'diagnostics.clean'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
+    if (['supervisor.start', 'context.init', 'context.configure', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'checks.resolve', 'profile.clear', 'diagnostics.clean'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);
     assert.deepEqual(operation.bindingDerivedFields, ['task.add', 'objective.show', 'objective.update', 'objective.complete', 'objective.abandon', 'objective.reopen', 'objective.confirm-usage', 'supervisor.start', 'supervisor.pending', 'supervisor.admitted', 'supervisor.handled', 'supervisor.briefing', 'supervisor.note'].includes(operation.name) ? ['objectiveId'] : []);
     assert.equal(operation.mutates, !['catalog.show', 'task.show', 'task.list', 'attempt.show', 'status.show', 'status.watch', 'request.show', 'objective.show', 'supervisor.briefing'].includes(operation.name));
-    assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'diagnostics.clean'].includes(operation.name));
+    assert.equal(operation.plans, ['context.configure', 'attempt.dispatch', 'attempt.continue', 'attempt.review', 'attempt.stop', 'attempt.steer', 'attempt.accept', 'attempt.rebase', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'checks.run', 'checks.resolve', 'diagnostics.clean'].includes(operation.name));
     assert.equal(operation.tool.name, `dk_${operation.name.replaceAll(".", "_")}`);
     assert.equal(operation.tool.description, operation.description);
     checkInputSchema(operation.inputSchema);

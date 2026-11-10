@@ -1,12 +1,17 @@
 import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { setImmediate } from 'node:timers/promises';
 import { heartbeatStatus } from '../../src/storage/claims.ts';
 import { confirmed, uncertain } from '../../src/adapters/command.ts';
 import type { CheckCommandResult } from '../../src/adapters/checks.ts';
-import { parseCheckPolicy } from '../../src/check-policy.ts';
+import { mandatoryChecks, parseCheckPolicy } from '../../src/check-policy.ts';
+import { canonicalJson } from '../../src/configuration.ts';
+import { executeCoreOperation } from '../../src/operations.ts';
+import { requestView } from '../../src/request-view.ts';
+import { acceptanceCheckFailure } from '../../src/storage/checks.ts';
 import { runCandidateChecks, runChecks } from '../../src/checks.ts';
 import { CommandFailure } from '../../src/response.ts';
 import { findOperation } from '../../src/catalog.ts';
@@ -88,6 +93,113 @@ test('R16/R30: checks.run reports the occupied full-check slot and resumes its p
   const result = await runChecks(f.db, input, person, 'waiting', fake.services);
   assert.deepEqual(result.steps, plan.steps);
   assert.deepEqual(fake.calls, ['fast', 'full']);
+});
+
+test('R08/R09/R16/R28/R30: exact interrupted check recovery retains diagnostics, releases only its claim and allows a new explicit run', async t => {
+  for (const state of ['claimed', 'uncertain', 'released'] as const) {
+    const f = await checkFixture(t), a = await f.attempt('task'), fake = fakeServices();
+    const admission = await f.db.beginChecks({ attemptId: a.id, commit: head,
+      checks: mandatoryChecks(parseCheckPolicy(start, policyContent, contextChecks), parseCheckPolicy(start, policyContent, contextChecks)),
+      profile, caller: person, requestKey: 'old-run' });
+    if (state !== 'claimed') await f.db.finishChecks(admission.request.id, admission.executor!, {
+      status: 'uncertain', evidenceKey: String(admission.request.input.evidenceKey),
+      commands: [{ status: 'uncertain', stderr: 'Original interrupted diagnostic', exitCode: null }] });
+    const commandFor = (key: string, input: Record<string, string | boolean>) => ({ requestKey: key,
+      operation: 'checks.resolve', caller: person, input, fingerprint: canonicalJson(input) });
+    if (state === 'released') {
+      const input = { claimId: admission.executor!.claimId, confirmStopped: true, evidence: 'Exact owner stopped', dryRun: false };
+      await f.db.resolveClaimByPerson(admission.executor!.claimId, input.evidence, person,
+        { ...commandFor('release-claim', input), operation: 'claim.resolve' });
+    }
+    const original = f.db.request(admission.request.id), originalClaims = f.db.claims();
+    assert.equal(acceptanceCheckFailure(a.id, head, original, originalClaims, f.db.requests()).nextAction?.operation, 'checks.resolve');
+    assert.equal((requestView(f.db, original).nextAction as { operation: string }).operation, 'checks.resolve');
+    const input = { checkRequestId: original.id, confirmStopped: true, evidence: 'Inspected this exact executor and its commands; all stopped', dryRun: false };
+    const resolve = (key: string, value = input) => f.db.resolveChecksByPerson(value.checkRequestId,
+      value.confirmStopped, value.evidence, value.dryRun, person, commandFor(key, value));
+    const before = { events: f.db.events(), requests: f.db.requests(), claims: f.db.claims(), attempt: f.db.attempt(a.id) };
+    const plan = await resolve('plan', { ...input, dryRun: true });
+    assert.deepEqual({ events: f.db.events(), requests: f.db.requests(), claims: f.db.claims(), attempt: f.db.attempt(a.id) }, before);
+    await assert.rejects(resolve('not-stopped', { ...input, confirmStopped: false }), /process_confirmation_required/);
+    await assert.rejects(resolve('blank', { ...input, evidence: '  ' }));
+    const result = await resolve('resolve');
+    assert.equal(validateSchema(findOperation('checks.resolve')!.outputSchema, result), null);
+    assert.deepEqual(result.steps, plan.steps);
+    const recovered = f.db.request(original.id);
+    assert.equal(recovered.state, 'withdrawn');
+    assert.deepEqual({ ...recovered, state: original.state, revision: original.revision, result: original.result }, original);
+    if (original.result) assert.deepEqual(recovered.result, original.result);
+    else assert.equal(recovered.result?.status, 'uncertain');
+    assert.ok(f.db.claim(admission.executor!.claimId).releasedAt);
+    assert.deepEqual(f.db.claims().filter(c => c.id !== admission.executor!.claimId), originalClaims.filter(c => c.id !== admission.executor!.claimId));
+    if (state === 'released') assert.deepEqual(f.db.claim(admission.executor!.claimId), originalClaims.find(c => c.id === admission.executor!.claimId));
+    assert.equal(f.db.events().filter(e => e.kind === 'checks.resolved').length, 1);
+    assert.equal((requestView(f.db, recovered).resolution as { evidence: string }).evidence, input.evidence);
+    assert.equal(acceptanceCheckFailure(a.id, head, recovered, f.db.claims(), f.db.requests()).code, 'check_missing');
+    const after = f.db.events();
+    assert.deepEqual(await resolve('resolve'), result);
+    assert.deepEqual(f.db.events(), after);
+    await assert.rejects(resolve('resolve', { ...input, evidence: 'Changed evidence' }), /different|mismatch/iu);
+    await assert.rejects(resolve('another-resolution'));
+    assert.equal((await runCandidateChecks(f.db, a.id, person, fake.services, 'old-run')).state, 'withdrawn');
+    await assert.rejects(runChecks(f.db, { attemptId: a.id, commit: head, dryRun: false }, person, 'old-run', fake.services),
+      (error: unknown) => error instanceof CommandFailure && error.code === 'check_missing');
+    assert.deepEqual(fake.calls, []);
+    const retry = await runChecks(f.db, { attemptId: a.id, commit: head, dryRun: false }, person, 'new-run', fake.services);
+    assert.equal(validateSchema(findOperation('checks.run')!.outputSchema, retry), null);
+    assert.equal(f.db.requests().find(r => r.requestKey === 'new-run')!.state, 'succeeded');
+    assert.equal(f.db.requests().find(r => r.requestKey === 'new-run')!.input.evidenceKey, original.input.evidenceKey);
+    assert.deepEqual(fake.calls, ['fast', 'full']);
+    assert.equal(f.db.request(original.id).result?.status, 'uncertain');
+  }
+});
+
+test('R08/R09/R18/R28: checks.resolve refuses unrelated, pending and mismatched scope and untrusted authority', async t => {
+  const f = await checkFixture(t), a = await f.attempt('one'), b = await f.attempt('two', ['Other criterion']);
+  const begin = (attemptId: string) => f.db.beginChecks({ attemptId, commit: head,
+    checks: parseCheckPolicy(start, policyContent, contextChecks), profile, caller: person });
+  const active = await begin(a.id), pending = await begin(b.id);
+  const operation = findOperation('checks.resolve')!;
+  const input = { checkRequestId: active.request.id, confirmStopped: true, evidence: 'Stopped exact owner', dryRun: false };
+  assert.deepEqual(operation.roles, ['person']);
+  for (const bad of [{ ...input, caller: person }, { ...input, checkRequestId: 'not-a-uuid' }, { ...input, evidence: ' ' }, { ...input, confirmStopped: 'true' }]) {
+    assert.notEqual(validateSchema(operation.inputSchema, bad), null);
+  }
+  const before = { events: f.db.events(), requests: f.db.requests(), claims: f.db.claims() };
+  for (const caller of [{ kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'objective', sessionId: 'session' }, { kind: 'worker' as const, attemptId: a.id }, host]) {
+    await assert.rejects(executeCoreOperation(operation, input, () => {}, { config: f.path }, 'denied', { caller }), /person_required/);
+  }
+  for (const request of [pending.request, f.db.requests().find(r => r.operation !== 'checks.run')!]) {
+    const value = { ...input, checkRequestId: request.id };
+    await assert.rejects(f.db.resolveChecksByPerson(request.id, true, input.evidence, false, person,
+      { requestKey: 'refused', operation: operation.name, caller: person, input: value, fingerprint: canonicalJson(value) }));
+  }
+  await assert.rejects(f.db.resolveChecksByPerson(active.request.id, true, input.evidence, false, person,
+    { requestKey: 'wrong-scope', operation: operation.name, caller: person, input: { ...input, checkRequestId: pending.request.id }, fingerprint: 'wrong' }), /scope mismatch/);
+  await assert.rejects(f.db.resolveChecksByPerson(active.request.id, true, input.evidence, false,
+    { kind: 'supervisor', id: 'supervisor', objectiveId: 'objective', sessionId: 'session' },
+    { requestKey: 'wrong-role', operation: operation.name, caller: person, input, fingerprint: canonicalJson(input) }), /person_required/);
+  assert.deepEqual({ events: f.db.events(), requests: f.db.requests(), claims: f.db.claims() }, before);
+});
+
+test('R08/R09/R16: recovery refuses mismatched persisted check claim scope without resolving anything', async t => {
+  for (const mismatch of ['role', 'resource_key', 'attempt_id', 'owner_ref'] as const) {
+    const f = await checkFixture(t), a = await f.attempt('one'), b = await f.attempt('two', ['Other criterion']);
+    const admission = await f.db.beginChecks({ attemptId: a.id, commit: head,
+      checks: parseCheckPolicy(start, policyContent, contextChecks), profile, caller: person });
+    const sql = new DatabaseSync(f.path);
+    defer(t, () => sql.close());
+    const values = { role: 'maintenance', resource_key: 'checks:another-request', attempt_id: b.id,
+      owner_ref: JSON.stringify({ kind: 'person', id: 'someone-else' }) };
+    sql.prepare(`UPDATE claims SET ${mismatch} = ? WHERE id = ?`).run(values[mismatch], admission.executor!.claimId);
+    const before = { events: f.db.events(), requests: f.db.requests(), claims: f.db.claims() };
+    for (const dryRun of [true, false]) {
+      const input = { checkRequestId: admission.request.id, confirmStopped: true, evidence: 'Scoped evidence', dryRun };
+      await assert.rejects(f.db.resolveChecksByPerson(admission.request.id, true, input.evidence, dryRun, person,
+        { requestKey: 'refused', operation: 'checks.resolve', caller: person, input, fingerprint: canonicalJson(input) }), /scope mismatch/);
+      assert.deepEqual({ events: f.db.events(), requests: f.db.requests(), claims: f.db.claims() }, before);
+    }
+  }
 });
 
 test('R15: trusted reservation freezes target checks and provenance; replay does not reread policy', async t => {

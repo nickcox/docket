@@ -48,7 +48,14 @@ function invalidResultAction(attemptId: string) {
   return action('attempt.continue', { sourceAttemptId: attemptId, sourceCommit: null, profile: null, note: null, dryRun: true },
     'Plan continuing from the retained output branch, or discard the attempt with attempt.discard.');
 }
+function checkResolutionAction(checkRequestId: string) {
+  return action('checks.resolve', { checkRequestId, confirmStopped: false,
+    evidence: 'Inspect the stopped check owner.', dryRun: true },
+    'If this run was interrupted, a person must confirm its owner has stopped before resolving this exact request.');
+}
 function attemptView(db: Database, id: string) {
+  const interruptedCheck = db.requests().find(r => r.attemptId === id && r.operation === 'checks.run'
+    && ['claimed', 'uncertain'].includes(r.state));
   const attempt = db.attempt(id), preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
   const stateDirectory = String(db.events().find(event => event.sourceKey === 'database.initialised')!.payload.stateDirectory);
   const diagnostics = workerDiagnostics(stateDirectory, db.requests().filter(r => r.attemptId === id && r.operation === 'worker.prepare'));
@@ -56,7 +63,7 @@ function attemptView(db: Database, id: string) {
     taskId: attempt.taskId, attemptId: id, leaseId: attempt.allocation?.leaseId ?? null, sessionId: preparation?.input.sessionId ?? null },
     workerRef: preparation?.result?.reference ?? null, result: db.validatedWorkerResult(id),
     resultInvalid: db.invalidWorkerResult(id),
-    nextAction: db.invalidWorkerResult(id) ? invalidResultAction(id) : null,
+    nextAction: interruptedCheck ? checkResolutionAction(interruptedCheck.id) : db.invalidWorkerResult(id) ? invalidResultAction(id) : null,
     terminalEvidence: db.events().filter(e => e.attemptId === id && e.kind === 'worker.observed' && e.payload.kind === 'terminal'),
     taskTransitionApplied: db.events().some(e => e.attemptId === id && e.kind === 'acceptance.finished'),
     acceptance: attempt.candidate ? db.acceptance(id, String(attempt.candidate.id)) : null,
@@ -159,7 +166,9 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         const requests = db.requests().filter(r => caller.kind !== 'supervisor' || (r.attemptId ? visibleTask(db.task(db.attempt(r.attemptId).taskId)) : r.objectiveId === caller.objectiveId));
         const attentionAttempts = (await Promise.all(attempts.map(async a => {
           const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
-          const checksState = String(checks?.result?.status ?? checks?.state ?? 'missing');
+          const interruptedCheck = requests.find(r => r.attemptId === a.id && r.operation === 'checks.run'
+            && ['claimed', 'uncertain'].includes(r.state));
+          const checksState = checks?.state === 'withdrawn' ? 'interrupted' : String(checks?.result?.status ?? checks?.state ?? 'missing');
           const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
           const resolved = a.leaseState === 'returned' || db.task(a.taskId).state === 'done'
             || db.events().some(e => e.attemptId === a.id && e.kind === 'return.authorised' && e.payload.discard);
@@ -172,7 +181,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
             : a.leaseState === 'held' ? 'Lease is held.'
             : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null);
-          const nextAction = invalidResult && !resolved ? invalidResultAction(a.id) : reason === null ? null
+          const nextAction = interruptedCheck ? checkResolutionAction(interruptedCheck.id)
+            : invalidResult && !resolved ? invalidResultAction(a.id) : reason === null ? null
             : returnReason ? action('attempt.return', { attemptId: a.id, dryRun: true }, `Resolve the return condition (${returnReason}), then plan returning the lease.`)
             : checksState === 'failed' || checksState === 'uncertain' ? action('attempt.show', { attemptId: a.id }, 'Inspect check evidence before retrying or resolving uncertainty.')
             : a.candidate && !accepted ? action('attempt.accept', { attemptId: a.id, candidateCommit: a.candidate.commit, overrideReason: null, dryRun: true }, 'Inspect the acceptance plan for this candidate.')
@@ -318,6 +328,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         if (args.dryRun) return plan;
         return { attempt: await returnAttempt(db, returns, completion), leaseReturn: { state: 'returned', reason: null }, ...plan };
       }
+      case 'checks.resolve': return await db.resolveChecksByPerson(String(args.checkRequestId), Boolean(args.confirmStopped),
+        String(args.evidence), Boolean(args.dryRun), caller, command);
       case 'claim.resolve': {
         if (!args.confirmStopped) throw new CommandFailure('process_confirmation_required');
         const claim = db.claim(String(args.claimId));

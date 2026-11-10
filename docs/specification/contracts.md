@@ -128,6 +128,7 @@ The operation-specific schema for ordinary task.add restricts kind to code/repor
 | attempt.discard | attemptId:UUID, confirmDiscard:boolean, reason:Text, dryRun:boolean | Person only |
 | effect.resolve | effectId:UUID, outcome:happened\|not_happened, evidence:Text, confirmStopped:boolean, dryRun:boolean | Person; specialised owner read must still agree |
 | claim.resolve | claimId:UUID, confirmStopped:boolean, evidence:Text, dryRun:boolean | Person; stale alone insufficient |
+| checks.resolve | checkRequestId:UUID, confirmStopped:boolean, evidence:Text, dryRun:boolean | Person only; withdraw the exact abandoned claimed or uncertain checks.run and release only its matching check_executor claim, retaining historical uncertainty |
 | request.show | requestId:String | Scoped read of the exact public replay key |
 | checks.run | attemptId:UUID, commit:Commit, dryRun:boolean | Person/supervisor; runs the checks for a recorded candidate of a terminal attempt that has no matching result, for example an explicitly selected commit or a new run after a failure |
 | question.ask | text:Text, choices:String[]\|null, waiting:boolean | Worker/supervisor; recipient derived from binding |
@@ -184,7 +185,9 @@ budget_reached usage_unknown metric_unsupported deadline_reached
 process_confirmation_required discard_confirmation_required
 ~~~
 
-Acceptance blocked by pending or claimed checks refuses with checks_waiting, naming the check request, its state and the current check-slot holders, with retrying acceptance as the next action. check_failed means a recorded check result failed; missing evidence uses check_missing and uncertain checks use effect_uncertain.
+Acceptance blocked by pending or claimed checks refuses with checks_waiting, naming the check request, its state and the current check-slot holders. Pending checks suggest retrying acceptance; claimed and uncertain checks offer person-only checks.resolve if the run was interrupted, requiring inspection and stopped-owner confirmation rather than authorising recovery automatically. check_failed means a recorded check result failed; missing evidence uses check_missing and uncertain checks use effect_uncertain. A resolved withdrawn run supplies no passing evidence and uses check_missing even though its historical result remains uncertain.
+
+checks.resolve returns {request,steps,scope}, where scope names checkRequestId, claimId, generation and ownerRef. It requires confirmStopped:true, nonblank evidence and an exact claimed/uncertain checks.run with its own matching check_executor claim, including an already explicitly released matching claim. It refuses pending unclaimed or unrelated requests and mismatched scope. Resolution records checks.resolved evidence and changes the original request to withdrawn, preserving its identity, inputs and diagnostic result. If no result existed, it records status uncertain, the original evidenceKey, empty commands and an unknown-outcome reason, not a test failure or proof that nothing ran. It neither invokes commands nor resolves other claims/effects. A new checks.run key may run again; the withdrawn key never does. Matching resolution replay returns the recorded decision; changed input under the same key refuses. Dry runs validate the same prerequisites without changes. request.show includes bounded resolution evidence and a recovery nextAction for interrupted checks.
 
 Expected refusal data names the blocking identity/evidence and next action. Unknown reads before effects can be retried; after intent they produce effect_uncertain, not a generic retry suggestion. Internal failure must expose any known committed request/attempt, never assert that nothing changed.
 

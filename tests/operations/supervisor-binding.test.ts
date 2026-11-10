@@ -44,7 +44,7 @@ test('R17/R28/A37/A52: generated role catalogues and strict bound schemas expose
     assert.deepEqual(tools.map(o => o.name), catalogue.operations.filter(o => o.roles.includes(role)).map(o => o.name));
     for (const operation of tools) assert.ok(operation.description && operation.tool.description);
   }
-  for (const forbidden of ['task.move', 'objective.update', 'objective.add', 'objective.abandon', 'attempt.return', 'attempt.discard', 'effect.resolve', 'claim.resolve', 'profile.clear', 'context.configure']) {
+  for (const forbidden of ['task.move', 'objective.update', 'objective.add', 'objective.abandon', 'attempt.return', 'attempt.discard', 'effect.resolve', 'claim.resolve', 'checks.resolve', 'profile.clear', 'context.configure']) {
     assert.ok(!f.binding.catalogue.operations.some(o => o.name === forbidden));
     await assert.rejects(f.binding.execute(forbidden, {}), code('person_required'));
   }
