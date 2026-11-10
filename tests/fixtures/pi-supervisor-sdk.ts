@@ -1,5 +1,7 @@
 // Synthetic SDK exercises the actual private supervisor entrypoint, without a provider.
 import { appendFileSync } from 'node:fs';
+// Model a cold SDK import before the private entrypoint can read its first request.
+if (process.env.PEER_MODE === 'slow-sdk') await new Promise(resolve => setTimeout(resolve, 500));
 const log = (value: unknown) => appendFileSync(process.env.PEER_RECORD!, `${JSON.stringify(value)}\n`);
 export const ModelRuntime = { create: async () => ({ getModel: (provider: string, id: string) => ({ provider, id }) }) };
 export const SettingsManager = { inMemory: (settings: unknown) => { log({ kind: 'settings', settings }); return settings; } };

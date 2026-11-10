@@ -31,7 +31,7 @@ async function fixture(t: test.TestContext, mode = 'normal') {
   const binding = createBinding(person, { config: file }, { home,
     keepAwake: () => { power.starts++; if (mode === 'helper-failure') throw new Error('Synthetic helper failure'); return () => { power.stops++; }; },
     supervisorPeer: async () => {
-    const peer = new PiSupervisor({ stateDirectory: join(home, 'supervisors'), requestMs: 300,
+    const peer = new PiSupervisor({ stateDirectory: join(home, 'supervisors'), ...(mode === 'lost-ack' ? { requestMs: 300 } : {}),
       profile: { provider: 'synthetic', model: 'synthetic', reasoning: null },
       execution: { executable: process.execPath, ...(mode === 'sdk' ? { sdkModule: resolve('tests', 'fixtures', 'pi-supervisor-sdk.ts') }
         : { entrypoint: resolve('tests', 'fixtures', 'pi-supervisor-peer.ts') }), passEnvironment: ['PEER_RECORD', 'PEER_MODE'] },
@@ -77,7 +77,7 @@ test('R19/A57: another active objective supervisor is refused, including a concu
   const f = await fixture(t, 'running');
   const starting = f.binding.execute('supervisor.start', args, 'first').catch(error => { assert.ok(refusal('effect_uncertain')(error)); });
   // Observe the direct peer rather than assuming that registration means a prompt ran.
-  for (let i = 0; i < 200 && !(await f.records()).some(r => r.type === 'prompt'); i++) await new Promise(resolve => setTimeout(resolve, 10));
+  for (let i = 0; i < 6000 && !(await f.records()).some(r => r.type === 'prompt'); i++) await new Promise(resolve => setTimeout(resolve, 10));
   assert.ok((await f.records()).some(r => r.type === 'prompt'));
   await assert.rejects(f.binding.execute('supervisor.start', { ...args, objectiveId: 'other' }, 'second'), refusal('owner_unresolved'));
   await f.peers[0]!.stop();
@@ -133,6 +133,21 @@ test('R35/A57: keep-awake failure warns without preventing supervision', async t
   await f.binding.execute('supervisor.start', args);
   assert.equal(f.power.starts, 1);
   assert.ok(f.db.events().some(e => e.kind === 'supervisor.note'));
+});
+
+test('R35/A57: cold SDK preparation has a separate limit from ordinary requests', async t => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-supervisor-cold-')));
+  defer(t, () => rm(home, { recursive: true, force: true }));
+  const peer = new PiSupervisor({ stateDirectory: join(home, 'supervisors'), requestMs: 100,
+    profile: { provider: 'synthetic', model: 'synthetic', reasoning: null },
+    execution: { executable: process.execPath, sdkModule: resolve('tests', 'fixtures', 'pi-supervisor-sdk.ts'),
+      passEnvironment: ['PEER_RECORD', 'PEER_MODE'] },
+    environment: { PEER_RECORD: join(home, 'peer.jsonl'), PEER_MODE: 'slow-sdk' } });
+  defer(t, async () => { await peer.stop(); });
+  // The SDK import alone waits 500 ms, longer than the ordinary 100 ms limit.
+  // Preparation must still validate the session and restrictions without retrying.
+  await peer.prepare('cold-start', [], async () => ({}));
+  assert.equal(peer.exited, false);
 });
 
 test('R23/R35/A57: private SDK path removes built-ins and resource discovery, bridges questions, and filters actual model context', async t => {

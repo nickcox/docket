@@ -27,7 +27,7 @@ export class PiSupervisor implements SupervisorPeer {
   private stopping?: Promise<boolean>;
   private directory?: string;
   private options: { stateDirectory: string; execution: PiExecutionProfile; profile: JsonObject;
-    environment?: NodeJS.ProcessEnv; requestMs?: number };
+    environment?: NodeJS.ProcessEnv; startupMs?: number; requestMs?: number };
   constructor(options: PiSupervisor['options']) {
     this.options = structuredClone(options);
     const execution = options.execution;
@@ -89,7 +89,11 @@ export class PiSupervisor implements SupervisorPeer {
       }
     });
     await this.rpc.started;
-    const state = await this.rpc.request('get_state', {}, this.requestMs) as Record<string, unknown>;
+    // Spawn only confirms the process exists. The first response also waits for SDK
+    // import, model runtime and session creation before the child reads stdin.
+    // Allow 60 seconds for that cold start, separately from ordinary 5-second RPCs.
+    // This is one request, not a retry; prompt acknowledgements keep their own limit.
+    const state = await this.rpc.request('get_state', {}, this.options.startupMs ?? 60_000) as Record<string, unknown>;
     const tools = operations.map(o => o.tool.name).sort();
     if (state.sessionId !== sessionId || state.provider !== profile.provider || state.model !== profile.model
       || state.isStreaming !== false || JSON.stringify(state.tools) !== JSON.stringify(tools)) throw new Error('Supervisor restriction/binding mismatch');
