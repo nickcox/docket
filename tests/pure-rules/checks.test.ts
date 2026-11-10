@@ -16,7 +16,7 @@ test("R29: repository checks declare types as fast and tests as full", () => {
     {
       name: "tests",
       command: ["npm", "test"],
-      timeoutMs: 300000,
+      timeoutMs: 600000,
     },
   ]);
 });

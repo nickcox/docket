@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { commandRunner } from './command.ts';
+import { windowsPowerShellEnvironment } from './host-files.ts';
 import type { CheckDefinition } from '../storage/reservations.ts';
 import type { JsonObject } from '../storage/database.ts';
 
@@ -25,7 +27,7 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
   return (check, workspace) => new Promise(resolve => {
     let stdout = '', stderr = '', stdoutTruncated = false, stderrTruncated = false, timedOut = false, spawnFailed = false;
     const child = spawn(check.command[0]!, check.command.slice(1), { cwd: workspace, env, shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     child.stdout.setEncoding('utf8').on('data', (text: string) => {
       if (stdout.length + text.length > 65536) stdoutTruncated = true;
       stdout = (stdout + text).slice(0, 65536);
@@ -35,15 +37,37 @@ export function checkCommandRunner(environment: NodeJS.ProcessEnv, secrets: read
       stderr = (stderr + text).slice(0, 65536);
     });
     child.once('error', () => { spawnFailed = true; });
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, check.timeoutMs);
+    let termination: Promise<void> | undefined;
+    async function stopTree(): Promise<void> {
+      if (child.pid === undefined) return;
+      if (process.platform === 'win32') {
+        const result = await commandRunner({ environment: windowsPowerShellEnvironment(env), timeoutMs: 5000 })(
+          'taskkill', ['/pid', String(child.pid), '/T', '/F'], workspace);
+        if (!result.complete || result.code !== 0) stderr = (stderr + '\nCould not stop the check process tree').slice(0, 65536);
+        return;
+      }
+      const signalGroup = (signal: NodeJS.Signals) => {
+        try { process.kill(-child.pid!, signal); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') stderr = (stderr + '\nCould not signal the check process group').slice(0, 65536);
+        }
+      };
+      signalGroup('SIGTERM');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      // The leader may already have exited, but descendants can still ignore SIGTERM.
+      signalGroup('SIGKILL');
+    }
+    const timer = setTimeout(() => { timedOut = true; termination = stopTree(); }, check.timeoutMs);
     // If descendants keep the pipes open, their existence is uncertain, not a pass.
     let drain: NodeJS.Timeout | undefined, pipesOpen = false;
     child.once('exit', () => {
       clearTimeout(timer);
       drain = setTimeout(() => { pipesOpen = true; child.stdout.destroy(); child.stderr.destroy(); }, 500);
     });
-    child.once('close', (code, signal) => {
+    child.once('close', async (code, signal) => {
       clearTimeout(timer); clearTimeout(drain);
+      // Do not return early when a descendant has closed or redirected its pipes.
+      await termination;
       // Suppress an overflowing stream rather than retaining a credential cut at the buffer boundary.
       const out = stdoutTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stdout, redactions);
       const err = stderrTruncated ? '[output exceeded diagnostic limit]' : redactDiagnostics(stderr, redactions);

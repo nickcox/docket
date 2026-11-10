@@ -4,6 +4,6 @@
     { "name": "types", "command": ["npm", "run", "check"], "timeoutMs": 120000, "goalMs": 10000 }
   ],
   "full": [
-    { "name": "tests", "command": ["npm", "test"], "timeoutMs": 300000 }
+    { "name": "tests", "command": ["npm", "test"], "timeoutMs": 600000 }
   ]
 }

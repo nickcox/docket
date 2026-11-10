@@ -10,6 +10,7 @@ import { confirmed } from '../../src/adapters/command.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { runCandidateChecks } from '../../src/checks.ts';
 import { checkFixture, contextChecks, head, person, profile, start } from '../helpers/check-attempt.ts';
+import { defer } from '../helpers/cleanup.ts';
 
 const check = (script: string, timeoutMs = 2000) => ({ name: 'command', command: [process.execPath, '-e', script], timeoutMs });
 const environment = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
@@ -43,6 +44,49 @@ test('R16/A35: timeout fails, spawn failure does not run, and self-kill uses the
   assert.equal(signal.exitCode, process.platform === 'win32' ? 1 : null);
   const failure = await run(check('process.exit(1)'), root);
   assert.equal(failure.status, 'failed'); assert.equal(failure.exitCode, 1);
+});
+
+test('R16/A35: timeout stops the whole tree, including a descendant ignoring SIGTERM with inherited or closed pipes', async t => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-timeout-tree-'));
+  defer(t, () => rm(root, { recursive: true, force: true }));
+  for (const pipes of ['inherit', 'ignore']) {
+    const pidFile = join(root, `${pipes}.json`);
+    defer(t, async () => {
+      const pids: number[] = JSON.parse(await readFile(pidFile, 'utf8').catch(() => '[]'));
+      for (const pid of pids) {
+        try { process.kill(pid, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+    });
+    const descendant = "process.on('SIGTERM', () => {}); process.send('ready'); setTimeout(() => process.exit(0), 15000)";
+    const script = `const { spawn } = require('node:child_process');
+      const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}],
+        { stdio: ['ignore', ${pipes === 'inherit' ? '1, 2' : "'ignore', 'ignore'"}, 'ipc'] });
+      child.once('message', () => {
+        require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, child.pid]));
+        child.disconnect();
+      });
+      setInterval(() => {}, 1000);`;
+    const result = await checkCommandRunner(environment)(check(script, 3000), root);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.status, 'failed');
+    const pids: number[] = JSON.parse(await readFile(pidFile, 'utf8'));
+    assert.equal(pids.length, 2, 'both processes started before the timeout');
+    async function running(pid: number): Promise<boolean> {
+      try { process.kill(pid, 0); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; }
+      // A killed orphan can await reaping by init on Linux; it cannot execute or hold pipes.
+      if (process.platform === 'linux') {
+        const stat = await readFile(join('/proc', String(pid), 'stat'), 'utf8').catch(() => '');
+        return stat !== '' && !/^.*\) Z /.test(stat);
+      }
+      return true;
+    }
+    for (const pid of pids) {
+      for (let tries = 0; tries < 100 && await running(pid); tries++) await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(await running(pid), false, `check process ${pid} stopped`);
+    }
+  }
 });
 
 test('R16/A35: crashes fail and interruptions stay uncertain with observed termination diagnostics', async t => {
