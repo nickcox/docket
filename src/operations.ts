@@ -54,6 +54,7 @@ function attemptView(db: Database, id: string) {
     taskTransitionApplied: db.events().some(e => e.attemptId === id && e.kind === 'acceptance.finished'),
     acceptance: attempt.candidate ? db.acceptance(id, String(attempt.candidate.id)) : null,
     review: db.reviewEvidence(id),
+    checks: db.requests().filter(r => r.attemptId === id && r.operation === 'checks.run'),
     effects: db.requests().filter(r => r.attemptId === id && r.category === 'effect') };
 }
 function mapStorage(error: unknown, db: Database, requestKey: string): never {
@@ -131,6 +132,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         return { events: events.map(notificationView), sequence: events.at(-1)?.seq ?? Number(args.afterSequence) };
       }
       case 'supervisor.handled': return await db.acknowledgeNotifications(String(args.objectiveId), args.eventIds as string[], null, command);
+      case 'supervisor.briefing': return { briefing: db.supervisorBriefing(String(args.objectiveId), caller) };
+      case 'supervisor.note': return { note: await db.supervisorNote(String(args.objectiveId), String(args.text), caller, command) };
       case 'question.answer': return { question: await db.answerQuestion(String(args.questionId), String(args.text), caller, command) };
       case 'diagnostics.clean': return await cleanDiagnostics(db, args as unknown as Parameters<typeof cleanDiagnostics>[1], caller, requestKey);
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
@@ -197,14 +200,14 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
               ? action('claim.resolve', { claimId: b.claimId, confirmStopped: false, evidence: 'Owner inspection is required.', dryRun: true }, 'Inspect the exact owner and obtain stopped-owner evidence before resolving the claim.')
               : action('request.show', { requestId: db.request(b.requestId).requestKey }, 'Inspect the external owner before choosing an effect outcome and supplying evidence.') }),
           objectives: db.objectives().filter(o => caller.kind !== 'supervisor' || o.id === caller.objectiveId)
-            .map(o => ({ ...o, usage: db.objectiveUsage(o.id) })), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor'
+            .map(o => ({ ...o, usage: db.objectiveUsage(o.id), personActions: db.personActions(o.id) })), openPersonQuestions: db.questions().filter(q => !q.answer && (caller.kind !== 'supervisor'
             || q.scope.objectiveId === caller.objectiveId && (q.scope.taskId === null || visibleTask(db.task(q.scope.taskId))))).map(q => ({ ...q,
             reason: q.waiting ? 'The asker is waiting for an answer.' : 'Question is unanswered.',
             nextAction: action('question.answer', { questionId: q.id, text: '<answer>' }, 'Answer this question; only a person may answer a question addressed to a person.') })) };
       }
       case 'request.show': return requestView(db, db.requestByKey(String(args.requestId), caller));
       case 'objective.add': return { objective: await db.addObjective(args as unknown as Parameters<Database['addObjective']>[0], caller, command) };
-      case 'objective.show': return { objective: { ...db.objective(String(args.objectiveId), caller), usage: db.objectiveUsage(String(args.objectiveId)) } };
+      case 'objective.show': return { objective: { ...db.objective(String(args.objectiveId), caller), usage: db.objectiveUsage(String(args.objectiveId)), personActions: db.personActions(String(args.objectiveId)) } };
       case 'objective.confirm-usage': return { objective: await db.confirmUsage(String(args.objectiveId), args.sessionGaps as import('./usage.ts').UsageGap[], String(args.reason), caller, command) };
       case 'objective.update': return { objective: await db.updateObjective(String(args.objectiveId), Number(args.expectedRevision), args as unknown as ObjectiveDefinition, caller, command) };
       case 'objective.complete': return { objective: await db.completeObjective(String(args.objectiveId),

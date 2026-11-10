@@ -13,6 +13,7 @@ import { addTaskInput, taskActor, taskDefinition, taskIds, taskSlug, taskText } 
 import { questionInput } from './questions.ts';
 import type { Question, QuestionCaller, QuestionInput } from './questions.ts';
 import { supervisorPermissions } from '../authority.ts';
+import { buildBriefing } from '../briefing.ts';
 import { objectiveDefinition, permissions, unlimitedBudget } from './objectives.ts';
 import type { CompletionStatement, CompletionReference, Objective, ObjectiveDefinition } from './objectives.ts';
 import { usageSummary, validateReport, enforceBudget, budgetReason, metrics } from '../usage.ts';
@@ -708,14 +709,83 @@ export class Database {
     });
   }
 
+  private personActionScope(command: CommandInput, attemptId?: string): JsonObject[] {
+    if (command.caller.kind !== 'person' || command.operation === 'attempt.return' && command.input.automatic === true) return [];
+    const input = command.input, ids = new Set<string>();
+    const taskIds = [input.taskId, input.blockerId, ...((input.orderedTaskIds ?? []) as string[])].filter((id): id is string => typeof id === 'string');
+    const claim = typeof input.claimId === 'string' ? this.claim(input.claimId) : null;
+    const effect = typeof input.effectId === 'string' ? this.request(input.effectId) : null;
+    if (claim?.objectiveId) ids.add(claim.objectiveId);
+    if (effect?.objectiveId) ids.add(effect.objectiveId);
+    for (const id of [attemptId, input.attemptId, input.sourceAttemptId, claim?.attemptId, effect?.attemptId]) {
+      if (typeof id === 'string') taskIds.push(String(this.attemptRow(id).task_id));
+    }
+    for (const id of taskIds) {
+      const objectiveId = this.taskRow(id).objective_id;
+      if (typeof objectiveId === 'string') ids.add(objectiveId);
+    }
+    if (typeof input.objectiveId === 'string') ids.add(input.objectiveId);
+    if (command.operation === 'objective.add' && typeof input.id === 'string') ids.add(input.id);
+    const question = command.operation === 'question.answer' ? this.questions().find(q => q.id === input.questionId) : null;
+    if (question?.scope.objectiveId) ids.add(question.scope.objectiveId);
+    // A repeated answer is the same logical action, even with a new replay key.
+    if (question?.answer) return [];
+    return [...ids].map(objectiveId => {
+      const row = this.db.prepare('SELECT state FROM objectives WHERE id = ?').get(objectiveId);
+      const registered = this.events().some(e => e.kind === 'session.registered' && e.payload.kind === 'supervisor' && e.payload.objectiveId === objectiveId);
+      const classification = question?.recipient.kind === 'person' ? 'intervention'
+        : command.operation === 'attempt.return' ? 'clean-up'
+        : row && row.state !== 'open' ? 'clean-up' : registered ? 'intervention' : 'setup';
+      return { objectiveId, classification, members: this.tasks().filter(t => t.objectiveId === objectiveId).map(t => t.id) };
+    });
+  }
+
+  private recordPersonActions(command: CommandInput, scopes: JsonObject[]): void {
+    if (!scopes.length) return;
+    this.insertEvent({ sourceKey: `person.action:${command.requestKey}`, kind: 'person.action',
+      payloadVersion: 1, correlationId: command.requestKey, actor: command.caller,
+      occurredAt: new Date().toISOString(), notification: true,
+      payload: { scopes, operation: command.operation, requestKey: command.requestKey } });
+  }
+
+  supervisorBriefing(objectiveId: string, actor: TaskActor) {
+    return this.snapshot(() => buildBriefing(this, objectiveId, actor));
+  }
+
+  personActions(objectiveId: string) {
+    return this.snapshot(() => {
+      const items: StoredEvent[] = this.events().filter(e => e.kind === 'person.action').flatMap(e => {
+        const scope = (e.payload.scopes as JsonObject[]).find(s => s.objectiveId === objectiveId);
+        return scope ? [{ ...e, objectiveId, payload: { ...scope, operation: e.payload.operation!, requestKey: e.payload.requestKey! } }] : [];
+      });
+      const counts = { setup: 0, intervention: 0, 'clean-up': 0 };
+      for (const event of items) counts[event.payload.classification as keyof typeof counts]++;
+      return { count: items.length, counts, recent: items.slice(-3).reverse() };
+    });
+  }
+
+  async supervisorNote(objectiveId: string, text: string, actor: TaskActor, command: CommandInput) {
+    nonblank(text);
+    return this.writeTask(command, () => {
+      this.objective(objectiveId, actor);
+      this.checkAuthority(actor, 'supervisor.note', { objectiveId });
+      const id = randomUUID();
+      this.insertEvent({ sourceKey: `supervisor.note:${id}`, kind: 'supervisor.note', payloadVersion: 1,
+        correlationId: id, objectiveId, actor, occurredAt: new Date().toISOString(), notification: true, payload: { text } });
+      return { id, text };
+    });
+  }
+
   private writeTask<T>(command: CommandInput | undefined, change: () => T): Promise<T> {
     if (command) commandInput(command);
     return this.write(() => {
       if (command) this.checkAuthority(command.caller as TaskActor, command.operation, command.input);
       const previous = command && this.duplicateRequest(command, 'command');
       if (previous) return previous.result!.value as T;
+      const actions = command ? this.personActionScope(command) : [];
       const value = change();
       if (command) {
+        this.recordPersonActions(command, actions);
         const id = randomUUID();
         this.db.prepare(`INSERT INTO requests (id, request_key, category, operation, caller, fingerprint, input, target, state, result, created_at)
           VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', 'succeeded', ?, ?)`)
@@ -1428,7 +1498,7 @@ export class Database {
         if (dryRun) return { requestId: randomUUID(), replayed: false, skippedTasks, attempt: { id, taskId: task.id, number, revision: 1,
           executionOpen: true, phase: 'reserved', launchState: 'pending', specification, allocation: null,
           leaseState: 'none', outcome: null, candidate: null } };
-        const requestId = this.recordCommandInTransaction(command).id;
+        const requestId = this.recordCommandInTransaction(command, undefined, task.id).id;
         this.db.prepare(`INSERT INTO attempts (id, task_id, objective_id, number, phase, specification, output_ref, created_at)
           VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)`).run(id, task.id, task.objectiveId, number, json(specification), outputRef, now);
         this.bindCommandInTransaction(requestId, id, { skippedTasks });
@@ -2914,7 +2984,7 @@ export class Database {
     return this.write(() => this.recordCommandInTransaction(value));
   }
 
-  private recordCommandInTransaction(input: CommandInput, attemptId?: string): StoredRequest {
+  private recordCommandInTransaction(input: CommandInput, attemptId?: string, taskId?: string): StoredRequest {
     commandInput(input);
     const value: CommandInput = { ...JSON.parse(json(input)) as CommandInput, caller: object(input.caller), input: object(input.input) };
     if (value.caller.kind === 'supervisor') this.checkAuthority(value.caller as TaskActor, value.operation, value.input);
@@ -2926,6 +2996,7 @@ export class Database {
       VALUES (?, ?, 'command', ?, ?, ?, ?, '{}', ?, ?, ?)`)
       .run(id, value.requestKey, value.operation, json(value.caller), value.fingerprint, json(value.input), attemptId ?? null, objectiveId, new Date().toISOString());
     const request = this.decodeRequest(this.requestRow(id));
+    this.recordPersonActions(value, this.personActionScope(taskId ? { ...value, input: { ...value.input, taskId } } : value, attemptId));
     this.storageEvent('request.recorded', value.caller, { request: object(request) }, id);
     return request;
   }

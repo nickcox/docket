@@ -4,7 +4,7 @@ import type { Permissions } from './storage/objectives.ts';
 export const supervisorPermissions: Readonly<Record<string, keyof Permissions | null>> = {
   'supervisor.handled': null,
   'question.ask': null, 'question.answer': 'answerQuestions',
-  'status.show': null, 'request.show': null, 'task.show': null, 'task.list': null, 'attempt.show': null, 'objective.show': null,
+  'supervisor.briefing': null, 'supervisor.note': null, 'status.show': null, 'request.show': null, 'task.show': null, 'task.list': null, 'attempt.show': null, 'objective.show': null,
   'task.add': 'manageTasks', 'task.update': 'manageTasks', 'task.hold': 'manageTasks', 'task.release': 'manageTasks',
   'task.block': 'manageTasks', 'task.unblock': 'manageTasks', 'task.reorder': 'manageTasks', 'task.reopen': 'manageTasks',
   'objective.complete': 'completeObjective', 'task.done': 'completeTasks', 'objective.reopen': 'manageTasks', 'attempt.dispatch': 'dispatch',

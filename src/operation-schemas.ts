@@ -49,6 +49,8 @@ function outputSchema(name: string): JsonSchema {
     eventIds: { type: 'array', maxItems: 20, items: uuid }, events: notifications, admitted: bool, handledSequence: { type: 'integer', minimum: 0 } });
   if (name === 'supervisor.admitted' || name === 'supervisor.handled') return object({ deliveryRequestId: nullable(uuid),
     eventIds: { type: 'array', maxItems: 20, items: uuid }, handledSequence: { type: 'integer', minimum: 0 } });
+  if (name === 'supervisor.briefing') return object({ briefing: view });
+  if (name === 'supervisor.note') return object({ note: view });
   if (name.startsWith('question.')) return object({ question: view });
   if (name === 'context.configure') return object({ revision: { type: 'integer', minimum: 1 }, digest: string,
     changedFields: { type: 'array', items: string }, steps });
@@ -72,7 +74,7 @@ function outputSchema(name: string): JsonSchema {
   if (name === 'task.reorder') return object({ tasks: { type: 'array', items: view } });
   if (name.startsWith('task.')) return object({ task: view });
   if (name === 'attempt.show') return { type: 'object', required: ['identity', 'phase', 'executionOpen', 'specification', 'allocation', 'candidate', 'terminalEvidence', 'outcome', 'leaseState', 'revision'],
-    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'resultInvalid', 'nextAction', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'review', 'effects'].map(key => [key, {}])), additionalProperties: false };
+    properties: Object.fromEntries(['id', 'taskId', 'number', 'revision', 'executionOpen', 'phase', 'launchState', 'specification', 'allocation', 'leaseState', 'outcome', 'candidate', 'identity', 'workerRef', 'result', 'resultInvalid', 'nextAction', 'terminalEvidence', 'taskTransitionApplied', 'acceptance', 'review', 'checks', 'effects'].map(key => [key, {}])), additionalProperties: false };
   if (name === 'status.show') return object({ contextId: string, databaseId: string, configurationRevision: { type: 'integer' }, migrationState: string,
     limitedProfiles: { type: 'array', items: view }, capacity: view, tasks: paginated(statusTask), attempts: paginated(statusAttempt), page: object({ next: nullable(string), total: { type: 'integer', minimum: 0 } }), claims: { type: 'array', items: view }, effects: { type: 'array', items: view },
     blockers: { type: 'array', items: view }, objectives: { type: 'array', items: view }, openPersonQuestions: { type: 'array', items: view } });
@@ -110,6 +112,8 @@ export const coreOperations: OperationDefinition[] = [
   operation('supervisor.pending', 'Recover or reserve a durable ordered delivery batch.', { objectiveId: id, afterSequence: sequence, timeoutMs: timeout }, true, ['host']),
   operation('supervisor.admitted', 'Confirm that the host admitted the exact delivery to its conversation.', { objectiveId: id, deliveryRequestId: uuid, eventIds }, true, ['host']),
   operation('supervisor.handled', 'Mark a contiguous admitted batch processed by the supervisor.', { objectiveId: id, eventIds }, true, ['supervisor']),
+  operation('supervisor.briefing', 'Read the compact objective briefing and references to full attempt evidence.', { objectiveId: id }, false),
+  operation('supervisor.note', 'Record an objective note for later supervisor sessions.', { objectiveId: id, text: string }),
   operation('question.ask', 'Ask an immutable question with a binding-derived recipient.', { text: string, choices: nullable({ type: 'array', items: { type: 'string' } }), waiting: bool }, true, ['worker', 'supervisor']),
   operation('question.answer', 'Record an answer and its independent delivery requests.', { questionId: uuid, text: string }),
   operation('context.configure', 'Validate and apply the selected configuration while quiescent.', { dryRun: bool }, true, ['person']),
