@@ -9,11 +9,13 @@ import type { ContextSelector } from './context.ts';
 import { StorageError } from './storage/database.ts';
 import { validateSchema } from './operation-schemas.ts';
 import { randomUUID } from 'node:crypto';
+import type { WatchOutput } from './operations.ts';
 
 export const MAX_RESPONSE_BYTES = 256 * 1024;
 export const MAX_INPUT_BYTES = 256 * 1024;
 
 export interface CliIO {
+  outputSignal?: AbortSignal;
   readFile(path: string): Promise<string>;
   readStdin(): Promise<string>;
   stdout(text: string): void;
@@ -26,6 +28,7 @@ export type OperationRunner = (
   progress: (message: string) => void,
   selector?: ContextSelector,
   requestId?: string,
+  watch?: WatchOutput,
 ) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
 interface Options {
@@ -123,21 +126,17 @@ export async function runCli(
       const writeLine = (line: string) => {
         try { io.stdout(line); } catch (error) { watchPipeBroken = true; throw error; }
       };
-      const deadline = Date.now() + Number(args.timeoutMs ?? 30000);
-      let sequence = Number(args.afterSequence);
-      do {
-        const page = await runOperation(definition, { afterSequence: sequence, timeoutMs: 0 },
-          message => io.stderr(`${message}\n`), options.selector, requestId ?? undefined);
-        for (const event of page.events as { sequence: number }[]) {
-          const line = `${JSON.stringify({ ...successEnvelope(operation, requestId, { event }), sequence: event.sequence })}\n`;
-          if (Buffer.byteLength(line, 'utf8') > MAX_RESPONSE_BYTES) throw new CommandFailure('response_too_large');
-          writeLine(line);
-          sequence = event.sequence;
-        }
-        if (Date.now() >= deadline) break;
-        await new Promise(resolve => setTimeout(resolve, Math.min(25, deadline - Date.now())));
-      } while (Date.now() < deadline);
-      writeLine(`${JSON.stringify({ ...successEnvelope(operation, requestId, { final: true }), sequence })}\n`);
+      const result = await runOperation(definition, args,
+        message => io.stderr(`${message}\n`), options.selector, requestId ?? undefined, {
+          signal: io.outputSignal,
+          event: event => {
+            const line = `${JSON.stringify({ ...successEnvelope(operation, requestId, { event }), sequence: event.sequence })}\n`;
+            if (Buffer.byteLength(line, 'utf8') > MAX_RESPONSE_BYTES) throw new CommandFailure('response_too_large');
+            writeLine(line);
+          },
+        });
+      io.outputSignal?.throwIfAborted();
+      writeLine(`${JSON.stringify({ ...successEnvelope(operation, requestId, { final: true }), sequence: result.sequence })}\n`);
       return 0;
     }
     const data = await runOperation(definition, args, (message) => io.stderr(`${message}\n`), options.selector, requestId ?? undefined);
@@ -147,7 +146,7 @@ export async function runCli(
     output = `${JSON.stringify(envelope)}\n`;
     if (Buffer.byteLength(output, "utf8") > MAX_RESPONSE_BYTES) throw new CommandFailure("response_too_large");
   } catch (error) {
-    if (watchPipeBroken) {
+    if (watchPipeBroken || operation === 'status.watch' && io.outputSignal?.aborted) {
       io.stderr('Unable to write the watch stream.\n');
       return 3;
     }

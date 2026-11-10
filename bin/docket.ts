@@ -16,12 +16,17 @@ async function readInput(stream: Readable): Promise<string> {
 }
 
 // A broken pipe cannot be repaired by printing a second envelope.
-process.stdout.on("error", () => {
+const outputController = new AbortController();
+process.stdout.on("error", error => {
+  outputController.abort(error);
   process.exitCode = 3;
-  process.stderr.write("Unable to write the response; do not infer absence of effects.\n");
+  if (process.argv[2] !== 'status' || process.argv[3] !== 'watch') {
+    process.stderr.write("Unable to write the response; do not infer absence of effects.\n");
+  }
 });
 
 process.exitCode = await runCli(process.argv.slice(2), {
+  outputSignal: outputController.signal,
   readFile: (path) => readInput(createReadStream(path)),
   readStdin: () => readInput(process.stdin),
   stdout: (text) => { process.stdout.write(text); },

@@ -2,6 +2,7 @@ import { cleanDiagnostics } from './diagnostics.ts';
 import { workerDiagnostics } from './worker-diagnostics.ts';
 import { userInfo } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { canonicalJson, ConfigurationError } from './configuration.ts';
 import { configureContext, initialiseContext, openContext } from './context.ts';
 import type { ContextOptions, ContextSelector } from './context.ts';
@@ -26,7 +27,13 @@ import { nextAction as action } from './next-action.ts';
 import { validateSchema } from './operation-schemas.ts';
 import { startSupervisor } from './supervisor.ts';
 
+export interface WatchOutput {
+  event(event: JsonObject): void | Promise<void>;
+  signal?: AbortSignal;
+}
+
 export interface OperationOptions extends ContextOptions {
+  watch?: WatchOutput;
   runtime?: typeof createRuntime;
   /** Trusted host peer factory, never supplied by operation input. */
   supervisorPeer?: () => Promise<import('./adapters/pi-supervisor.ts').SupervisorPeer>;
@@ -142,8 +149,23 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
     const id = String(args.taskId);
     switch (operation.name) {
       case 'status.watch': {
-        const events = db.notificationPage(Number(args.afterSequence));
-        return { events: events.map(notificationView), sequence: events.at(-1)?.seq ?? Number(args.afterSequence) };
+        let sequence = Number(args.afterSequence);
+        if (!options.watch) {
+          const events = db.notificationPage(sequence);
+          return { events: events.map(notificationView), sequence: events.at(-1)?.seq ?? sequence };
+        }
+        const { event: emit, signal } = options.watch;
+        const deadline = Date.now() + Number(args.timeoutMs ?? 30000);
+        do {
+          signal?.throwIfAborted();
+          for (const event of db.notificationPage(sequence)) {
+            await emit(notificationView(event));
+            sequence = event.seq;
+          }
+          if (Date.now() >= deadline) break;
+          await delay(Math.min(500, deadline - Date.now()), undefined, { signal });
+        } while (Date.now() < deadline);
+        return { final: true, sequence };
       }
       case 'supervisor.start': return await startSupervisor(db, context.configuration.resolved, input, command, selector, options);
       case 'supervisor.handled': return await db.acknowledgeNotifications(String(args.objectiveId), args.eventIds as string[], null, command);

@@ -1,5 +1,6 @@
 import { coreOperations } from './operation-schemas.ts';
 import { executeCoreOperation } from './operations.ts';
+import type { WatchOutput } from './operations.ts';
 import type { ContextSelector } from './context.ts';
 import { CommandFailure } from './response.ts';
 
@@ -105,8 +106,8 @@ export function findOperation(name: string): OperationDefinition | undefined {
 }
 
 export function executeOperation(operation: OperationDefinition, args: Record<string, unknown> = {}, progress: (message: string) => void = () => {},
-  selector?: ContextSelector, requestId?: string): Record<string, unknown> | Promise<Record<string, unknown>> {
+  selector?: ContextSelector, requestId?: string, watch?: WatchOutput): Record<string, unknown> | Promise<Record<string, unknown>> {
   if (operation.name === 'catalog.show') return catalogue;
   if (!selector) throw new CommandFailure('invalid_input');
-  return executeCoreOperation(operation, args, progress, selector, requestId);
+  return executeCoreOperation(operation, args, progress, selector, requestId, { watch });
 }

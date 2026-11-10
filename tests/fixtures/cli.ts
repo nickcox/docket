@@ -18,19 +18,25 @@ async function readInput(stream: Readable): Promise<string> {
   return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
 }
 
-process.stdout.on('error', () => {
+const outputController = new AbortController();
+process.stdout.on('error', error => {
+  outputController.abort(error);
   process.exitCode = 3;
-  process.stderr.write('Unable to write the response; do not infer absence of effects.\n');
+  if (process.argv[2] !== 'status' || process.argv[3] !== 'watch') {
+    process.stderr.write('Unable to write the response; do not infer absence of effects.\n');
+  }
 });
 
 process.exitCode = await runCli(process.argv.slice(2), {
+  outputSignal: outputController.signal,
   readFile: path => readInput(createReadStream(path)),
   readStdin: () => readInput(process.stdin),
   stdout: text => { process.stdout.write(text); },
   stderr: text => { process.stderr.write(text); },
-}, (operation, args, progress, selector, requestId) => {
+}, (operation, args, progress, selector, requestId, watch) => {
   if (operation.name === 'catalog.show' || !selector) return executeOperation(operation, args, progress, selector, requestId);
   return executeCoreOperation(operation, args, progress, selector, requestId, {
+    watch,
     runtime: (db, config, home) => createRuntime(db, config, home, {
       windowsSettingsWritableOnlyByOwner: async () => true,
       windowsSecurePrivateDirectory: async () => {},
