@@ -13,7 +13,10 @@ export function buildBriefing(db: Database, objectiveId: string, actor: TaskActo
   const sessions = scoped.filter(e => e.kind === 'session.registered' && e.payload.kind === 'supervisor');
   const usage = db.objectiveUsage(objectiveId);
   const claims = db.claims().filter(c => !c.releasedAt && (c.objectiveId === objectiveId || c.attemptId && attemptIds.has(c.attemptId)));
-  const handled = new Set(scoped.filter(e => e.kind === 'supervisor.handled').flatMap(e => (e.payload.eventIds ?? []) as string[]));
+  const handledSequence = Number(events.findLast(e => e.objectiveId === objectiveId && e.kind === 'supervisor.handled')?.payload.sequence ?? 0);
+  const pending = events.filter(e => e.objectiveId === objectiveId && e.notification && e.seq > handledSequence);
+  const pendingCounts: Record<string, number> = {};
+  for (const event of pending) pendingCounts[event.kind] = (pendingCounts[event.kind] ?? 0) + 1;
   return {
     detailOperation: 'attempt.show',
     objective: { id: objective.id, state: objective.state, criteria: objective.criteria, scope: objective.scope,
@@ -46,7 +49,8 @@ export function buildBriefing(db: Database, objectiveId: string, actor: TaskActo
     }),
     questions: db.questions().filter(q => q.scope.objectiveId === objectiveId && (q.scope.taskId === null || taskIds.has(q.scope.taskId))),
     notes: scoped.filter(e => e.kind === 'supervisor.note').map(e => ({ id: e.id, text: e.payload.text })),
-    pendingEvents: scoped.filter(e => e.notification && !handled.has(e.id)).map(e => ({ id: e.id, sequence: e.seq, kind: e.kind, attemptId: e.attemptId ?? null })),
+    pendingEvents: { count: pending.length, counts: pendingCounts, handledSequence, detailOperation: 'supervisor.pending',
+      recent: pending.slice(-3).map(e => ({ id: e.id, sequence: e.seq, kind: e.kind, attemptId: e.attemptId ?? null })) },
     ownerDiagnostics: {
       sessions: scoped.filter(e => ['session.failed', 'supervisor.stopped'].includes(e.kind)
         || e.kind === 'worker.observed' && e.payload.kind === 'capability_failure')

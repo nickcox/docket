@@ -35,7 +35,8 @@ test("R28/A52: one version-1 catalogue exposes context.init and catalog.show wit
     assert.ok(operation.description.trim());
     if (operation.name === 'question.ask') assert.deepEqual(operation.roles, ['worker', 'supervisor']);
     else if (operation.name === 'supervisor.handled') assert.deepEqual(operation.roles, ['supervisor']);
-    else if (operation.name.startsWith('supervisor.')) assert.deepEqual(operation.roles, ['host']);
+    else if (['supervisor.pending', 'supervisor.admitted'].includes(operation.name)) assert.deepEqual(operation.roles, ['host']);
+    else if (['supervisor.briefing', 'supervisor.note'].includes(operation.name)) assert.deepEqual(operation.roles, ['person', 'supervisor']);
     else assert.ok(operation.roles.includes(operation.name === 'host.usage' ? 'host' : 'person'));
     if (operation.name === 'host.usage') assert.deepEqual(operation.roles, ['host']);
     if (['context.init', 'context.configure', 'attempt.return', 'attempt.discard', 'claim.resolve', 'effect.resolve', 'profile.clear', 'diagnostics.clean'].includes(operation.name)) assert.deepEqual(operation.roles, ['person']);

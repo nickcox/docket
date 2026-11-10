@@ -15,7 +15,7 @@ import { configuration } from '../fixtures/configuration.ts';
 
 const person = { kind: 'person' as const, id: 'operator' };
 const supervisor = { kind: 'supervisor' as const, id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
-const host = { kind: 'host', id: 'host' };
+const host = { kind: 'host' as const, id: 'host' };
 const hash = 'a'.repeat(40);
 async function fixture(t: test.TestContext) {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-briefing-')));
@@ -30,13 +30,14 @@ async function fixture(t: test.TestContext) {
   defer(t, () => db.close());
   const binding = createBinding(person, { config: file }, { home });
   const agent = createBinding(supervisor, { config: file }, { home });
+  const hostBinding = createBinding(host, { config: file }, { home });
   for (const id of ['goal', 'other']) await binding.execute('objective.add', { id, request: 'Deliver a reliable project',
     criteria: ['All features work', 'Evidence retained'], scope: 'Project', constraints: 'No publication', permissions: null, budget: null, deadline: null });
   const add = (id: string) => binding.execute('task.add', { id, objectiveId: 'goal', definition: {
     title: `Implement ${id}`, instructions: 'Long task instructions. '.repeat(500), criteria: [`${id} criterion one`, `${id} criterion two`], kind: 'code', profile: null } });
   const register = () => db.registerSession({ sessionId: 'session', kind: 'supervisor', objectiveId: 'goal', attemptId: null,
     registeredAt: new Date().toISOString(), capabilities: [] }, host);
-  return { db, binding, agent, add, register };
+  return { db, binding, agent, hostBinding, add, register };
 }
 
 test('R23/A46: canonical three-task/thirteen-attempt briefing preserves blockers under 15,000 characters and full detail stays available', async t => {
@@ -88,7 +89,12 @@ test('R23/A46: canonical three-task/thirteen-attempt briefing preserves blockers
   assert.equal(briefing.usage.gaps.length, 14);
   assert.equal(briefing.questions[0].text, 'Which behaviour is intended?');
   assert.equal(briefing.notes.length, 1);
-  assert.ok(briefing.pendingEvents.length > 0);
+  const pending = f.db.events().filter(e => e.objectiveId === 'goal' && e.notification);
+  assert.equal(briefing.pendingEvents.count, pending.length);
+  assert.equal(Object.values(briefing.pendingEvents.counts).reduce((sum: number, count) => sum + Number(count), 0), pending.length);
+  assert.equal(briefing.pendingEvents.counts['attempt.reserved'], 13);
+  assert.equal(briefing.pendingEvents.detailOperation, 'supervisor.pending');
+  assert.deepEqual(briefing.pendingEvents.recent, pending.slice(-3).map(e => ({ id: e.id, sequence: e.seq, kind: e.kind, attemptId: e.attemptId ?? null })));
   assert.equal(briefing.authority[0].kind, 'unrestricted');
   assert.equal(briefing.ownerDiagnostics.claims.length, 1);
   assert.equal(briefing.ownerDiagnostics.blockers[0].reason, 'stale');
@@ -98,6 +104,35 @@ test('R23/A46: canonical three-task/thirteen-attempt briefing preserves blockers
   assert.match(detail.specification.task.instructions, /Long task instructions/u);
   assert.ok(detail.result.content.evidence[0].summary.length > 5000);
   assert.ok(detail.checks[0].result.output.length > 5000);
+});
+
+test('R23/A46: compact pending counts cover the full backlog and follow durable partial handling, not delivery admission', async t => {
+  const f = await fixture(t);
+  await f.register();
+  for (let i = 0; i < 30; i++) await f.agent.execute('supervisor.note', { text: `Note ${i}` });
+  await f.binding.execute('supervisor.note', { objectiveId: 'other', text: 'Foreign note' });
+  const read = async () => (await f.agent.execute('supervisor.briefing', {})).briefing as any;
+  const before = await read();
+  assert.equal(before.pendingEvents.counts['supervisor.note'], 30);
+  assert.equal(before.notes.length, 30);
+  assert.equal(before.pendingEvents.recent.length, 3);
+  const delivery = await f.hostBinding.execute('supervisor.pending', { objectiveId: 'goal', afterSequence: 0, timeoutMs: 0 }, 'pending');
+  assert.equal((delivery.eventIds as string[]).length, 20, 'Full backlog counts are not limited to one delivery page');
+  await f.hostBinding.execute('supervisor.admitted', { objectiveId: 'goal', deliveryRequestId: delivery.deliveryRequestId, eventIds: delivery.eventIds }, 'admitted');
+  assert.deepEqual((await read()).pendingEvents, before.pendingEvents, 'Admission alone does not handle notifications');
+  const handledIds = (delivery.eventIds as string[]).slice(0, 2);
+  const handled = await f.agent.execute('supervisor.handled', { eventIds: handledIds });
+  const after = await read();
+  const pending = f.db.events().filter(e => e.objectiveId === 'goal' && e.notification && e.seq > Number(handled.handledSequence));
+  assert.equal(after.pendingEvents.handledSequence, handled.handledSequence);
+  assert.equal(after.pendingEvents.count, before.pendingEvents.count - 2);
+  assert.equal(after.pendingEvents.count, pending.length);
+  for (const kind of Object.keys(after.pendingEvents.counts)) {
+    assert.equal(after.pendingEvents.counts[kind], pending.filter(e => e.kind === kind).length);
+  }
+  assert.deepEqual(after.pendingEvents.recent, before.pendingEvents.recent);
+  const remaining = await f.hostBinding.execute('supervisor.pending', { objectiveId: 'goal', afterSequence: 0, timeoutMs: 0 }, 'remaining');
+  assert.deepEqual(remaining.eventIds, (delivery.eventIds as string[]).slice(2), 'Full detail still starts at the oldest unhandled notification');
 });
 
 test('R23/A47: classifications and membership are write-once, with answer and return exceptions and replay deduplication', async t => {
@@ -143,6 +178,17 @@ test('R23/A47: classifications and membership are write-once, with answer and re
   const briefing = (await f.binding.execute('supervisor.briefing', { objectiveId: 'goal' })).briefing as any;
   assert.deepEqual(objective.personActions, briefing.personActions);
   assert.equal(briefing.personActions.recent.length, 3);
+});
+
+test('R23/A47: a pre-supervisor return is setup but a person-addressed answer is always an intervention', async t => {
+  const f = await fixture(t);
+  await f.add('one');
+  const input: JsonObject = { taskId: 'one' };
+  await f.db.recordCommand({ requestKey: 'setup-return', operation: 'attempt.return', caller: person, input, fingerprint: canonicalJson(input) });
+  assert.equal(f.db.personActions('goal').recent[0]!.payload.classification, 'setup');
+  const question = (await f.agent.execute('question.ask', { text: 'Decision before supervision?', choices: null, waiting: true })).question as any;
+  await f.binding.execute('question.answer', { questionId: question.id, text: 'Continue' });
+  assert.equal(f.db.personActions('goal').recent[0]!.payload.classification, 'intervention');
 });
 
 test('R23/R28/R30: briefing and notes are strict, scoped, non-planable operations; notes replay without duplication', async t => {

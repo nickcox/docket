@@ -734,8 +734,8 @@ export class Database {
       const row = this.db.prepare('SELECT state FROM objectives WHERE id = ?').get(objectiveId);
       const registered = this.events().some(e => e.kind === 'session.registered' && e.payload.kind === 'supervisor' && e.payload.objectiveId === objectiveId);
       const classification = question?.recipient.kind === 'person' ? 'intervention'
-        : command.operation === 'attempt.return' ? 'clean-up'
-        : row && row.state !== 'open' ? 'clean-up' : registered ? 'intervention' : 'setup';
+        : row && row.state !== 'open' ? 'clean-up' : !registered ? 'setup'
+        : command.operation === 'attempt.return' ? 'clean-up' : 'intervention';
       return { objectiveId, classification, members: this.tasks().filter(t => t.objectiveId === objectiveId).map(t => t.id) };
     });
   }
