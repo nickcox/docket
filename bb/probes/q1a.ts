@@ -8,6 +8,7 @@ import { Harness, until, app } from '../harness/index.ts';
 import { controlRequest } from '../harness/http.ts';
 import { firstInput } from '../plugin/admission.ts';
 import { ProbeReport, validateInputs } from './report.ts';
+import { recheckUntil } from './recheck.ts';
 
 if (process.argv.length !== 2) throw new Error('Synthetic-only entry accepts no arguments (including --pi)');
 const pluginPath = process.env.DOCKET_BB_PROBE_PLUGIN;
@@ -58,7 +59,15 @@ const control = async (action: string, threadId?: string, requestId?: string) =>
 const count = (id: string) => inputs().filter(row => row.threadId === id).length;
 const events = async (id: string) => (await state()).observations.filter((row: any) => row.threadId === id);
 const latest = async () => (await state()).observations.at(-1)?.sequence ?? 0;
-const observe = async (id: string, after: number, action: string) => until(() => events(id), rows => rows.some((row: any) => row.sequence > after && row.kind === 'dispatch' && row.action === action));
+const recheckObserved = async (id: string, after: number, accept: (fresh: any[]) => boolean) => {
+  const generation = (await state()).generation;
+  return recheckUntil({ stage: report.active ?? 'observation', threadId: id, after, generation,
+    read: () => events(id), recheck: async () => assert.equal((await control('recheck')).status, 200), accept });
+};
+const observe = (id: string, after: number, action: string) => recheckObserved(id, after,
+  rows => rows.some(row => row.kind === 'dispatch' && row.action === action));
+const admitted = (id: string, after: number) => recheckObserved(id, after,
+  rows => rows.some(row => row.kind === 'dispatch' && row.action === 'proceed') && count(id) === 1);
 const spawn = (title: string) => {
   const row = JSON.parse(h.cli('thread', 'spawn', '--project', h.projectId, '--environment', h.repo, '--machine', h.hostId,
     '--provider', 'docket-synthetic', '--model', 'synthetic', '--permission-mode', 'full', '--title', title, '--prompt', firstInput, '--json'));
@@ -74,7 +83,6 @@ const held = async (id: string) => {
 };
 const recheckHeld = async (id: string) => {
   const before = await latest();
-  assert.equal((await control('recheck')).status, 200);
   await observe(id, before, 'wait');
   return held(id);
 };
@@ -144,9 +152,9 @@ try {
     return { threadId: id, queue: await held(id) };
   });
   await report.stage('Q1a single permit / drain', async () => {
+    const before = await latest();
     assert.equal((await control('permit', id)).status, 200);
-    await control('recheck');
-    await until(async () => count(id), count => count === 1);
+    await admitted(id, before);
     await until(async () => show(id), row => row.status === 'error');
     retryId = await failedRequest(id);
     assert.equal((await control('permit', id)).status, 409, 'Consumed cannot be revived');
@@ -158,13 +166,16 @@ try {
     for (let i = 0; i < 4; i++) {
       const raceId = spawn(`Synthetic fence race ${i}`); await held(raceId); await control('bind', raceId);
       const before = await latest();
-      const permit = () => control('permit', raceId).then(async result => { await control('recheck'); return result; });
+      // Start ordinary drain concurrently with the competing fence. If pacing
+      // skips the first request, keep re-evaluating without repeating permission.
+      const permit = async () => {
+        const result = await control('permit', raceId);
+        const observed = await recheckObserved(raceId, before, rows => rows.some(row =>
+          (row.kind === 'dispatch' && row.action === 'reject') || (row.kind === 'turn.failed' && row.inputAccepted)));
+        return { ...result, observed };
+      };
       const results = await Promise.all(i % 2 ? [permit(), control('refuse', raceId)] : [control('refuse', raceId), permit()]);
-      await control('recheck');
-      // Wait for a real rejection of the queued first input, or a consumed turn
-      // reaching error. Neither outcome depends on an arbitrary sleep.
-      const observed = await until(() => events(raceId), rows => rows.some((row: any) => row.sequence > before &&
-        ((row.kind === 'dispatch' && row.action === 'reject') || row.kind === 'turn.failed')));
+      const observed = await events(raceId);
       const row = (await state()).rows.find((row: any) => row.thread === raceId);
       assert.equal(row.decision, 'refuse');
       if (row.consumed) {
@@ -179,8 +190,9 @@ try {
   await report.stage('Q1b completed fence', async () => {
     completedId = spawn('Synthetic completed attempt'); await held(completedId);
     writeFileSync(join(h.repo, 'completed-threads.json'), JSON.stringify([completedId]));
-    await control('bind', completedId); await control('permit', completedId); await control('recheck');
-    await until(async () => count(completedId), count => count === 1);
+    const before = await latest();
+    await control('bind', completedId); await control('permit', completedId);
+    await admitted(completedId, before);
     await until(async () => show(completedId), row => row.status === 'idle');
     await control('refuse', completedId); await control('refuse', id);
     return { threadId: completedId, attempts: await rejectLater(completedId) };
@@ -208,7 +220,7 @@ try {
     // Recovery fences instead of granting permission. A paused creator loses.
     await control('refuse', waiting);
     assert.equal((await control('permit', waiting)).status, 409);
-    const before = await latest(); await control('recheck'); await observe(waiting, before, 'reject');
+    const before = await latest(); await observe(waiting, before, 'reject');
     assert.equal(count(waiting), 0);
     return { threadId: waiting, events: await events(waiting) };
   });

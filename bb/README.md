@@ -1,6 +1,6 @@
 # Experimental bb harness – unqualified
 
-Experimental work, not a production Docket launcher. Startup fixes through `194b442dbde7ff718ac70e45beaaa815e09fc278` are integrated. The synthetic admission entry has been repaired offline; its live Q1a/Q1b results are **pending supervisor execution**, not passing qualification. Q1c, Q2, real Pi/model/resource qualification and actual Docket authority/provenance remain unproven. No old retained code was restored in this attempt.
+Experimental work, not a production Docket launcher. Startup fixes through `194b442dbde7ff718ac70e45beaaa815e09fc278` are integrated. The first synthetic admission run stopped at a skipped recheck after binding. The bounded recheck correction is verified offline; corrected live Q1a/Q1b results are **pending supervisor execution**, not passing qualification. Q1c, Q2, real Pi/model/resource qualification and actual Docket authority/provenance remain unproven. No old retained code was restored in this attempt.
 
 ## Startup repair (R31, R33)
 
@@ -68,7 +68,7 @@ env -i PATH="$PATH" HOME="$BUILD_ROOT/home" BB_DATA_DIR="$BUILD_ROOT/data" \
 
 The build command is offline with respect to the bb server; first use may download the pinned build toolchain. Keep dependency/build outputs in this scratch copy, not nested in the source workspace: the person-controlled root execution profile permits only root `node_modules/`. Generated `bb/plugin/dist/` and `bb/plugin/node_modules/` remain ignored as a safeguard, not permission to leave them there.
 
-Seven admission/report tests, nine provider-selection policy tests and two local HTTP transport tests run in the ordinary root suite without bb installed, providers, credentials, models or Keychain access. Admission tests use real temporary SQLite, fresh database handles and a fake provider boundary, with project `defer` cleanup. The HTTP tests use only an owned local Node server process, including a deliberately blocked client interval and a reset mutation with no retry. Live harness process handling remains macOS-only and unqualified.
+Ten admission/report/recheck tests, nine provider-selection policy tests and two local HTTP transport tests run in the ordinary root suite without bb installed, providers, credentials, models or Keychain access. Admission tests use real temporary SQLite, fresh database handles and a fake provider boundary, with project `defer` cleanup. The HTTP tests use only an owned local Node server process, including a deliberately blocked client interval and a reset mutation with no retry. Live harness process handling remains macOS-only and unqualified.
 
 ## Supervisor: one monitored startup only
 
@@ -86,7 +86,17 @@ An independent cleanup guardian imposes a **180-second deadline**, covering sync
 
 The printed temporary `docket-bb-*` root is deliberately retained. Inspect `server.log`, `daemon.log`, `data/logs/`, `selected-providers.json`, `startup-only.json`, `guardian-stopped.json` and `stopped.json`. A hard deadline records `timedOut: true` in `guardian-stopped.json` and may leave no final parent report. These files are diagnostic evidence, not qualification. Retain the printed root and the external monitor's output for review; do not repeat a failed live check automatically. Remove only that exact temporary root once its evidence is retained and all recorded processes are confirmed stopped.
 
-## Supervisor: synthetic admission suite (live results pending)
+## First synthetic admission result and recheck correction
+
+The supervisor ran candidate `a0fb2985bd5e37c2af756cfa575a6f19fd29372f` once under independent guards. Startup and Q1a held input/crash before binding passed. The bound-hold stage failed waiting for a fresh hook observation after binding; later admission/reload/restart scenarios were not run. The durable row remained bound=1, hold, consumed=0, with **zero provider inputs**. Cleanup passed: no recorded processes remained and ports 60462/60463 were closed. The monitor recorded zero Keychain events and zero blocked commands. This was an orchestration failure, not passing admission qualification or evidence of extra input.
+
+Evidence: `/Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-a0fb298/live-outcome.md` and `monitor-output.jsonl`; retained root `/private/var/folders/82/z689vjhj5f9f6xlwg34dn3vw0000gn/T/docket-bb-MtiQuk` contains the failed `admission-report.json` and audit.
+
+Installed bb 0.49.0 `start-server.js` confirms that `runPluginRecheckDispatch` respects `isDispatchRequeuedRecently`: a recheck inside the 1000 ms pacing window returns without scheduling a trailing recheck. The last wait was at 1794376467129 and binding at 1794376467654. Waiting longer after that single request cannot itself generate a new decision.
+
+`probes/recheck.ts` now repeatedly requests only public hook re-evaluation until a fresh sequence in the current backend generation satisfies the required observation, bounded to 60 seconds per barrier and the independent whole-suite deadline. Held checks, permit/drain, race outcomes, completed-turn activation, retry rejection and waiting/fence rejection use this same helper. No create, send, bind, permit, retry or activation is automatically repeated. A successful recheck response or elapsed interval is not evidence. HTTP transport failure still fails immediately without retry; deliberate repeated rechecks are separate requests, not automatic mutation retries. Cheap fake-boundary tests cover skipped/coalesced requests, stale sequence/generation exclusion, bounded diagnostic failure/report retention and transport failure. The corrected live suite has not run in this worker.
+
+## Supervisor: synthetic admission suite (corrected live results pending)
 
 After stopping this worker, the supervisor may run **once**, under independent Keychain and provider-command guards. Build the scratch plugin as above from the exact clean committed candidate. Do not copy dependencies or bundles into the source tree. Run from that candidate's repository root:
 

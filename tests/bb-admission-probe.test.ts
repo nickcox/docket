@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { AdmissionPolicy, admissionSchema, firstInput, inputText } from '../bb/plugin/admission.ts';
 import { ProbeReport, validateInputs } from '../bb/probes/report.ts';
+import { recheckUntil, type Observation } from '../bb/probes/recheck.ts';
 import { defer } from './helpers/cleanup.ts';
 
 function fixture(t: TestContext) {
@@ -120,6 +121,53 @@ test('Q1a/Q1b: assertion failure retains failed/not-run stages and cleanup evide
   assert.match(retained.failure, /Observed rejection missing/);
   assert.equal(retained.active, null);
   assert.equal(retained.scenarios[3].evidence.fakeOwnedProcessesStopped, true);
+});
+
+test('Q1a/Q1b: skipped/coalesced rechecks require a fresh decision in the current generation', async () => {
+  for (const action of ['wait', 'proceed', 'reject', 'turn.failed']) {
+    let clock = 0, requests = 0;
+    const rows: Observation[] = [
+      { sequence: 10, generation: 'current', kind: action === 'turn.failed' ? action : 'dispatch', action },
+      { sequence: 11, generation: 'old', kind: action === 'turn.failed' ? action : 'dispatch', action },
+    ];
+    const observed = await recheckUntil({ stage: action, threadId: 't', after: 10, generation: 'current',
+      read: async () => rows, accept: fresh => fresh.some(row => row.action === action),
+      recheck: async () => {
+        requests++;
+        // First request is skipped; the next burst coalesces without a decision.
+        if (requests === 4) rows.push({ sequence: 12, generation: 'current', kind: action === 'turn.failed' ? action : 'dispatch', action });
+      },
+      now: () => clock, pause: async ms => { clock += ms; }, timeoutMs: 1000, intervalMs: 100 });
+    assert.equal(requests, 4);
+    assert.equal(observed.at(-1)?.sequence, 12);
+  }
+});
+
+test('Q1a/Q1b: bounded recheck failure retains stage/sequence context and not-run scenarios', async t => {
+  const { root } = fixture(t); const path = join(root, 'recheck-report.json');
+  const report = new ProbeReport(['bound hold', 'permit', 'cleanup'], value => writeFileSync(path, JSON.stringify(value)));
+  let clock = 0, requests = 0;
+  await assert.rejects(report.stage('bound hold', () => recheckUntil({
+    stage: 'bound hold', threadId: 't', after: 8, generation: 'new',
+    read: async () => [{ sequence: 8, generation: 'new', kind: 'dispatch', action: 'wait' }],
+    accept: fresh => fresh.some(row => row.action === 'wait'),
+    recheck: async () => { requests++; }, now: () => clock, pause: async ms => { clock += ms; },
+    timeoutMs: 300, intervalMs: 100,
+  })), /stage=bound hold thread=t after=8 generation=new lastSequence=8 requests=3/);
+  assert.equal(requests, 3);
+  await report.stage('cleanup', async () => ({ stopped: true }));
+  const retained = JSON.parse(readFileSync(path, 'utf8'));
+  assert.deepEqual(retained.scenarios.map((row: any) => row.status), ['failed', 'not-run', 'passed']);
+  assert.match(retained.failure, /Recheck timed out/);
+});
+
+test('Q1a/Q1b: recheck transport errors fail without automatic mutation retry', async () => {
+  let requests = 0;
+  await assert.rejects(recheckUntil({ stage: 'permit', threadId: 't', after: 1, generation: 'g',
+    read: async () => [], accept: () => false,
+    recheck: async () => { requests++; throw new Error('connection reset'); },
+  }), /connection reset/);
+  assert.equal(requests, 1);
 });
 
 test('Q1a/Q1b: interrupted active stage is retained as failed, never silently passed', async t => {

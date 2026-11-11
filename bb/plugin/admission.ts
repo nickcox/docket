@@ -58,7 +58,7 @@ export class AdmissionPolicy {
   dispatch(thread: string, input: { text: string; attempt: string; origin: string | null; messages: { content: string; origin: string | null }[] }, evidence: object = {}) {
     return this.transaction(() => {
       const state = this.row(thread);
-      // Inspect every queued member. A grouped follow-up must never ride along
+      // Inspect every queued member. A grouped follow-up must never be admitted
       // with the permitted first prompt. Inline and queued text must be exact.
       const exact = input.attempt === 'start-turn' && input.origin === 'cli' && input.text === firstInput && input.messages.length <= 1 && input.messages.every(row => row.content === firstInput && row.origin === 'cli');
       let action: 'reject' | 'wait' | 'proceed' = 'reject';
