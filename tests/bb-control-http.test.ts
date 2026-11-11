@@ -39,17 +39,24 @@ test('R31/R33/R37: control GETs and mutation use fresh connections across synchr
   assert.deepEqual(rows.map(row => row.path), ['/api/v1/system/version', '/api/v1/plugins', '/api/v1/plugins/provider-claude-code/disable']);
   assert.deepEqual(rows.map(row => row.connection), ['close', 'close', 'close']);
   assert.equal(new Set(rows.map(row => row.connectionId)).size, 3);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+  const authenticated = await controlRequest(url, '/api/v1/plugins/docket-probe/http/control', { action: 'recheck' }, 5000, 'test-token');
+  const row = JSON.parse(authenticated.text);
+  assert.equal(row.authenticated, true);
+  assert.equal(row.connection, 'close');
+  assert.ok(!rows.some(other => other.connectionId === row.connectionId));
 });
 
 test('R31/R37: transport failure retains method, path and cause without body or mutation retry', { timeout: 15_000 }, async t => {
   const url = await fixture(t);
-  await assert.rejects(controlRequest(url, '/reset', { token: 'secret-body-value' }), error => {
+  await assert.rejects(controlRequest(url, '/reset', { token: 'secret-body-value' }, 5000, 'secret-header-value'), error => {
     assert.ok(error instanceof Error);
     assert.equal(error.message, 'Control request failed: POST /reset');
     assert.ok(error.cause instanceof TypeError);
     assert.ok(error.cause.cause);
     assert.ok(!error.message.includes(url));
     assert.ok(!error.message.includes('secret-body-value'));
+    assert.ok(!error.message.includes('secret-header-value'));
     return true;
   });
   const response = await controlRequest(url, '/stats');

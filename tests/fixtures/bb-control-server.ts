@@ -18,6 +18,7 @@ const server = createServer((request, response) => {
     response.end(JSON.stringify({
       method: request.method, path: request.url, connection: request.headers.connection,
       connectionId: connections.get(request.socket), resets,
+      authenticated: request.headers['x-bb-plugin-token'] === 'test-token',
     }));
   });
 });

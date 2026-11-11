@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, openSync, closeSync, readFileSync, realpathSync
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, resolve, relative, sep } from 'node:path';
-import { createServer } from 'node:net';
+import { createServer, connect } from 'node:net';
 import { pluginsFrom, registrationReady, startIsolated, verifySelection, type StartupIO } from './startup.ts';
 import { controlRequest } from './http.ts';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -46,7 +46,7 @@ async function reserve(port = 0) {
 }
 
 export async function withHarness<T>(run: (harness: Harness) => Promise<T>): Promise<T> {
-  const h = new Harness();
+  const h = new Harness(240_000);
   const interrupt = () => { void h.stop().finally(() => process.exit(130)); };
   process.once('SIGINT', interrupt);
   process.once('SIGTERM', interrupt);
@@ -73,7 +73,7 @@ export class Harness {
   hostId = '';
   projectId = '';
 
-  constructor(timeoutMs = 0) {
+  constructor(timeoutMs = 240_000) {
     mkdirSync(this.dataDir); mkdirSync(this.repo);
     this.guardian = spawn(executable, [fileURLToPath(new URL('./guardian.ts', import.meta.url)), this.root, String(timeoutMs), String(process.pid)], { detached: true, stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
   }
@@ -139,7 +139,7 @@ export class Harness {
           return registrationReady(await this.request('/api/v1/plugins'), providers);
         }, ready => ready);
       },
-      installProbe: async () => { this.cli('plugin', 'install', fileURLToPath(new URL('../plugin', import.meta.url)), '--yes'); },
+      installProbe: async () => { this.cli('plugin', 'install', process.env.DOCKET_BB_PROBE_PLUGIN ?? fileURLToPath(new URL('../plugin', import.meta.url)), '--yes'); },
       listPlugins: () => this.request('/api/v1/plugins'),
       listProviders: () => this.request('/api/v1/system/providers/catalog'),
       disable: async id => {
@@ -206,12 +206,11 @@ export class Harness {
       await exited;
       await this.startServer();
     } }, true);
-    await until(async () => this.request('/api/v1/plugins/docket-probe/http/state'), value => value.ready === true);
   }
 
-  async request(path: string, body?: unknown): Promise<any> {
-    const response = await controlRequest(this.url, path, body);
-    if (!response.ok) throw new Error(`${response.status} ${path}: ${response.text}`);
+  async request(path: string, body?: unknown, token?: string): Promise<any> {
+    const response = await controlRequest(this.url, path, body, 60_000, token);
+    if (!response.ok) throw new Error(`${response.status} ${path}`);
     return JSON.parse(response.text);
   }
 
@@ -227,7 +226,16 @@ export class Harness {
         if (child.pid && child.exitCode === null && child.signalCode === null) await new Promise<void>(yes => child.once('exit', () => yes()));
       }
       // Keep logs on failure and for manual inspection; never remove a normal bb path.
-      writeFileSync(join(this.root, 'stopped.json'), JSON.stringify({ pids: this.children.map(child => child.pid), ports: this.ports }));
+      const ports = await Promise.all(this.ports.map(port => new Promise<{ port: number; closed: boolean }>(yes => {
+        const socket = connect({ host: '127.0.0.1', port });
+        socket.setTimeout(1000);
+        socket.once('connect', () => { socket.destroy(); yes({ port, closed: false }); });
+        socket.once('error', error => { socket.destroy(); yes({ port, closed: (error as NodeJS.ErrnoException).code === 'ECONNREFUSED' }); });
+        socket.once('timeout', () => { socket.destroy(); yes({ port, closed: false }); });
+      })));
+      const childExits = this.children.map(child => ({ pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode }));
+      writeFileSync(join(this.root, 'stopped.json'), JSON.stringify({ pids: this.children.map(child => child.pid), childExits, ports }));
+      if (ports.some(port => !port.closed)) throw new Error('Owned port not confirmed closed');
     })();
   }
 }

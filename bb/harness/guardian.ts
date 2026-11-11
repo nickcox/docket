@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -40,10 +40,25 @@ async function stop() {
     await sleep(signal === 'SIGTERM' ? 1500 : 200);
     snapshot();
   }
-  writeFileSync(join(root, 'guardian-stopped.json'), JSON.stringify({ groups: [...groups], descendants: [...descendants], timedOut }));
+  const remaining = execFileSync('ps', ['-axo', 'pid=,stat='], { encoding: 'utf8' }).trim().split('\n')
+    .map(line => line.trim().split(/\s+/)).filter(([pid, state]) => descendants.has(Number(pid)) && !state?.startsWith('Z'))
+    .map(([pid, state]) => ({ pid: Number(pid), state }));
+  const cleanup = { groups: [...groups], descendants: [...descendants], timedOut, remaining };
+  writeFileSync(join(root, 'guardian-stopped.json'), JSON.stringify(cleanup));
+  // A synchronous CLI can block the parent past its deadline. Preserve the
+  // active stage and explicit failure even when that parent cannot run finally.
+  const reportPath = join(root, 'admission-report.json');
+  if (timedOut && existsSync(reportPath)) {
+    const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+    const active = report.scenarios.find((row: { name: string }) => row.name === report.active);
+    if (active) active.status = 'failed';
+    report.failure = 'Independent guardian deadline exceeded';
+    report.cleanup = cleanup;
+    writeFileSync(reportPath, JSON.stringify(report, null, 2));
+  }
   // The independent deadline also covers a parent blocked in a synchronous CLI.
   if (timedOut) process.kill(ownerPid, 'SIGKILL');
-  process.exit(0);
+  process.exit(remaining.length ? 1 : 0);
 }
 process.on('disconnect', () => void stop());
 process.on('SIGTERM', () => void stop());
