@@ -48,8 +48,10 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
         const completed = existsSync(completedPath) && JSON.parse(readFileSync(completedPath, 'utf8')).includes(parsed.threadId);
         const providerTurnId = randomUUID();
         reply({});
-        delta(p.threadId, [{ kind: 'input.accepted', clientRequestId: p.clientRequestId, providerTurnId },
-          { kind: 'turn.open', providerTurnId }, { kind: 'turn.boundary', providerTurnId,
+        // Explicit provider turn IDs bypass the assembler's pending-acceptance
+        // buffer. Start must reach storage before acceptance for that same turn.
+        delta(parsed.threadId, [{ kind: 'turn.open', providerTurnId },
+          { kind: 'input.accepted', clientRequestId: parsed.clientRequestId, providerTurnId }, { kind: 'turn.boundary', providerTurnId,
             ...(completed ? { status: 'completed' } : { status: 'failed', error: { message: 'Intentional synthetic failure for ordinary retry' } }) }]);
         break;
       }

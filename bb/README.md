@@ -1,6 +1,6 @@
 # Experimental bb harness – unqualified
 
-Experimental work, not a production Docket launcher. Startup fixes through `194b442dbde7ff718ac70e45beaaa815e09fc278` are integrated. The first synthetic admission run stopped at a skipped recheck after binding. The bounded recheck correction is verified offline; corrected live Q1a/Q1b results are **pending supervisor execution**, not passing qualification. Q1c, Q2, real Pi/model/resource qualification and actual Docket authority/provenance remain unproven. No old retained code was restored in this attempt.
+Experimental work, not a production Docket launcher. Startup fixes through `194b442dbde7ff718ac70e45beaaa815e09fc278` are integrated. The first synthetic admission run stopped at a skipped recheck after binding. The second passed held input across crashes before/after binding, then stopped at synthetic turn event ordering after exactly one durably permitted provider input. Both corrections are verified offline; corrected live Q1a/Q1b results are **pending supervisor execution**, not passing qualification. Q1c, Q2, real Pi/model/resource qualification and actual Docket authority/provenance remain unproven. No old retained code was restored in this attempt.
 
 ## Startup repair (R31, R33)
 
@@ -55,7 +55,7 @@ node --test tests/bb-admission-probe.test.ts tests/bb-control-http.test.ts tests
 BUILD_ROOT=$(mktemp -d -t docket-bb-build)
 cp -R bb/plugin "$BUILD_ROOT/plugin"
 mkdir "$BUILD_ROOT/home" "$BUILD_ROOT/data"
-(cd "$BUILD_ROOT/plugin" && npm ci --ignore-scripts --no-audit --no-fund && npm run check)
+(cd "$BUILD_ROOT/plugin" && npm ci --ignore-scripts --no-audit --no-fund && npm run check && npm run check:protocol)
 env -i PATH="$PATH" HOME="$BUILD_ROOT/home" BB_DATA_DIR="$BUILD_ROOT/data" \
   BB_SERVER_URL=http://127.0.0.1:1 \
   node /Applications/bb.app/Contents/Resources/app.asar.unpacked/node_modules/bb-app/dist/bb.js \
@@ -95,6 +95,26 @@ Evidence: `/Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-a0fb298/li
 Installed bb 0.49.0 `start-server.js` confirms that `runPluginRecheckDispatch` respects `isDispatchRequeuedRecently`: a recheck inside the 1000 ms pacing window returns without scheduling a trailing recheck. The last wait was at 1794376467129 and binding at 1794376467654. Waiting longer after that single request cannot itself generate a new decision.
 
 `probes/recheck.ts` now repeatedly requests only public hook re-evaluation until a fresh sequence in the current backend generation satisfies the required observation, bounded to 60 seconds per barrier and the independent whole-suite deadline. Held checks, permit/drain, race outcomes, completed-turn activation, retry rejection and waiting/fence rejection use this same helper. No create, send, bind, permit, retry or activation is automatically repeated. A successful recheck response or elapsed interval is not evidence. HTTP transport failure still fails immediately without retry; deliberate repeated rechecks are separate requests, not automatic mutation retries. Cheap fake-boundary tests cover skipped/coalesced requests, stale sequence/generation exclusion, bounded diagnostic failure/report retention and transport failure. The corrected live suite has not run in this worker.
+
+## Second synthetic admission result and event-order correction
+
+The supervisor ran `c5174d785396b122c936fc2332023a76e5a34531` once under independent guards. Startup, held input/crash before binding and bound hold/crash after binding passed. Single permit/drain recorded **exactly one synthetic provider input**, following durable bind, permit and consumption. That stage then failed waiting for a genuine accepted failed turn: the observed `turn.failed` had `inputAccepted: false`, `turnId: null`. This is not successful host acceptance. Ordinary retry/follow-up, races, completed fencing, backend reload, later-input rejection across server restart, waiting-input fence recovery and final validation stages were **not run**. The earlier hold stages did exercise server restart, not later-input fencing after completion.
+
+The server/daemon logs report `MissingStoredTurnStartedError`: acceptance reached storage before turn start. The bridge emitted `input.accepted` with an explicit provider turn ID before `turn.open`. SDK 0.6.132's assembler immediately emits acceptance for an explicit ID; it does not buffer it pending turn start. The previous offline check saw completion but did not assert ordering. `host.ts` now emits open, accepted, boundary for the same provider turn ID. The genuine `inputAccepted: true` live assertion and actual failed-request retry route remain unchanged; no host-rejected event is relabelled as acceptance.
+
+The monitor recorded zero Keychain events and zero blocked commands. Cleanup passed: all recorded process IDs were absent and both ports refused connections. Evidence: `/Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-c5174d7/live-outcome.md` and `monitor-output.jsonl`; retained root `/private/var/folders/82/z689vjhj5f9f6xlwg34dn3vw0000gn/T/docket-bb-MY6yWQ`. Earlier reports and startup evidence remain retained.
+
+### Standalone offline SDK protocol check
+
+After copying the plugin and installing its pinned dependencies in scratch as above, run:
+
+```sh
+(cd "$BUILD_ROOT/plugin" && npm run check:protocol)
+```
+
+This runs `protocol-check.ts` with plain Node, the **actual synthetic bridge** and the public SDK JSON-RPC capture harness/event assembler. No bb server, daemon, installed provider CLI, model or credentials are involved. It asserts ordered `turn/started` → `turn/input/accepted` → `turn/completed` consumer events for both deliberately failed and completed fixtures, matching nonempty turn scopes, exact client request IDs, one JSON-RPC reply, thread routing identities, stable provider identity on resume, no start/resume input and per-thread resumed cwd/input recording. Temporary directories are removed and stdout restored even on assertion failure. The public assembler leaves thread/provider identities empty; the installed daemon's `VF`/`KY` path stamps these from the notification's thread ID and provider identity. The check verifies that envelope separately; it does not pretend to test the server's persistence or `turn.failed` notification.
+
+Both paths pass on Node 26.7.0 / SDK 0.6.132. Restoring the old acceptance-before-open order in scratch makes the new check fail on the assembled order, even though completion still appears. No live corrected run was made by this worker. The check is deliberately outside root tests, which remain independent of installed bb and plugin dependencies. Remaining live scenarios and all previously listed gate gaps remain unproven.
 
 ## Supervisor: synthetic admission suite (corrected live results pending)
 
