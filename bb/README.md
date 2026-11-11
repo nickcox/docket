@@ -1,6 +1,6 @@
 # Experimental bb harness – unqualified
 
-Experimental work, not a production Docket launcher. Startup fixes through `194b442dbde7ff718ac70e45beaaa815e09fc278` are integrated. The first synthetic admission run stopped at a skipped recheck after binding. The second passed held input across crashes before/after binding, then stopped at synthetic turn event ordering after exactly one durably permitted provider input. Both corrections are verified offline; corrected live Q1a/Q1b results are **pending supervisor execution**, not passing qualification. Q1c, Q2, real Pi/model/resource qualification and actual Docket authority/provenance remain unproven. No old retained code was restored in this attempt.
+Experimental work, not a production Docket launcher. Startup fixes through `194b442dbde7ff718ac70e45beaaa815e09fc278` are integrated. The first synthetic admission run stopped at a skipped recheck after binding. The second passed held input across crashes before/after binding, then stopped at synthetic turn event ordering after exactly one durably permitted provider input. Both corrections were verified offline; the corrected run of `b538a7744272821088726368ac9e0f3e40db573d` then passed all 12 covered synthetic stages under independent guards. This is synthetic host-contract evidence, not full Q1a/Q1b qualification or qualified Docket bb support. Q1c, Q2, real Pi/model/resource qualification and actual Docket authority/provenance remain unproven. No old retained code was restored in this attempt.
 
 ## Startup repair (R31, R33)
 
@@ -94,7 +94,7 @@ Evidence: `/Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-a0fb298/li
 
 Installed bb 0.49.0 `start-server.js` confirms that `runPluginRecheckDispatch` respects `isDispatchRequeuedRecently`: a recheck inside the 1000 ms pacing window returns without scheduling a trailing recheck. The last wait was at 1794376467129 and binding at 1794376467654. Waiting longer after that single request cannot itself generate a new decision.
 
-`probes/recheck.ts` now repeatedly requests only public hook re-evaluation until a fresh sequence in the current backend generation satisfies the required observation, bounded to 60 seconds per barrier and the independent whole-suite deadline. Held checks, permit/drain, race outcomes, completed-turn activation, retry rejection and waiting/fence rejection use this same helper. No create, send, bind, permit, retry or activation is automatically repeated. A successful recheck response or elapsed interval is not evidence. HTTP transport failure still fails immediately without retry; deliberate repeated rechecks are separate requests, not automatic mutation retries. Cheap fake-boundary tests cover skipped/coalesced requests, stale sequence/generation exclusion, bounded diagnostic failure/report retention and transport failure. The corrected live suite has not run in this worker.
+`probes/recheck.ts` now repeatedly requests only public hook re-evaluation until a fresh sequence in the current backend generation satisfies the required observation, bounded to 60 seconds per barrier and the independent whole-suite deadline. Held checks, permit/drain, race outcomes, completed-turn activation, retry rejection and waiting/fence rejection use this same helper. No create, send, bind, permit, retry or activation is automatically repeated. A successful recheck response or elapsed interval is not evidence. HTTP transport failure still fails immediately without retry; deliberate repeated rechecks are separate requests, not automatic mutation retries. Cheap fake-boundary tests cover skipped/coalesced requests, stale sequence/generation exclusion, bounded diagnostic failure/report retention and transport failure. At that correction, the corrected live suite was still pending; the later passing run is recorded below.
 
 ## Second synthetic admission result and event-order correction
 
@@ -114,11 +114,21 @@ After copying the plugin and installing its pinned dependencies in scratch as ab
 
 This runs `protocol-check.ts` with plain Node, the **actual synthetic bridge** and the public SDK JSON-RPC capture harness/event assembler. No bb server, daemon, installed provider CLI, model or credentials are involved. It asserts ordered `turn/started` → `turn/input/accepted` → `turn/completed` consumer events for both deliberately failed and completed fixtures, matching nonempty turn scopes, exact client request IDs, one JSON-RPC reply, thread routing identities, stable provider identity on resume, no start/resume input and per-thread resumed cwd/input recording. Temporary directories are removed and stdout restored even on assertion failure. The public assembler leaves thread/provider identities empty; the installed daemon's `VF`/`KY` path stamps these from the notification's thread ID and provider identity. The check verifies that envelope separately; it does not pretend to test the server's persistence or `turn.failed` notification.
 
-Both paths pass on Node 26.7.0 / SDK 0.6.132. Restoring the old acceptance-before-open order in scratch makes the new check fail on the assembled order, even though completion still appears. No live corrected run was made by this worker. The check is deliberately outside root tests, which remain independent of installed bb and plugin dependencies. Remaining live scenarios and all previously listed gate gaps remain unproven.
+Both paths pass on Node 26.7.0 / SDK 0.6.132. Restoring the old acceptance-before-open order in scratch makes the new check fail on the assembled order, even though completion still appears. That offline check did not execute the corrected live suite. The check is deliberately outside root tests, which remain independent of installed bb and plugin dependencies. The subsequent synthetic result and remaining gate gaps are recorded below.
 
-## Supervisor: synthetic admission suite (corrected live results pending)
+## Corrected synthetic admission result – covered scenarios passed
 
-After stopping this worker, the supervisor may run **once**, under independent Keychain and provider-command guards. Build the scratch plugin as above from the exact clean committed candidate. Do not copy dependencies or bundles into the source tree. Run from that candidate's repository root:
+The supervisor's guarded run of tested code commit [`b538a7744272821088726368ac9e0f3e40db573d`](https://github.com/nickcox/docket/commit/b538a7744272821088726368ac9e0f3e40db573d) passed on 11 November 2026, 06:23:10.045–06:24:12.443 UTC (17:23:10.045–17:24:12.443 Sydney time). It used bb 0.49.0, SDK 0.6.132 and Node 26.7.0 on macOS arm64, with `docket-synthetic 0.1.0` and Pi plugin 0.1.0. This pins the tested code, not this documentation update.
+
+All 12 recorded stages passed: startup; held input/crash before bind; bound hold/crash after bind; single permit/drain; ordinary retry/follow-up; permit/fence races; completed fence; enabled backend reload; enabled server restart; waiting-first-input crash recovery; provider input validation; and cleanup. Seven synthetic threads received exactly two provider inputs in total, each after durable bind, permit and consumption, with none duplicated per thread. The supervisor independently rechecked the actual post-stop provider inputs against all 70 durable SQLite observations using `validateInputs`.
+
+Only `docket-synthetic` received test inputs. There were no real Pi/model calls, Keychain creation events or blocked credential/provider commands. Claude Code, Codex and ACP were independently verified persisted disabled. No recorded processes remained and ports 49201/49202 refused connections. The whole report and guardian passed without timeout.
+
+Retained evidence: [verification](file:///Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-b538a77/verification.json), [admission report](file:///Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-b538a77/admission-report.json), [guard monitor](file:///Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-b538a77/monitor-output.jsonl) and [offline SDK protocol check](file:///Users/nick/.bb/thread-storage/thr_i4r9iqub7v/bb-admission-b538a77/protocol-check.json). The report retains source/bundle hashes and stage evidence. Private run root: `/private/var/folders/82/z689vjhj5f9f6xlwg34dn3vw0000gn/T/docket-bb-AMIUqu`.
+
+### Synthetic suite procedure and scope
+
+The recorded run used a scratch plugin built as above from the exact clean committed candidate, under independent Keychain and provider-command guards. Dependencies and bundles stayed outside the source tree. Its entry point was:
 
 ```sh
 DOCKET_BB_PROBE_PLUGIN="$BUILD_ROOT/plugin" node bb/probes/q1a.ts
@@ -128,7 +138,7 @@ The entry refuses arguments (including `--pi`), requires plain Node 26.7.0, bb 0
 
 An **independent 300-second guardian deadline** bounds the whole entry, including blocking CLI calls; allow roughly two seconds more for TERM/KILL cleanup. It also handles parent death and signals. Timeout updates the active report stage to failed. No automatic rerun. Logs/data remain in the printed private temporary root on success, assertion error or timeout.
 
-Planned scenarios, each reported as passed, failed or not-run:
+Covered synthetic scenarios (all passed in the recorded run):
 
 - Q1a: observe the plugin-owned queue row and wait decision before binding; crash/restart with the same durable data; bind and observe another wait; crash/restart after binding with no permission; permit once and recheck through ordinary queue drain. Consume must be durable before provider input. Consumed controls cannot revive the row.
 - Q1a: retry the actual failed turn **by its `turn.failed.requestId`** through `bb.sdk.threads.retry`, then ordinary `thread tell --mode auto` and `--mode steer`. Retain attempted request and hook rejection evidence. No arbitrary delay stands in for dispatch observation.
@@ -140,7 +150,7 @@ Planned scenarios, each reported as passed, failed or not-run:
 
 These experiments test an **independent probe SQLite database**, not actual Docket binding, authority, claims or trusted provenance. The hook accepts only the exact synthetic initial CLI text and a single matching queued member; grouped or non-initial input is refused. Permission, consumption and their observations commit together. This is deliberately not a Docket launcher.
 
-Remaining gate gaps are explicit: UI and agent-origin submissions are not driven; steer mode targets an idle/fenced thread, not a live turn; retry of a completed turn may be refused by host preconditions rather than the hook (failed-turn retry covers the actual retry dispatch path); crashes cover persisted hook waits, not a callback paused mid-execution. Q1c uncertain create/send, real-provider recovery/terminal observation, Q2 isolation, actual Docket authority/provenance and production qualification remain unproven. Deliberate plugin disable/unload/replacement and Send now/queue send remain outside the guarantee and are never used by the suite.
+Remaining gate gaps are explicit: UI and agent-origin submissions were not driven; steer mode targeted an idle/fenced thread, not an active turn; completed-turn retry was refused by host preconditions, while actual failed-turn retry reached and was rejected by the hook; crashes covered persisted hook waits, not a hook callback paused mid-execution. Q1c uncertain create/send effects, Q2 real-provider isolation/recovery/terminal observation/environment retention and actual Docket authority/provenance remain unproven. Full Q1a/Q1b gates and Docket bb support are not qualified. Real Pi qualification is deferred pending the remaining gates. Deliberate plugin disable/unload/replacement and Send now/queue send remain outside the guarantee and are never used by the suite.
 
 ### Additional pinned contract checks
 
