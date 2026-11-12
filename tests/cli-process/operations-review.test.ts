@@ -72,10 +72,10 @@ for (const scenario of ['held', 'failed', 'replaced-candidate', 'dirty-untracked
     const shown = f.invoke('attempt.show', { attemptId: source.id }).data;
     assert.equal(shown.review.findings.length, dirty ? 1 : 0);
     if (dirty) {
-      assert.match(review.data.leaseReturn.reason, /uncommitted or untracked/);
+      assert.match(review.data.leaseReturn.reason, /workspace_dirty/);
       const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
       const attention = status.data.attempts.items.find((item: any) => item.id === attempt.id);
-      assert.match(attention.reason, /uncommitted or untracked/);
+      assert.match(attention.reason, /workspace_dirty/);
       assert.equal(attention.nextAction.operation, 'attempt.return');
       assert.ok(attention.nextAction.description);
       const path = join(attempt.allocation.path, scenario === 'dirty-untracked' ? 'unfinished.txt' : 'implementation.txt');

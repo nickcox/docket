@@ -1,7 +1,7 @@
 import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdir, readFile, readdir, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile, unlink, link } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { dispatch } from '../../src/dispatch.ts';
 import type { Runtime } from '../../src/runtime.ts';
@@ -81,6 +81,63 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false, piD
     dirty: () => { clean = false; }, cleanWorkspace: () => { clean = true; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
     loseRetention: () => { retained = false; } };
 }
+
+for (const operation of ['checks', 'acceptance', 'integration', 'return'] as const) {
+  for (const change of ['ref', 'result', 'missing_result', 'linked_result', 'dirty', 'untracked'] as const) {
+    test(`A18 R11: ${operation} refuses ${change} immediately before its effect`, async t => {
+      const f = await fixture(t, operation === 'integration');
+      const recorded = f.db.validatedWorkerResult(f.a.id);
+      const mutate = async () => {
+        if (change === 'ref') f.refs.set(f.a.binding.outputRef, 'c'.repeat(40));
+        else if (change === 'result') await writeFile(f.a.binding.resultPath, '{}');
+        else if (change === 'missing_result') await unlink(f.a.binding.resultPath);
+        else if (change === 'linked_result') await link(f.a.binding.resultPath, join(f.root, 'result-link'));
+        else if (change === 'dirty') f.dirty();
+        else f.services.repository.inspectWorkspace = async () => confirmed({
+          branch: f.a.binding.outputRef, head, clean: false, uncommitted: [], untracked: ['new-file'],
+        });
+      };
+      if (operation === 'integration') {
+        const record = f.db.recordAcceptance.bind(f.db);
+        f.db.recordAcceptance = async (...args) => {
+          const accepted = await record(...args);
+          await mutate();
+          return accepted;
+        };
+      } else await mutate();
+      const code = change === 'ref' ? 'candidate_moved'
+        : change === 'result' || change === 'missing_result' || change === 'linked_result' ? 'result_discrepancy' : 'workspace_dirty';
+      const run = operation === 'checks' ? () => runCandidateChecks(f.db, f.a.id, person, f.services)
+        : operation === 'return' ? () => returnAttempt(f.db, f.returns, f.services)
+          : () => acceptCandidate(f.db, { ...f.accept, overrideReason: 'Exercise integrity independently of checks' }, f.services);
+      await assert.rejects(run, { code });
+      assert.deepEqual(f.db.validatedWorkerResult(f.a.id), recorded, 'Recorded output is immutable');
+      assert.deepEqual(f.calls, [], 'No check, integration or lease return was called');
+      assert.equal(f.db.attempt(f.a.id).leaseState, 'held');
+      if (operation === 'acceptance') assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+    });
+  }
+}
+
+test('A18 R11: acceptance rechecks result integrity after checks finish', async t => {
+  const f = await fixture(t);
+  const run = f.services.run;
+  f.services.run = async (...args) => {
+    const result = await run(...args);
+    if (args[0].name === 'full') await writeFile(f.a.binding.resultPath, '{}');
+    return result;
+  };
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'result_discrepancy' });
+  assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+});
+
+test('A18 R11: reused passing checks do not waive acceptance workspace integrity', async t => {
+  const f = await fixture(t);
+  await runCandidateChecks(f.db, f.a.id, person, f.services);
+  f.dirty();
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'workspace_dirty' });
+  assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
+});
 
 test('A17/A18 R11/R33: a later-turn observation requires terminal evidence and a strict empty payload', async t => {
   const f = await checkFixture(t);
@@ -368,7 +425,7 @@ test('R11: person discards terminal missing/invalid results without retention an
     await assert.rejects(returnAttempt(f.db, input, f.services), /terminal/);
     await f.db.recordWorkerObservation(a.observation('terminal', 2), host);
     f.dirty();
-    await assert.rejects(returnAttempt(f.db, input, f.services), /uncommitted/);
+    await assert.rejects(returnAttempt(f.db, input, f.services), { code: 'workspace_dirty' });
     assert.equal(f.db.attempt(a.id).outcome, 'failed', 'discard settles the outcome but keeps dirty work');
     assert.equal(f.db.attempt(a.id).leaseState, 'held');
     f.cleanWorkspace();
@@ -413,7 +470,7 @@ test('A21/R11: automatic return keeps dirty, unretained, mismatched and unresolv
     const kept = await automaticReturn(f.db, f.a.id, person, f.services);
     assert.equal(kept.state, 'kept', failure);
     assert.equal(kept.attempt.leaseState, 'held');
-    assert.match(kept.reason!, /uncommitted|retained|match|unresolved/);
+    assert.match(kept.reason!, /workspace_dirty|retained|match|unresolved/);
     assert.equal(await leaseReturnReason(f.db, f.a.id, person, f.services), kept.reason);
     assert.equal(f.calls.includes('return'), false);
   }
@@ -855,7 +912,14 @@ test('R11: moved refs, failed cleanup and unknown cleanup never reverse a confir
   for (const failure of ['moved', 'rejected', 'uncertain']) {
     const f = await fixture(t, true);
     await acceptCandidate(f.db, f.accept, f.services);
-    if (failure === 'moved') f.refs.set(f.a.binding.outputRef, 'c'.repeat(40));
+    if (failure === 'moved') {
+      const returnLease = f.services.workspace.returnLease;
+      f.services.workspace.returnLease = async (...args) => {
+        const result = await returnLease(...args);
+        f.refs.set(f.a.binding.outputRef, 'c'.repeat(40));
+        return result;
+      };
+    }
     else f.services.repository.conditionalDeleteRef = async () => failure === 'rejected' ? rejected('Checked out elsewhere') : uncertain('Lost delete response');
     await returnAttempt(f.db, f.returns, f.services);
     assert.equal(f.db.attempt(f.a.id).leaseState, 'returned');

@@ -1,3 +1,4 @@
+import { requireOutputIntegrity } from './output-integrity.ts';
 import { checkEvidenceKey, mandatoryChecks } from './check-policy.ts';
 import { canonicalJson } from './configuration.ts';
 import { CommandFailure } from './response.ts';
@@ -12,7 +13,7 @@ import type { TrustedChecks } from './storage/reservations.ts';
 import type { TaskActor } from './storage/tasks.ts';
 import type { StoredRequest } from './storage/requests.ts';
 
-export type CheckRepository = Pick<GitRepository, 'readCheckPolicy' | 'identity' | 'inspectWorkspace'>;
+export type CheckRepository = Pick<GitRepository, 'readCheckPolicy' | 'identity' | 'inspectWorkspace' | 'inspectRef'>;
 export interface CheckServices {
   repository: CheckRepository;
   profile: ExecutionProfile;
@@ -35,12 +36,14 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
   const current = await repository.readCheckPolicy(target, config.checks);
   if (profile.id !== current.executionProfile) throw new StorageError('conflict', 'Check execution profile does not match policy');
   const checks = mandatoryChecks(attempt.specification.checks as TrustedChecks, current);
+  await requireOutputIntegrity(db, attemptId, repository);
   const admission = await db.beginChecks({ attemptId, commit, checks, profile, caller,
     expectedConfigRevision: config.revision, expectedConfigDigest: config.digest,
     ...(requestKey === undefined ? {} : { requestKey }) });
   if (!admission.execute) return admission.request;
   const commands: JsonObject[] = [];
   let status: 'passed' | 'failed' | 'uncertain' = 'passed';
+  let integrityFailure: CommandFailure | undefined;
   let heartbeat: Promise<void> | undefined, heartbeatFailed = false;
   const timer = setInterval(() => {
     if (heartbeat || heartbeatFailed) return;
@@ -69,6 +72,7 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
             commands.push({ kind, name: check.name, status: 'not_run', reason: 'An earlier check did not pass' });
             continue;
           }
+          await requireOutputIntegrity(db, attemptId, repository);
           if (!await clean()) {
             status = 'failed'; commands.push({ kind, name: check.name, status: 'not_run', reason: 'Workspace changed before command' });
             continue;
@@ -87,17 +91,24 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
       }
       if (!await clean() && status !== 'uncertain') status = 'failed';
     }
-  } catch {
-    // A thrown adapter call cannot establish that a started process is no longer running.
-    status = 'uncertain'; commands.push({ status: 'uncertain', reason: 'Check owner or workspace observation interrupted' });
+  } catch (error) {
+    if (error instanceof CommandFailure && ['candidate_moved', 'result_discrepancy', 'workspace_dirty'].includes(error.code)) {
+      integrityFailure = error;
+      status = 'failed'; commands.push({ status: 'not_run', reason: error.code });
+    } else {
+      // A thrown adapter call cannot establish that a started process is no longer running.
+      status = 'uncertain'; commands.push({ status: 'uncertain', reason: 'Check owner or workspace observation interrupted' });
+    }
   } finally {
     clearInterval(timer);
     // Drain any write before recording the result, including an uncertain one.
     await heartbeat;
   }
   if (heartbeatFailed) status = 'uncertain';
-  return db.finishChecks(admission.request.id, admission.executor!, { status,
+  const result = await db.finishChecks(admission.request.id, admission.executor!, { status,
     evidenceKey: String(admission.request.input.evidenceKey), commands });
+  if (integrityFailure) throw integrityFailure;
+  return result;
 }
 
 export interface RunChecksInput {
@@ -159,6 +170,7 @@ async function planChecks(db: Database, input: RunChecksInput, services: CheckSe
   const current = await services.repository.readCheckPolicy(target, config.checks);
   if (services.profile.id !== current.executionProfile) throw new StorageError('conflict', 'Check execution profile does not match policy');
   const checks = mandatoryChecks(attempt.specification.checks as TrustedChecks, current);
+  await requireOutputIntegrity(db, attempt.id, services.repository);
   const key = checkEvidenceKey(attempt.specification.repository as JsonObject, input.commit,
     attempt.specification.criteria as string[], checks, services.profile);
   if (db.requests().some(request => request.operation === 'checks.run' && request.input.evidenceKey === key

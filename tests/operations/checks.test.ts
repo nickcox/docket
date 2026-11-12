@@ -29,6 +29,7 @@ function fakeServices() {
   const services: CheckServices = { profile,
     repository: { readCheckPolicy: async () => parseCheckPolicy(sourceCommit, content, contextChecks),
       identity: async () => confirmed('/repo'),
+      inspectRef: async () => confirmed({ state: 'present', commit: candidate }),
       inspectWorkspace: async () => confirmed({ branch: 'refs/heads/worker', head: candidate, clean, uncommitted: clean ? [] : ['file'], untracked: [] }) },
     run: async check => { calls.push(check.name); return passed; } };
   return { services, calls, policy: (value: string | null) => { content = value; }, source: (value: string) => { sourceCommit = value; },
@@ -249,7 +250,7 @@ test('R15/R16: profile identity and ignored paths are detached before asynchrono
   assert.equal(result.state, 'succeeded');
   assert.deepEqual(result.input.profile, profile);
   assert.ok(observedPaths.length > 0);
-  assert.ok(observedPaths.every(paths => JSON.stringify(paths) === JSON.stringify(profile.ignoredGeneratedPaths)));
+  assert.ok(observedPaths.every(paths => paths.length === 0 || JSON.stringify(paths) === JSON.stringify(profile.ignoredGeneratedPaths)));
 });
 
 test('R16: missing terminal or validated result evidence refuses without starting commands', async t => {
@@ -321,6 +322,12 @@ test('R16/A35: changed workspace or candidate fails and a later command is not r
     if (mutation === 'between') fake.dirty();
     else if (mutation === 'unknown') fake.services.repository.inspectWorkspace = async () => uncertain('Cannot inspect');
     else fake.services.run = async check => { fake.calls.push(check.name); if (mutation === 'head') fake.move(); else fake.dirty(); return passed; };
+    if (mutation === 'between' || mutation === 'unknown') {
+      await assert.rejects(runCandidateChecks(f.db, a.id, person, fake.services),
+        { code: mutation === 'between' ? 'workspace_dirty' : 'owner_unknown' });
+      assert.deepEqual(fake.calls, []);
+      continue;
+    }
     const result = await runCandidateChecks(f.db, a.id, person, fake.services);
     assert.equal(result.state, 'rejected', mutation);
     assert.equal(f.db.task(`task-${mutation}`).holdReason, 'checks_failed');

@@ -1,5 +1,6 @@
 import { join, dirname } from 'node:path';
 import { canonicalJson } from './configuration.ts';
+import { requireOutputIntegrity, requireResultIntegrity } from './output-integrity.ts';
 import { runCandidateChecks } from './checks.ts';
 import { checkEvidenceKey, mandatoryChecks } from './check-policy.ts';
 import type { TrustedChecks } from './storage/reservations.ts';
@@ -11,7 +12,6 @@ import type { AcceptInput, ReturnInput, FinalisationPlan } from './storage/compl
 import type { Allocation } from './storage/reservations.ts';
 import type { StoredRequest } from './storage/requests.ts';
 import { acceptanceCheckFailure } from './storage/checks.ts';
-import { readWorkerResult } from './storage/results.ts';
 import { taskActor } from './storage/tasks.ts';
 import type { GitRepository, RetentionRequest } from './adapters/repository.ts';
 import type { Result } from './adapters/command.ts';
@@ -60,8 +60,7 @@ export async function retainedOutput(db: Database, attemptId: string, services: 
     return retention;
   }
   if (!recorded) refuse('Validated retained output is required');
-  const current = await readWorkerResult(binding);
-  if (recorded!.digest !== current.digest || canonicalJson(recorded!.artefacts) !== canonicalJson(current.artefacts)) refuse('Validated output changed');
+  const current = (await requireResultIntegrity(db, attemptId))!;
   const references = (current.content.workReferences as JsonObject[]).filter(item => item.kind === 'git')
     .map(item => ({ ref: String(item.branch), commit: String(item.commit) }));
   for (const reference of references) {
@@ -169,6 +168,8 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
   const finished = accepted && db.events().some(e => e.sourceKey === `acceptance.finished:${accepted.id}`);
   if (finished) return { steps: [] };
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
+  await requireOutputIntegrity(db, attempt.id, services.repository,
+    selecting ? { outputRef: String(attempt.specification.outputRef), commit: input.commit } : undefined);
   await retainedOutput(db, attempt.id, services);
   const policy = await planAcceptance(db, input, services);
   if (policy.kind === 'local-merge') db.checkIntegrationAuthority(input.caller, input.attemptId);
@@ -231,6 +232,7 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
         attempt.specification.criteria as string[], mandatoryChecks(attempt.specification.checks as TrustedChecks, current), services.profile);
       if (checks.input.evidenceKey !== key) refuse('Mandatory check policy changed before acceptance');
     }
+    await requireOutputIntegrity(db, input.attemptId, services.repository);
     accepted = await db.recordAcceptance(input, command.id, plan, checks, config);
   }
   const plan = accepted.payload.plan as FinalisationPlan;
@@ -251,6 +253,7 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
       if (current.target !== plan.target || current.kind !== plan.kind || current.policyDigest !== plan.policyDigest) refuse('Finalisation policy changed after acceptance');
       if (current.expected !== plan.expected) refuse('Target moved after planning');
       alreadyContains = known(await services.repository.compare(input.commit, plan.expected));
+      await requireOutputIntegrity(db, input.attemptId, services.repository);
     });
   }
   return db.finishAcceptance(accepted);
@@ -276,9 +279,12 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
     if (known(await services.workspace.inspect(allocation)).state !== 'absent') refuse('Interrupted effect remains unresolved; it will not be repeated');
     return { steps: [step('return.reconcile', allocation.leaseId, ['owner_confirms_return'])] };
   }
-  if (attempt.outcome && !input.discard && !authorisation?.payload.discard) await retainedOutput(db, attempt.id, services);
+  if (!input.discard && !authorisation?.payload.discard) {
+    await requireOutputIntegrity(db, attempt.id, services.repository);
+    if (attempt.outcome) await retainedOutput(db, attempt.id, services);
+  }
   if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
-  if (!known(await services.repository.inspectWorkspace(allocation.path)).clean) refuse('Workspace has uncommitted or untracked work');
+  if (!known(await services.repository.inspectWorkspace(allocation.path)).clean) throw new CommandFailure('workspace_dirty', { attemptId: attempt.id });
   return { steps: [step(input.discard ? 'attempt.discard' : 'attempt.return', allocation.leaseId, ['terminal', 'matching_allocation', 'clean_workspace', 'retained_output'])] };
 }
 
@@ -300,7 +306,7 @@ export async function returnAttempt(db: Database, input: ReturnInput, services: 
         : await retainedOutput(db, input.attemptId, services);
       if (known(await services.workspace.inspect(allocation)).state !== 'matching') refuse('Allocation does not match');
       const workspace = known(await services.repository.inspectWorkspace(allocation.path));
-      if (!workspace.clean) refuse('Workspace has uncommitted or untracked work');
+      if (!workspace.clean) throw new CommandFailure('workspace_dirty', { attemptId: input.attemptId });
     }
     await effect(db, authorisation, 'return', { allocation }, async () =>
       known(await services.workspace.inspect(allocation)).state === 'absent' ? { leaseId: allocation.leaseId, returned: true } : null,

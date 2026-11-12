@@ -127,6 +127,7 @@ test('R16/A35: open descendant pipes keep both successful and nonzero exits unce
     const services = { profile, repository: {
       readCheckPolicy: async () => parseCheckPolicy(start, policy, contextChecks),
       identity: async () => confirmed('/repo'),
+      inspectRef: async () => confirmed({ state: 'present' as const, commit: head }),
       inspectWorkspace: async () => confirmed({ branch: 'refs/heads/worker', head, clean: true, uncommitted: [], untracked: [] }),
     }, run: async () => {
       commands++;
@@ -193,6 +194,12 @@ test('R16/A35: candidate checks with real Git fail tracked/untracked mutations a
     const candidate = await git('rev-parse', 'HEAD');
     if (mutation === 'hidden-index') await git('update-index', '--assume-unchanged', 'file');
     const a = await f.attempt('task', ['Criterion'], workspace, candidate, base, content);
+    await git('update-ref', a.binding.outputRef, candidate);
+    if (mutation === 'hidden-index') {
+      await assert.rejects(runCandidateChecks(f.db, a.id, person, { profile, repository: repo, run: checkCommandRunner(environment) }),
+        { code: 'owner_unknown' });
+      continue;
+    }
     const result = await runCandidateChecks(f.db, a.id, person, { profile, repository: repo, run: checkCommandRunner(environment) });
     assert.equal(result.state, mutation === 'ignored' ? 'succeeded' : 'rejected', mutation);
     assert.equal(result.result!.status, mutation === 'ignored' ? 'passed' : 'failed', mutation);

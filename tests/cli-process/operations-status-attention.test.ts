@@ -58,19 +58,18 @@ test('A21: kept leases show current dirt, retention and unresolved-effect reason
   const attempt = dispatched.data.attempt;
   await writeFile(join(attempt.allocation.path, 'untracked'), 'Keep this work');
   const accepted = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false });
-  assert.equal(accepted.status, 0, JSON.stringify(accepted.envelope));
-  assert.equal(accepted.data.leaseReturn.state, 'kept');
-  assert.equal(accepted.data.attempt.leaseState, 'held');
+  assert.equal(accepted.envelope.code, 'workspace_dirty');
+  assert.equal(f.invoke('attempt.show', { attemptId: attempt.id }).data.leaseState, 'held');
   const status = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
   const attention = status.data.attempts.items.find((item: any) => item.id === attempt.id);
-  assert.match(attention.reason, /uncommitted or untracked/);
+  assert.match(attention.reason, /workspace_dirty/);
   assert.equal(attention.nextAction.operation, 'attempt.return');
   assert.ok(attention.nextAction.description);
 
   // A later status read checks current retention, not just the failed automatic return.
   f.git('update-ref', attempt.specification.outputRef, attempt.specification.startingCommit);
   const unretained = f.invoke('status.show', { attentionOnly: true, page: { after: null, limit: 100 } }).data.attempts.items[0];
-  assert.match(unretained.reason, /retained/);
+  assert.match(unretained.reason, /candidate_moved/);
   assert.ok(unretained.nextAction.description);
   f.git('update-ref', attempt.specification.outputRef, attempt.candidate.commit);
 

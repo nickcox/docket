@@ -126,7 +126,7 @@ test('R09/R32: explicit return rechecks a kept lease after untracked work is ret
   const untracked = join(attempt.allocation.path, 'untracked');
   await writeFile(untracked, 'Keep this work');
   const accepted = f.invoke('attempt.accept', { attemptId: attempt.id, candidateCommit: null, overrideReason: null, dryRun: false });
-  assert.equal(accepted.data.leaseReturn.state, 'kept');
+  assert.equal(accepted.envelope.code, 'workspace_dirty');
   await writeFile(join(f.home, 'retained-work'), await readFile(untracked));
   await rm(untracked);
   const returned = f.invoke('attempt.return', { attemptId: attempt.id, dryRun: false });
@@ -176,7 +176,7 @@ test('R11: CLI discards terminal missing/invalid output, refuses dirty work and 
     await writeFile(dirty, 'Keep this work');
     const kept = f.invoke('attempt.discard', discard);
     assert.equal(kept.data.leaseReturn.state, 'kept');
-    assert.match(kept.data.leaseReturn.reason, /uncommitted or untracked/);
+    assert.match(kept.data.leaseReturn.reason, /workspace_dirty/);
     assert.equal(f.invoke('attempt.show', { attemptId }).data.outcome, 'held');
     await rm(dirty);
     const returned = f.invoke('attempt.return', { attemptId, dryRun: false }, 'return-discarded');
