@@ -41,6 +41,8 @@ The first release supports the following capabilities before it is ready for eve
 | Several reviews of one candidate at once, with a focus per reviewer and a combined verdict | One current verdict per candidate and criteria; the latest completed review replaces earlier verdicts |
 | Automatic fallback to another profile when a profile is limited | Dispatch on a limited profile refuses with provider_limited; a person or supervisor names another profile, and a person clears the limit with profile.clear |
 | Proof that every process a worker started has stopped | Automatic lease return depends on committed, retained work, not on process state |
+| Proof that no later bb turn can run on a finished worker | The plugin hook refuses later turns on a best-effort basis; Docket detects changes to a finished attempt's output before checks, acceptance, integration and return (R11) |
+| Isolating bb workers from the person's provider settings, skills, extensions and tools | bb workers have the same capabilities as the person's ordinary coding threads, and the bb launcher documentation says so |
 | Automatic or periodic clean-up of diagnostics | diagnostics.clean is explicit and per attempt; session transcripts are kept unless a person asks to remove them |
 | Event-history compaction, request-key expiry and permanent-identity deletion | Domain identities and evidence remain available |
 | Worker-requested full checks | Workers run fast checks; Docket runs the full checks once the worker stops |
@@ -55,7 +57,7 @@ Each milestone has observable exit evidence.
 
 | Milestone | Required evidence |
 | --- | --- |
-| M1: contracts and host feasibility | Schema/envelope/tool examples validate; Q1/Q2 establish a conforming bb admission, resource and terminal-state mechanism using pinned SDK/provider versions |
+| M1: contracts and host feasibility | Schema/envelope/tool examples validate; Q1/Q2 establish a conforming bb admission, later-turn detection and terminal-state mechanism, and record a worker's loaded resources, using pinned SDK/provider versions |
 | M2: storage and domain operations | Tasks/graph, requests/claims, immutable specifications/events, known/unknown observations and pure decisions satisfy applicable A01–A16 and A48–A54 cases |
 | M3: standalone execution | One real Pi task demonstrates exact allocation/prompt/result, candidate retention, held outcome and person-confirmed return through the common operations |
 | M4: evidence and supervision | Checks/slots, reviews, continuations, rebase, acceptance/integration/return, objectives/budgets/questions/events, catalogue and restricted supervisor satisfy applicable A17–A47 cases |

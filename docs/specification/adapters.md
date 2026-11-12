@@ -16,13 +16,13 @@ There is no independent task queue, speculative next-task dispatcher, worker ado
 
 | Method | Contract |
 | --- | --- |
-| capabilities(profile) | Supported preparation/admission, active steering, after-turn message, stop-turn, terminal stop/fence, usage metrics, resource isolation and observation sources |
+| capabilities(profile) | Supported preparation/admission, active steering, after-turn message, stop-turn, terminal stop/fence and whether the launcher enforces the fence, usage metrics and observation sources |
 | prepare(binding, effectId) | Create a non-acting worker/session, or equivalent protected preparation; return a reference or definite rejection/uncertainty |
 | activate(reference, storedInput, effectId, claimGeneration) | Admit exactly one initial task prompt after reference binding and launch permission |
 | inspect(reference) | Current worker/turn/terminal state and capabilities, or unknown; no prompting |
 | deliver(reference, message, mode, effectId) | At most one send attempt, never restart a terminal worker; report unsupported or uncertainty explicitly |
 | stop(reference, effectId) | Request cancellation/termination; prove terminal state separately |
-| fence(reference, effectId) | Establish that no future turn for this attempt can run; not merely an in-memory flag |
+| fence(reference, effectId) | Record durably that no future turn for this attempt may run, and refuse later turns where the launcher can; not merely an in-memory flag. The bb launcher refuses them on a best-effort basis (R33) |
 | usage(reference) | Session-attributed cumulative metrics with reported/unknown/unsupported status |
 | result(reference) | Retained regular-file/result transport reference, not acceptance |
 
@@ -54,7 +54,7 @@ Checks run in the attempt's own workspace after its worker is terminal, so they 
 2. Plugin backend registers ownership and prepares a bb thread/environment. No task prompt may run yet.
 3. Record the returned thread/reference and resource identity in the core. Conditionally permit launch under its owning claim.
 4. Admit the exact activation effect once. Any replay through the supported dispatch path after admission is blocked or exposed as uncertain, never reprompted.
-5. Use host events plus fresh reads to observe progress. At terminal candidate, validate result, establish durable no-later-turn fencing, confirm stopped state, then record terminal/completion facts.
+5. Use host events plus fresh reads to observe progress. At terminal candidate, validate result, record the fence, confirm stopped state, then record terminal/completion facts.
 
 Stored thread metadata can locate a candidate binding, but cannot authorise it. The core database plus trusted host provenance establishes authority. Another agent/plugin can edit metadata; a valid-looking object is insufficient. The hook must check every member of grouped queued messages, not merely the first row's origin.
 
@@ -62,9 +62,11 @@ A person's message to a worker is recorded as a steer request before delivery. A
 
 An intent precedes each SDK create/send. If a response is lost, inspect stable thread/queue/timeline identifiers where available; no matching message does not prove non-delivery. Remain uncertain unless an owner proves what happened. New attempt creation after resolution is explicit.
 
-The bb launcher guarantees admission and terminal fencing only while the Docket plugin is installed and enabled and messages pass through its hook. It must restore the fence after normal backend reload and server restart with the plugin enabled. Deliberately disabling, unloading or changing the plugin, or explicitly using bb Send now or `bb thread queue send` on a worker, is outside this guarantee: bb may admit queued or later messages without Docket checking them. These limitations must be visible in bb launcher documentation. The core must not treat idle/stopped alone as terminal evidence.
+The hook's refusal of later turns is a best-effort guard, not a guarantee. It works only while the Docket plugin is installed and enabled and messages pass through its hook. After a normal backend reload or server restart, the plugin registers its hook again before it reconciles tracked threads. bb can still run a later turn without Docket checking it: for example when the plugin is disabled, unloaded or replaced, when someone uses bb Send now or `bb thread queue send` on a worker, or in host recovery cases that qualification has not covered. Docket therefore does not rely on the refusal to protect a finished attempt's output. Instead it detects later changes, as R11 describes: before checks, acceptance, integration and return it checks the candidate commit, the result file and the workspace again, and the backend records a later turn that it observes on a finished worker's thread as a discrepancy.
 
-Workers use a dedicated, qualified execution profile. Inject only approved credentials, task inputs and required tools; validate exact cwd/provider/model and exclude unintended user/project settings, extensions and context sources where the profile promises isolation. Explicitly describe any remaining trusted-user capabilities. A normal unrestricted coding thread is not silently equivalent to an isolated Pi worker.
+A later turn that runs after the lease has been returned could change a workspace that another attempt has since acquired, and Docket cannot detect every such change. bb launcher documentation must state this limit and the paths that bypass the hook. The core must not treat idle/stopped alone as terminal evidence.
+
+A bb worker runs with the provider's normal resources for the person who runs Docket: their user and project settings, skills, extensions, context sources and the tools the provider offers. Docket does not try to remove them, so a bb worker has the same capabilities as the person's ordinary coding threads, and bb launcher documentation says so. The execution profile fixes the provider and model, the launcher checks the cwd, provider and model before activation, and the worker receives only the credentials its profile references.
 
 ## bb host
 
@@ -111,10 +113,10 @@ Qualification pins the SDK/provider/host versions and records source/type eviden
 | Gate | Experiment and required outcome | If it fails |
 | --- | --- | --- |
 | Q1a | Prepare thread while holding first message; crash before/after reference bind, race a fence and activation, drain queue/retry through the ordinary dispatch path. Count provider input admissions; at most one, only after committed permission. | Select another protected creation/provider mechanism; never weaken R06. |
-| Q1b | With the Docket plugin enabled, finish a worker, reload the backend and restart bb, then unarchive and send/retry/steer through ordinary UI/agent/system dispatch. No further worker input may execute. Repeat with a crash while the first message waits on the plugin hook, then restore the enabled plugin and inspect admission before retry. | Revise plugin recovery and fencing before qualifying the bb launcher. Deliberate plugin disable, unload or replacement and explicit Send now are outside this gate. |
+| Q1b | With the Docket plugin enabled, finish a worker, then send, retry and steer it through ordinary bb dispatch. The hook refuses each message and no further worker input runs. After a backend reload and a server restart, the hook is registered before tracked threads are reconciled. Then run a later turn on the finished worker through a path that bypasses the hook, such as Send now, and change its output: Docket reports the change before checks, acceptance, integration or return. | Fix the hook or the detection before qualifying the bb launcher. A path whose refusal cannot be made to work is documented as a limit; detection is still required. |
 | Q1c | Lose SDK create/send response; inspect queue/timeline and replay command key. No second create/send without definite non-occurrence proof; uncertainty visible. | Keep unresolved effect; do not add blind retry. |
-| Q2a | Place user/project settings, skills, context and extensions where provider would find them; verify actual loaded resources, cwd/model and allowed tools. With the provider's sandbox enabled, verify that a worker can edit, run fast checks and commit in its Treehouse worktree, which writes to the backing repository's `.git`, and can reach only the network its profile allows. Record which of these sandbox settings the plugin can set for a worker thread and which a person must configure. | Restrict supported provider/profile, or obtain approval for an explicit trust-model change. If a needed sandbox setting cannot be set by the plugin, document it and refuse to start a worker until it is configured, rather than letting the worker fail part-way. |
-| Q2b | With the plugin enabled, inspect real interrupted/completed turns across backend reload and bb restart; compare provider events, thread state, queued inputs and result. Idle is never sufficient; terminal fence survives recovery. | Revise terminal mechanism before adapter acceptance. |
+| Q2a | Run a worker with the profile's provider and model in its Treehouse worktree. Record the actual cwd, provider and model, and which user/project settings, skills, extensions and context sources it loaded. Verify that it can edit, run fast checks and commit, which writes to the backing repository's `.git`. | Document the difference. Restrict the supported provider/profile only if the worker cannot do its work. |
+| Q2b | With the plugin enabled, inspect real interrupted/completed turns across backend reload and bb restart; compare provider events, thread state, queued inputs and result. Idle is never sufficient; a later turn after recovery is recorded as a discrepancy. | Revise terminal mechanism before adapter acceptance. |
 | Q2c | Archive/delete worker and parent/project, attempt environment removal and retries, with dirty output/active worker/preserved lease. Path/lease remains until core return is authorised; no premature teardown scripts. | Use externally attached retained paths as a qualified fallback, with explicit identity mapping and removal refusal. |
 
 Tests may use synthetic providers/peers first. A real bb objective and standalone Pi dispatch are still required. Qualification evidence identifies the versions, environment, budget and observed results of each real experiment.

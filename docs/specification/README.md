@@ -89,7 +89,7 @@ These documents form one specification. Requirement IDs R01–R40 are normative.
 | R30 | Dry-run/execution agreement | [Contracts](contracts.md#plans-and-errors) |
 | R31 | Reference-based launcher and capability contract | [Adapters](adapters.md#launchers) |
 | R32 | Workspace ownership and safe return contract | [Adapters](adapters.md#workspaces-and-repository) |
-| R33 | bb first-message admission, fencing and uncertain sends | [Adapters](adapters.md#bb-launcher) |
+| R33 | bb first-message admission, later-turn guard and detection, and uncertain sends | [Adapters](adapters.md#bb-launcher) |
 | R34 | bb environments, events, questions and supervision | [Adapters](adapters.md#bb-host) |
 | R35 | Minimal standalone Pi and restricted supervisor | [Adapters](adapters.md#standalone-pi) |
 | R36 | No speculative launch, replay or duplicated infrastructure | [Adapters](adapters.md#ownership-boundaries) |
@@ -102,7 +102,7 @@ These documents form one specification. Requirement IDs R01–R40 are normative.
 
 Host support requires evidence for two technical gates:
 
-- Q1: Verify that the bb launcher enforces admission before the first prompt and refuses later/retried turns during normal operation, backend reload and server restart with the Docket plugin enabled. Deliberate plugin disable, unload or replacement and explicit Send now are outside this guarantee.
-- Q2: Identify the pinned bb/provider combinations that provide the required worker resource isolation and trustworthy terminal-state observation.
+- Q1: Verify that the bb launcher admits the first prompt only after launch permission, that the Docket plugin's hook refuses later turns for a finished attempt through ordinary dispatch, and that Docket detects a later turn that bypasses the hook before it checks, accepts, integrates or returns the attempt's output.
+- Q2: Identify the pinned bb/provider combinations that give trustworthy terminal-state observation and keep a worker's workspace until the core returns it, and record which resources a worker actually loads.
 
 [Adapters](adapters.md#qualification-gates) defines the experiments and required outcomes. An adapter cannot be qualified without satisfying the applicable requirements.
