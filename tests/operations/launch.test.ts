@@ -136,7 +136,7 @@ test('R06/R07/R08/R09: another connection records stop; only the owner fences, r
   assert.equal(db.requests().filter(r => r.operation === 'worker.stop').length, 1);
   await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: 1, attemptId: value.attemptId,
     workerRef: value.reference, observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
-    payload: { terminal: true, laterTurnsRefused: true } }, host);
+    payload: { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host);
   assert.equal((await db.interruptWorker(value.attemptId, host)).outcome, 'interrupted');
   assert.equal(db.attempt(value.attemptId).executionOpen, false);
 });

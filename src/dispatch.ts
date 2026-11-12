@@ -257,7 +257,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
       workerTimeMs: { availability: 'reported', value: Math.max(0, stoppedAt - Date.parse(String(session.payload.registeredAt))) } }, host);
     await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: ++sequence, attemptId: id, workerRef: reference,
       observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
-      payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
+      payload: reference.launcher === 'pi' ? { directChildExited: true } : { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host);
     progress('attempt.complete');
     if (turnFailure) {
       await db.failWorkerTurn(id, host, turnFailure);
@@ -315,7 +315,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
             try {
               await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: ++sequence, attemptId: id, workerRef: reference,
                 observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
-                payload: reference.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } }, host);
+                payload: reference.launcher === 'pi' ? { directChildExited: true } : { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host);
               terminal = true;
               stoppedAt ??= Date.now();
             } catch { /* Leave the claim unreleased; a person can resolve it from the recorded stop. */ }

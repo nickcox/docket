@@ -2975,7 +2975,7 @@ export class Database {
     const workerRef = object(JSON.parse(String(attempt.runtime_ref))) as WorkerReference;
     const observation: WorkerObservation = { sourceId: `stop:${request.id}`, sourceSequence: 0, attemptId, workerRef,
       observedAt: request.claimedAt ?? request.createdAt, kind: 'terminal', payloadVersion: 1,
-      payload: workerRef.launcher === 'pi' ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true } };
+      payload: workerRef.launcher === 'pi' ? { directChildExited: true } : { turnEnded: true, threadStopped: true, fenceRecorded: true } };
     workerObservation(observation);
     this.insertEvent({ sourceKey: `worker.observation:${json([attemptId, observation.sourceId, 0])}`, kind: 'worker.observed',
       payloadVersion: 1, correlationId: attemptId, actor: object(caller), occurredAt: observation.observedAt,

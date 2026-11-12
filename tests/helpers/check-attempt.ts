@@ -75,7 +75,7 @@ export async function checkFixture(t: TestContext, maximum = 1, piDiagnostics = 
     await writeFile(binding.resultPath, JSON.stringify(result));
     const observation = (kind: 'terminal' | 'result_available', sequence: number) => ({ sourceId: name, sourceSequence: sequence,
       attemptId: id, workerRef: reference, observedAt: new Date().toISOString(), kind, payloadVersion: 1 as const,
-      payload: kind === 'terminal' ? (piDiagnostics ? { directChildExited: true } : { terminal: true, laterTurnsRefused: true }) : {} });
+      payload: kind === 'terminal' ? (piDiagnostics ? { directChildExited: true } : { turnEnded: true, threadStopped: true, fenceRecorded: true }) : {} });
     if (stage !== 'prepared') await observeWorker(db, observation('result_available', 1), host, retention);
     if (stage === 'completed') await observeWorker(db, observation('terminal', 2), host, retention);
     return { id, allocation, binding, observation };

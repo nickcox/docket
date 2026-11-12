@@ -188,8 +188,8 @@ export function workerObservation(value: WorkerObservation): void {
       fields(payload, ['directChildExited']);
       if (payload.directChildExited !== true) invalid('Pi terminal observation requires direct child exit');
     } else if (value.workerRef.launcher === 'bb') {
-      fields(payload, ['terminal', 'laterTurnsRefused']);
-      if (payload.terminal !== true || payload.laterTurnsRefused !== true) invalid('bb terminal observation requires durable refusal of later turns');
+      fields(payload, ['turnEnded', 'threadStopped', 'fenceRecorded']);
+      if (payload.turnEnded !== true || payload.threadStopped !== true || payload.fenceRecorded !== true) invalid('bb terminal observation requires turn ended, thread stopped and fence recorded');
     } else invalid('Unknown terminal observation launcher');
   } else if (['turn_ended', 'later_turn', 'result_available', 'idle'].includes(value.kind)) fields(payload, []);
   else invalid('Unsupported worker observation kind');

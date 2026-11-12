@@ -70,7 +70,7 @@ async function fixture(t: TestContext, kind: 'code' | 'report' = 'code', deliver
   function observation(kind: WorkerObservation['kind'], sourceSequence = sequence++): WorkerObservation {
     return { sourceId: 'worker-events', sourceSequence, attemptId, workerRef: reference,
       observedAt: '2026-11-08T09:00:00.000Z', kind, payloadVersion: 1,
-      payload: kind === 'terminal' ? { terminal: true, laterTurnsRefused: true } : {} };
+      payload: kind === 'terminal' ? { turnEnded: true, threadStopped: true, fenceRecorded: true } : {} };
   }
   async function observe(kind: WorkerObservation['kind'], sourceSequence?: number) {
     return observeWorker(db, observation(kind, sourceSequence), host, repository);
@@ -356,12 +356,17 @@ test('R10: held and failed results record their outcome, hold the task and never
   }
 });
 
-test('R07: wrong worker, host, duplicate source content and inadequate terminal proof cannot supply terminal evidence', async t => {
+test('R07/R33: wrong worker, host, duplicate source content and inadequate terminal proof cannot supply terminal evidence', async t => {
   const f = await fixture(t); await f.save();
   const observation = f.observation('terminal');
   await assert.rejects(f.db.recordWorkerObservation({ ...observation, workerRef: { launcher: 'bb', threadId: 'other' } }, host), refuses('result_identity_mismatch'));
   await assert.rejects(f.db.recordWorkerObservation(observation, { ...host, generation: 'other' }), refuses('conflict'));
-  await assert.rejects(f.db.recordWorkerObservation({ ...observation, payload: { terminal: true, laterTurnsRefused: false } }, host), refuses('result_invalid'));
+  for (const fact of ['turnEnded', 'threadStopped', 'fenceRecorded']) {
+    const payload = { ...observation.payload };
+    delete payload[fact];
+    await assert.rejects(f.db.recordWorkerObservation({ ...observation, payload }, host), refuses('result_invalid'));
+    await assert.rejects(f.db.recordWorkerObservation({ ...observation, payload: { ...observation.payload, [fact]: false } }, host), refuses('result_invalid'));
+  }
   await assert.rejects(f.db.recordWorkerObservation({ ...observation, payload: { noProcesses: true } }, host), refuses('result_invalid'));
   assert.equal(f.db.events().filter(event => event.kind === 'worker.observed').length, 0);
   await f.db.recordWorkerObservation(observation, host);

@@ -54,7 +54,7 @@ async function fixture(t: Parameters<typeof checkFixture>[0]) {
     async function save() { await mkdir(dirname(binding.resultPath), { recursive: true }); await writeFile(binding.resultPath, JSON.stringify(content)); }
     async function terminal() { await f.db.recordWorkerObservation({ sourceId: id, sourceSequence: 1, attemptId: id,
       workerRef: preparation.result!.reference as WorkerReference, observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
-      payload: { terminal: true, laterTurnsRefused: true } }, host); }
+      payload: { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host); }
     return { id, binding, content, save, terminal, allocation, launcher };
   }
   return { ...f, source, target, review, command, worker };
