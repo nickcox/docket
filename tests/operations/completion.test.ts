@@ -10,6 +10,8 @@ import { DiagnosticsDirectory } from '../../src/adapters/diagnostics.ts';
 import type { DiagnosticManifest } from '../../src/adapters/diagnostics.ts';
 import { acceptCandidate, returnAttempt, selectCandidate, planCandidateAcceptance, planAttemptReturn, automaticReturn, leaseReturnReason } from '../../src/completion.ts';
 import { rebaseAttempt, planAttemptRebase } from '../../src/rebase.ts';
+import { observeWorker } from '../../src/workers.ts';
+import { buildBriefing } from '../../src/briefing.ts';
 import { originalCandidateRef } from '../../src/storage/rebase.ts';
 import type { CompletionServices } from '../../src/completion.ts';
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
@@ -79,6 +81,79 @@ async function fixture(t: Parameters<typeof checkFixture>[0], local = false, piD
     dirty: () => { clean = false; }, cleanWorkspace: () => { clean = true; }, protect: () => { protection = true; }, unreadable: () => { policyReadable = false; },
     loseRetention: () => { retained = false; } };
 }
+
+test('A17/A18 R11/R33: a later-turn observation requires terminal evidence and a strict empty payload', async t => {
+  const f = await checkFixture(t);
+  const a = await f.attempt('not-terminal', ['Criterion'], undefined, head, start, policyContent, 'prepared');
+  const later = { ...a.observation('terminal', 3), kind: 'later_turn' as const, payload: {} };
+  const before = f.db.events();
+  await assert.rejects(observeWorker(f.db, later, host), { code: 'result_invalid' });
+  assert.deepEqual(f.db.events(), before);
+  await f.db.recordWorkerObservation(a.observation('terminal', 2), host);
+  for (const patch of [{ payloadVersion: 2 }, { payload: { terminal: true } }, { sourceSequence: -1 }, { observedAt: 'invalid' }]) {
+    await assert.rejects(observeWorker(f.db, { ...later, ...patch } as typeof later, host), { code: 'result_invalid' });
+  }
+  await observeWorker(f.db, later, host);
+  assert.equal(f.db.laterTurnDiscrepancy(a.id)?.code, 'result_discrepancy');
+  assert.equal(f.db.attempt(a.id).outcome, null, 'A later turn cannot complete an attempt');
+});
+
+test('A17/A18 R07/R11/R33: later turns preserve terminal output, block checks, acceptance and return, and explicit selection resolves them', async t => {
+  const f = await fixture(t);
+  await f.db.addObjective({ id: 'goal', request: 'Finish', criteria: ['Works'], scope: '', constraints: '', permissions: null, budget: null, deadline: null }, person);
+  await f.db.moveTask('task', f.db.task('task').definitionRevision, 'goal', person);
+  const before = f.db.attempt(f.a.id), result = f.db.validatedWorkerResult(f.a.id);
+  const terminal = f.db.events().find(e => e.attemptId === f.a.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')!;
+  const later = { ...f.a.observation('terminal', 3), kind: 'later_turn' as const, payload: {} };
+  await assert.rejects(observeWorker(f.db, { ...later, payload: { noProcesses: true } }, host), { code: 'result_invalid' });
+  await assert.rejects(observeWorker(f.db, { ...later, workerRef: { launcher: 'bb', threadId: 'other' } }, host), { code: 'result_identity_mismatch' });
+  await observeWorker(f.db, later, host, f.services.repository, { caller: person, services: f.services });
+  await observeWorker(f.db, later, host);
+  assert.deepEqual(f.db.attempt(f.a.id), before);
+  assert.deepEqual(f.db.validatedWorkerResult(f.a.id), result);
+  assert.deepEqual(f.db.events().find(e => e.id === terminal.id), terminal);
+  assert.equal(f.db.events().filter(e => e.attemptId === f.a.id && e.payload.kind === 'later_turn').length, 1);
+  assert.deepEqual(f.calls, []);
+  for (const run of [
+    () => runCandidateChecks(f.db, f.a.id, person, f.services),
+    () => runChecks(f.db, { attemptId: f.a.id, commit: head, dryRun: true }, person, 'plan-check', f.services),
+    () => planCandidateAcceptance(f.db, f.accept, f.services),
+    () => acceptCandidate(f.db, { ...f.accept, overrideReason: 'Person override' }, f.services),
+    () => planAttemptReturn(f.db, f.returns, f.services),
+    () => returnAttempt(f.db, f.returns, f.services),
+  ]) await assert.rejects(run, { code: 'result_discrepancy' });
+  assert.match((await leaseReturnReason(f.db, f.a.id, person, f.services))!, /result_discrepancy/);
+  const briefing = buildBriefing(f.db, 'goal', person).attempts[0]!;
+  assert.equal(briefing.discrepancy?.code, 'result_discrepancy');
+  assert.match(briefing.nextAction!.description, /select a candidate explicitly.*discard/i);
+  assert.deepEqual(f.calls, []);
+  const selected = await selectCandidate(f.db, { attemptId: f.a.id, commit: head, caller: person }, f.services);
+  assert.notEqual(selected.candidate!.id, before.candidate!.id, 'Selecting even the same commit explicitly resolves the discrepancy');
+  assert.equal(f.db.laterTurnDiscrepancy(f.a.id), null);
+  await observeWorker(f.db, later, host);
+  assert.equal(f.db.laterTurnDiscrepancy(f.a.id), null, 'Replayed observation is not a new later turn');
+  await runCandidateChecks(f.db, f.a.id, person, f.services);
+  await acceptCandidate(f.db, { ...f.accept, candidateId: String(selected.candidate!.id) }, f.services);
+  await returnAttempt(f.db, f.returns, f.services);
+  assert.equal(f.db.attempt(f.a.id).leaseState, 'returned');
+});
+
+test('A18 R11/R33: a later turn after acceptance prevents integration and a person can discard instead', async t => {
+  const f = await fixture(t, true);
+  await runCandidateChecks(f.db, f.a.id, person, f.services);
+  const authorise = f.db.recordAcceptance.bind(f.db);
+  f.db.recordAcceptance = async (...args) => {
+    const accepted = await authorise(...args);
+    await observeWorker(f.db, { ...f.a.observation('terminal', 3), kind: 'later_turn', payload: {} }, host);
+    return accepted;
+  };
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'result_discrepancy' });
+  assert.ok(!f.calls.includes('integrate'));
+  await assert.rejects(returnAttempt(f.db, f.returns, f.services), { code: 'result_discrepancy' });
+  await returnAttempt(f.db, { ...f.returns, requestKey: 'discard', discard: { leaseId: f.a.allocation.leaseId, confirmed: true, reason: 'Discard later turn output' } }, f.services);
+  assert.equal(f.db.laterTurnDiscrepancy(f.a.id), null);
+  assert.equal(f.db.attempt(f.a.id).leaseState, 'returned');
+});
 
 test('R19/A38: exact accepted-output statements close only the objective, refuse bad evidence atomically and replay safely', async t => {
   const f = await fixture(t), db = f.db;

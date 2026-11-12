@@ -159,6 +159,7 @@ export async function effect(db: Database, authorisation: StoredEvent, operation
 export async function planCandidateAcceptance(db: Database, input: AcceptInput, services: CompletionServices, selecting = false) {
   taskActor(input.caller);
   db.checkAuthority(input.caller, 'attempt.accept', JSON.parse(JSON.stringify(input)) as JsonObject);
+  if (!selecting) db.requireNoLaterTurnDiscrepancy(input.attemptId);
   db.requireSupervisorReview(input.caller, input.attemptId, input.commit);
   const attempt = db.attempt(input.attemptId);
   if (selecting) await inspectCandidateSelection(db, input, services);
@@ -206,6 +207,7 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
   services = { ...services, profile: structuredClone(services.profile) };
   taskActor(input.caller);
   db.checkAuthority(input.caller, 'attempt.accept', JSON.parse(JSON.stringify(input)) as JsonObject);
+  db.requireNoLaterTurnDiscrepancy(input.attemptId);
   db.requireSupervisorReview(input.caller, input.attemptId, input.commit);
   exactCandidate(db, input);
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
@@ -243,6 +245,7 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
       if (alreadyContains) return { status: 'confirmed', value: { alreadyContains: true, target: plan.target, commit: input.commit } };
       return services.repository.conditionalFastForward(plan.target, plan.expected, input.commit);
     }, async () => {
+      db.requireNoLaterTurnDiscrepancy(input.attemptId);
       await retainedOutput(db, input.attemptId, services);
       const current = await planAcceptance(db, input, services);
       if (current.target !== plan.target || current.kind !== plan.kind || current.policyDigest !== plan.policyDigest) refuse('Finalisation policy changed after acceptance');
@@ -260,6 +263,9 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
   const attempt = db.attempt(input.attemptId), allocation = attempt.allocation;
   if (!allocation || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) throw new StorageError('conflict', 'Return requires a stopped terminal worker and allocation');
   if (input.discard && (input.discard.leaseId !== allocation.leaseId || input.discard.confirmed !== true || !input.discard.reason.trim())) refuse('Person discard confirmations must name the exact lease');
+  if (!input.discard && !db.events().some(e => e.attemptId === attempt.id && e.kind === 'return.authorised' && e.payload.discard)) {
+    db.requireNoLaterTurnDiscrepancy(attempt.id);
+  }
   if (attempt.leaseState === 'returned') return { steps: [] };
   if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
   const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
@@ -281,6 +287,7 @@ export async function returnAttempt(db: Database, input: ReturnInput, services: 
   taskActor(input.caller);
   const command = await db.recordCommand({ requestKey: input.requestKey, operation: input.discard ? 'attempt.discard' : 'attempt.return',
     caller: input.caller, fingerprint: canonicalJson(input), input: JSON.parse(JSON.stringify(input)) as JsonObject });
+  if (!input.discard) db.requireNoLaterTurnDiscrepancy(input.attemptId);
   const authorisation = await db.authoriseReturn(input, command.id);
   const allocation = authorisation.payload.allocation as Allocation;
   // Once returned, the workspace is recyclable and must not be read again.

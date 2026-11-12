@@ -26,6 +26,7 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
   const { repository, run } = services;
   const profile = structuredClone(services.profile);
   const attempt = db.attempt(attemptId);
+  db.requireNoLaterTurnDiscrepancy(attemptId);
   if (!attempt.candidate || !attempt.allocation) throw new StorageError('conflict', 'Checks require a recorded candidate and allocation');
   const commit = String(attempt.candidate.commit), workspace = attempt.allocation.path;
   if (expectedCommit !== undefined && commit !== expectedCommit) throw new CommandFailure('candidate_moved', { attemptId, commit: expectedCommit });
@@ -72,6 +73,7 @@ export async function runCandidateChecks(db: Database, attemptId: string, caller
             status = 'failed'; commands.push({ kind, name: check.name, status: 'not_run', reason: 'Workspace changed before command' });
             continue;
           }
+          db.requireNoLaterTurnDiscrepancy(attemptId);
           db.checkRequestAuthority(admission.request.id);
           const result = await run(check, workspace);
           if (result.status === 'uncertain') clearInterval(timer);
@@ -144,6 +146,7 @@ function checkResponse(db: Database, input: RunChecksInput, request: StoredReque
 
 async function planChecks(db: Database, input: RunChecksInput, services: CheckServices) {
   const attempt = db.attempt(input.attemptId);
+  db.requireNoLaterTurnDiscrepancy(attempt.id);
   if (!attempt.candidate || attempt.candidate.commit !== input.commit) {
     throw new CommandFailure('candidate_missing', { attemptId: input.attemptId, commit: input.commit });
   }

@@ -199,11 +199,12 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           const returnReason = currentReturnReason === 'Lease is ready to return.' && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;
           const invalidResult = db.invalidWorkerResult(a.id);
-          const reason = (!resolved ? invalidResult?.message : null) ?? returnReason ?? (resolved ? null : ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
+          const discrepancy = db.laterTurnDiscrepancy(a.id);
+          const reason = discrepancy?.message ?? (!resolved ? invalidResult?.message : null) ?? returnReason ?? (resolved ? null : ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
             : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
             : a.leaseState === 'held' ? 'Lease is held.'
             : ['held', 'failed'].includes(a.outcome ?? '') ? `Attempt outcome is ${a.outcome}.` : null);
-          const nextAction = interruptedCheck ? checkResolutionAction(interruptedCheck.id)
+          const nextAction = discrepancy ? discrepancy.nextAction : interruptedCheck ? checkResolutionAction(interruptedCheck.id)
             : invalidResult && !resolved ? invalidResultAction(a.id) : reason === null ? null
             : returnReason ? action('attempt.return', { attemptId: a.id, dryRun: true }, `Resolve the return condition (${returnReason}), then plan returning the lease.`)
             : checksState === 'failed' || checksState === 'uncertain' ? action('attempt.show', { attemptId: a.id }, 'Inspect check evidence before retrying or resolving uncertainty.')
@@ -319,7 +320,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'attempt.accept': {
         const runtime = await services(), attemptId = String(args.attemptId);
         const attempt = db.attempt(attemptId);
-        const selecting = args.candidateCommit !== null && attempt.candidate?.commit !== args.candidateCommit;
+        const selecting = args.candidateCommit !== null
+          && (attempt.candidate?.commit !== args.candidateCommit || db.laterTurnDiscrepancy(attemptId) !== null);
         if (!attempt.candidate && !selecting) throw new CommandFailure('candidate_missing', { attemptId });
         const accept = { requestKey, attemptId, candidateId: selecting ? 'planned-selection' : String(attempt.candidate!.id),
           commit: selecting ? String(args.candidateCommit) : String(attempt.candidate!.commit), caller,

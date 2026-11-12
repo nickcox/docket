@@ -19,6 +19,8 @@ export async function observeWorker(db: Database, observation: WorkerObservation
   repository?: Pick<GitRepository, 'compare' | 'verifyRetention'>,
   checks?: { caller: TaskActor; services: CheckServices }): Promise<Attempt> {
   await db.recordWorkerObservation(observation, host);
+  // A later turn is discrepancy evidence, never another completion or check run.
+  if (observation.kind === 'later_turn') return db.attempt(observation.attemptId);
   await consumeQuestionFiles(db, observation.attemptId);
   if (observation.kind === 'result_available') await db.validateWorkerResult(observation.attemptId, host, repository);
   // Turn-end and idle are not completion evidence. They may reconcile facts already recorded.

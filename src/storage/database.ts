@@ -2104,6 +2104,22 @@ export class Database {
     });
   }
 
+  /** Resolution follows durable event order; replaying an old observation cannot undo a selection. */
+  laterTurnDiscrepancy(attemptId: string) {
+    const events = this.events().filter(event => event.attemptId === attemptId);
+    const later = events.findLast(event => event.kind === 'worker.observed' && event.payload.kind === 'later_turn');
+    if (!later || events.some(event => event.seq > later.seq
+      && (event.kind === 'candidate.selected' || event.kind === 'return.authorised' && event.payload.discard === true))) return null;
+    return { code: 'result_discrepancy' as const, eventId: later.id,
+      message: 'result_discrepancy: A later worker turn was observed. Select a candidate explicitly or ask a person to discard the attempt.',
+      nextAction: nextAction('attempt.show', { attemptId }, 'Inspect the later turn, then select a candidate explicitly or ask a person to discard the attempt.') };
+  }
+
+  requireNoLaterTurnDiscrepancy(attemptId: string): void {
+    const discrepancy = this.laterTurnDiscrepancy(attemptId);
+    if (discrepancy) throw new CommandFailure(discrepancy.code, { attemptId, eventId: discrepancy.eventId }, discrepancy.nextAction);
+  }
+
   /** Old source sequences still carry independent facts. A duplicate cannot erase terminal evidence. */
   async recordWorkerObservation(observation: WorkerObservation, host: WorkerHost): Promise<Attempt> {
     workerObservation(observation); workerHost(host);
@@ -2113,6 +2129,10 @@ export class Database {
       this.workerClaim(value.attemptId, String(attempt.owner_claim_id), actor);
       if (attempt.runtime_ref === null || json(JSON.parse(String(attempt.runtime_ref))) !== json(value.workerRef)) {
         throw new StorageError('result_identity_mismatch', 'Observation worker does not match the attempt');
+      }
+      if (value.kind === 'later_turn' && !this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ?
+        AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'`).get(value.attemptId)) {
+        throw new StorageError('result_invalid', 'Later turn requires a recorded terminal observation');
       }
       this.insertEvent({ sourceKey: `worker.observation:${json([value.attemptId, value.sourceId, value.sourceSequence])}`,
         kind: 'worker.observed', payloadVersion: 1, correlationId: value.attemptId, actor,
@@ -2243,6 +2263,7 @@ export class Database {
     const value = JSON.parse(json(input)) as CheckRunInput;
     return this.write(() => {
       this.checkAuthority(value.caller, 'checks.run', { attemptId: value.attemptId });
+      this.requireNoLaterTurnDiscrepancy(value.attemptId);
       const attempt = this.attemptRow(value.attemptId), spec = object(JSON.parse(String(attempt.specification)));
       const result = this.validatedResultInTransaction(value.attemptId);
       const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
@@ -2416,7 +2437,7 @@ export class Database {
       if (object(spec.delivery).kind !== 'code' || outputRef !== spec.outputRef || commit === spec.startingCommit || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new StorageError('conflict', 'Candidate must name the retained output and move beyond the start');
       if (this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'candidate.accepted'").get(attemptId)) throw new StorageError('conflict', 'An accepted candidate cannot be replaced');
       const previous = attempt.candidate === null ? null : object(JSON.parse(String(attempt.candidate)));
-      if (previous?.commit === commit && previous.outputRef === outputRef) return this.decodeAttempt(attempt);
+      if (previous?.commit === commit && previous.outputRef === outputRef && !this.laterTurnDiscrepancy(attemptId)) return this.decodeAttempt(attempt);
       const result = this.validatedResultInTransaction(attemptId);
       if (!result) throw new StorageError('conflict', 'Candidate requires a validated result');
       const candidate = { id: randomUUID(), commit, outputRef, selectedBy: caller, resultDigest: result.digest };
@@ -2443,6 +2464,7 @@ export class Database {
     if (value.overrideReason !== undefined) nonblank(value.overrideReason);
     return this.write(() => {
       this.checkAuthority(value.caller, 'attempt.accept', object(value));
+      this.requireNoLaterTurnDiscrepancy(value.attemptId);
       this.requireSupervisorReview(value.caller, value.attemptId, value.commit);
       if (value.caller.kind === 'supervisor' && plan.kind === 'local-merge') this.checkIntegrationAuthority(value.caller, value.attemptId);
       const attempt = this.completionGuard(value.attemptId), task = this.taskRow(String(attempt.task_id));
@@ -2515,6 +2537,7 @@ export class Database {
     if (value.discard !== undefined) nonblank(value.discard.reason);
     return this.write(() => {
       this.checkAuthority(value.caller, value.discard ? 'attempt.discard' : 'attempt.return', object(value));
+      if (!value.discard) this.requireNoLaterTurnDiscrepancy(value.attemptId);
       const raw = this.attemptRow(value.attemptId);
       const abandonedWithoutOutcome = value.discard !== undefined && raw.outcome === null;
       const terminal = this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
@@ -2717,6 +2740,9 @@ export class Database {
 
   private checkCompletionEffectInTransaction(request: StoredRequest, executor: ClaimIdentity): void {
     this.requestAuthority(request);
+    if (request.operation === 'completion.integrate' || request.operation === 'completion.return') {
+      this.requireNoLaterTurnDiscrepancy(request.attemptId!);
+    }
     if (request.operation === 'completion.integrate') this.checkIntegrationAuthority(request.caller as TaskActor, request.attemptId!);
     const claim = this.effectExecutor(request, executor), attempt = this.completionGuard(request.attemptId!);
     if (heartbeatStatus(claim.heartbeatAt, Date.now()) !== 'fresh') throw new StorageError('conflict', 'Completion executor heartbeat is not fresh');

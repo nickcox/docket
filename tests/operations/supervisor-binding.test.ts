@@ -89,6 +89,24 @@ test('R21/R28/A43/A44: bound question tools derive the asker, status keeps choic
   assert.equal((answered.effects as any[])[0].state, 'pending', 'Recording an answer does not prove message delivery');
 });
 
+test('A18 R11/R33: status shows a later-turn discrepancy and the explicit selection or person discard action', async t => {
+  const f = await fixture(t);
+  await f.db.addTask({ id: 'later', title: 'Later', objectiveId: 'goal' }, person);
+  const reservation = await f.db.reserveAttempt({ requestKey: 'reserve-later', taskId: 'later', caller: person,
+    startingCommit: 'a'.repeat(40), checks: parseCheckPolicy('a'.repeat(40), null, { executionProfile: 'node-v1', fast: [], full: [] }),
+    delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+  const id = reservation.attempt.id;
+  // Seed the already-validated host event here; launcher admission is covered by completion tests.
+  await f.db.appendEvents([{ sourceKey: 'later-observed', kind: 'worker.observed', payloadVersion: 1,
+    correlationId: id, attemptId: id, taskId: 'later', actor: { kind: 'host', id: 'backend' },
+    occurredAt: new Date().toISOString(), payload: { kind: 'later_turn' } }]);
+  const status = await f.binding.execute('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  const attempt = (status.attempts as { items: any[] }).items.find(a => a.id === id);
+  assert.match(attempt.reason, /result_discrepancy.*later worker turn/i);
+  assert.equal(attempt.nextAction.operation, 'attempt.show');
+  assert.match(attempt.nextAction.description, /select a candidate explicitly.*person.*discard/i);
+});
+
 test('R18/R21/A43: question status follows current task membership without changing the immutable recipient', async t => {
   const f = await fixture(t);
   await f.db.addTask({ id: 'inside', title: 'Inside', objectiveId: 'goal' }, person);

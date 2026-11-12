@@ -29,7 +29,9 @@ export function buildBriefing(db: Database, objectiveId: string, actor: TaskActo
       const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit);
       const latest = checks.at(-1), checkState = latest?.result?.status ?? latest?.state ?? 'missing';
       const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) : null;
+      const discrepancy = db.laterTurnDiscrepancy(a.id);
       const waitingFor: string[] = [];
+      if (discrepancy) waitingFor.push(discrepancy.message);
       if (!accepted) {
         if (a.executionOpen) waitingFor.push('worker terminal');
         if (!result) waitingFor.push('valid retained result');
@@ -45,7 +47,7 @@ export function buildBriefing(db: Database, objectiveId: string, actor: TaskActo
         reviews: review.findings.map(e => ({ eventId: e.id, reviewAttemptId: e.payload.reviewAttemptId,
           commit: e.payload.commit, verdict: e.payload.verdict, findings: ((e.payload.findings ?? []) as Record<string, unknown>[])
             .map(f => ({ position: f.position, status: f.status, evidence: f.evidence })) })),
-        accepted: accepted !== null, waitingFor };
+        accepted: accepted !== null, ...(discrepancy ? { discrepancy, nextAction: discrepancy.nextAction } : {}), waitingFor };
     }),
     questions: db.questions().filter(q => q.scope.objectiveId === objectiveId && (q.scope.taskId === null || taskIds.has(q.scope.taskId))),
     notes: scoped.filter(e => e.kind === 'supervisor.note').map(e => ({ id: e.id, text: e.payload.text })),
