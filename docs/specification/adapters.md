@@ -26,6 +26,8 @@ There is no independent task queue, speculative next-task dispatcher, worker ado
 | usage(reference) | Session-attributed cumulative metrics with reported/unknown/unsupported status |
 | result(reference) | Retained regular-file/result transport reference, not acceptance |
 
+The `fenceEnforcement` capability is `enforced` for Pi, whose worker process exits, and `best_effort` for bb. It is separate from `terminalFence`, which reports support for terminal stop/fence.
+
 Every binding carries attempt/database identity, profile digest, allocation, internal session UUID and owning claim. A source observation has a stable source ID/sequence. Duplicate/out-of-order data cannot move state backwards or attach to a different attempt. Launcher-specific types stay inside adapters.
 
 Adapter effects return confirmed(value), rejected(reason,evidence), or uncertain(reason,referenceHints). Inspect returns absent only after complete successful lookup. No adapter hides SDK retries that might activate/send twice. Unsupported operations refuse before effect. Preparation/activation/terminal semantics are each tested for every launcher.

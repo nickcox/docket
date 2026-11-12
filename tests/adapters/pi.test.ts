@@ -153,11 +153,17 @@ for (const mode of ['lost-ack', 'wrong-ack']) test(`R35/A15: ${mode} is uncertai
   assert.equal((await f.records()).filter(r => r.type === 'prompt').length, 1);
 });
 
-test('R07/R35: turn end and idle are not direct-child exit; fence observes exit and cannot restart', async t => {
+test('R07/R31/R35: enforced fence observes direct-child exit, not turn end or idle, and cannot restart', async t => {
   const f = await fixture(t); f.permit();
   const initial = await f.launcher.inspect(f.reference);
   assert.equal(initial.status, 'known');
-  if (initial.status === 'known') { assert.equal(initial.turn, 'idle'); assert.equal(initial.terminal, false); }
+  if (initial.status === 'known') {
+    assert.equal(initial.turn, 'idle'); assert.equal(initial.terminal, false);
+    assert.equal(initial.capabilities.fenceEnforcement, 'enforced');
+    assert.equal(initial.capabilities.terminalFence, true);
+    assert.deepEqual(initial.capabilities, f.launcher.capabilities(f.binding.specification.profile as JsonObject));
+    assert.equal(Object.hasOwn(initial.capabilities, 'resourceIsolation'), false);
+  }
   await f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation');
   // A fresh RPC round trip ensures the preceding turn events were consumed.
   assert.equal((await f.launcher.usage(f.reference)).status, 'reported');

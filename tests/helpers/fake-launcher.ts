@@ -16,7 +16,7 @@ export class FakeLauncher implements Launcher {
   afterActivate?: () => Promise<Result<JsonObject>>;
   capabilities(_profile: JsonObject): LauncherCapabilities {
     return { preparation: 'non_acting', admission: true, activeSteering: false, afterTurnMessage: false,
-      stopTurn: true, terminalFence: true, usageMetrics: [], resourceIsolation: ['fake'], observationSources: ['fake'] };
+      stopTurn: true, terminalFence: true, usageMetrics: [], fenceEnforcement: 'enforced', observationSources: ['fake'] };
   }
   async prepare(binding: WorkerBinding, effectId: string): Promise<Result<WorkerReference>> {
     this.calls.push({ operation: 'prepare', effectId });

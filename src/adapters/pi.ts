@@ -42,7 +42,7 @@ type Worker = {
 const capabilities: LauncherCapabilities = {
   preparation: 'non_acting', admission: true, activeSteering: false, afterTurnMessage: false,
   stopTurn: false, terminalFence: true, usageMetrics: ['tokens', 'cost', 'workerTimeMs'],
-  resourceIsolation: ['private_home', 'no_project_settings', 'no_extensions', 'no_mcp', 'no_skills', 'no_context_files', 'environment_allowlist'],
+  fenceEnforcement: 'enforced',
   observationSources: ['direct_child', 'pi_rpc'],
 };
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);

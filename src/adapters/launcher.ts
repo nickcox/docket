@@ -23,7 +23,7 @@ export interface LauncherCapabilities {
   stopTurn: boolean;
   terminalFence: boolean;
   usageMetrics: readonly string[];
-  resourceIsolation: readonly string[];
+  fenceEnforcement: 'enforced' | 'best_effort';
   observationSources: readonly string[];
 }
 export interface TurnFailure { kind: 'provider_limit' | 'model_error'; message: string }
