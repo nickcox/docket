@@ -1038,6 +1038,20 @@ test('R11: explicit retained branch selection creates a fresh exact candidate an
   await assert.rejects(selectCandidate(f.db, { attemptId: f.a.id, commit: head, caller: person }, f.services), /exact candidate/);
 });
 
+test('R11/A18: output rechecks use the ordinary workspace read, so declared generated files do not refuse checks or acceptance', async t => {
+  const f = await fixture(t);
+  const reads: unknown[][] = [];
+  // The real adapter rejects a check-mode read when ignored files such as node_modules/ are not declared.
+  f.services.repository.inspectWorkspace = async (...args: unknown[]) => {
+    reads.push(args);
+    return args[1] === true && (args[2] as string[] | undefined)?.length === 0 ? rejected('Workspace has ignored files not allowed by the execution profile')
+      : confirmed({ branch: f.a.binding.outputRef, head, clean: true, uncommitted: [], untracked: [] });
+  };
+  await runChecks(f.db, { attemptId: f.a.id, commit: head, dryRun: true }, person, 'plan-integrity-read', f.services);
+  await planCandidateAcceptance(f.db, f.accept, f.services);
+  assert.ok(reads.length > 0);
+});
+
 async function rebaseFixture(t: Parameters<typeof fixture>[0]) {
   const f = await fixture(t, true);
   let state = { branch: f.a.binding.outputRef as string | null, head, clean: true, uncommitted: [] as string[], untracked: [] as string[] };

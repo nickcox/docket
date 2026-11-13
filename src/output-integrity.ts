@@ -19,7 +19,8 @@ export async function requireOutputIntegrity(db: Database, attemptId: string, re
   }
   await requireResultIntegrity(db, attemptId);
   if (attempt.allocation && attempt.leaseState !== 'returned') {
-    const state = await repository.inspectWorkspace(attempt.allocation.path, true, []);
+    // The ordinary read: check-mode reads refuse declared generated files such as node_modules/.
+    const state = await repository.inspectWorkspace(attempt.allocation.path);
     if (state.status !== 'confirmed') throw new CommandFailure('owner_unknown', { attemptId });
     if (!state.value.clean) throw new CommandFailure('workspace_dirty', { attemptId });
   }

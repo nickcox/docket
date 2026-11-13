@@ -195,11 +195,6 @@ test('R16/A35: candidate checks with real Git fail tracked/untracked mutations a
     if (mutation === 'hidden-index') await git('update-index', '--assume-unchanged', 'file');
     const a = await f.attempt('task', ['Criterion'], workspace, candidate, base, content);
     await git('update-ref', a.binding.outputRef, candidate);
-    if (mutation === 'hidden-index') {
-      await assert.rejects(runCandidateChecks(f.db, a.id, person, { profile, repository: repo, run: checkCommandRunner(environment) }),
-        { code: 'owner_unknown' });
-      continue;
-    }
     const result = await runCandidateChecks(f.db, a.id, person, { profile, repository: repo, run: checkCommandRunner(environment) });
     assert.equal(result.state, mutation === 'ignored' ? 'succeeded' : 'rejected', mutation);
     assert.equal(result.result!.status, mutation === 'ignored' ? 'passed' : 'failed', mutation);
