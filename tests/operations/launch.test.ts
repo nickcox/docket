@@ -15,6 +15,7 @@ import { activateWorker, prepareWorker, controlWorker } from '../../src/workers.
 import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
 import { PiLauncher } from '../../src/adapters/pi.ts';
+import { canonicalJson } from '../../src/configuration.ts';
 
 const person = { kind: 'person' as const, id: 'operator' };
 const host: WorkerHost = { kind: 'host', id: 'backend', generation: 'generation-1' };
@@ -61,6 +62,8 @@ async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
   async function prepared(taskId = 'task', profile?: string) {
     const value = await started(taskId, profile), launcher = new FakeLauncher();
     const effect = await prepareWorker(db, value.attemptId, host, launcher);
+    launcher.admit = async reference => reference.launcher !== 'bb'
+      || (await db.admitInitialBbPrompt(value.attemptId, String(reference.threadId), host)).kind === 'admitted';
     return { ...value, launcher, prepare: effect, reference: effect.result!.reference as WorkerReference };
   }
   return { db, root, path, options, allocated, started, prepared };
@@ -436,7 +439,7 @@ test('A14/R09: interrupted claimed prepare or activation is never retried, even 
 
 test('A14/R09: lost activation responses before and after prompting never send twice', async t => {
   for (const stage of ['before', 'after', 'uncertain', 'rejected'] as const) {
-    const { db, prepared } = await fixture(t), value = await prepared();
+    const { db, prepared } = await fixture(t), value = await prepared('task', 'other');
     await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
     if (stage === 'before') value.launcher.beforeActivate = async () => { throw new Error('lost before send'); };
     else if (stage === 'rejected') value.launcher.beforeActivate = async () => rejected('Not admitted', { owner: true });
@@ -538,7 +541,7 @@ test('A14/R09: failed binding and failed activation confirmation preserve uncert
 test('R08/R09/A14: the executor rechecks freshness after claiming and immediately before both launcher calls', async t => {
   for (const operation of ['prepare', 'activate']) {
     const { db, path, started, prepared } = await fixture(t);
-    const value = operation === 'prepare' ? { ...await started(), launcher: new FakeLauncher(), reference: { launcher: 'bb', threadId: 'unused' } } : await prepared();
+    const value = operation === 'prepare' ? { ...await started(), launcher: new FakeLauncher(), reference: { launcher: 'bb', threadId: 'unused' } } : await prepared('task', 'other');
     if (operation === 'activate') await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
     const original = db.checkWorkerEffect.bind(db);
     db.checkWorkerEffect = (id, identity) => {
@@ -613,3 +616,131 @@ for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepar
     assert.deepEqual(state(f.db, f.path, value.attemptId), before);
   });
 }
+
+async function bbDispatchFixture(t: { after: (fn: () => Promise<void> | void) => void }) {
+  const f = await fixture(t), value = await f.started();
+  const launcher = new FakeLauncher();
+  const preparation = await prepareWorker(f.db, value.attemptId, host, launcher);
+  const reference = preparation.result!.reference as WorkerReference;
+  const member = { id: String(reference.initialMessageId), author: String(reference.initialAuthor), content: String(preparation.input.initialInput) };
+  return { ...f, ...value, launcher, reference, member, threadId: String(reference.threadId) };
+}
+
+test('R06 R33 A15: bb hook holds before permission, matches every queued member and consumes admission once across reopen', async t => {
+  const f = await bbDispatchFixture(t), { db, threadId, member } = f;
+  assert.deepEqual(await db.admitBbDispatch('ordinary', [member]), { decision: 'pass-through' });
+  assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'hold' });
+  assert.deepEqual(await db.admitBbDispatch(threadId, [member, { ...member, id: 'unauthorised' }]), { decision: 'refuse' });
+  const decision = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  for (const changed of [{ ...member, id: 'forged' }, { ...member, author: 'person' }, { ...member, content: 'forged' }]) {
+    assert.deepEqual(await db.admitBbDispatch(threadId, [member, changed]), { decision: 'refuse' });
+    assert.equal(db.request(decision.effectId!).state, 'pending');
+    assert.deepEqual(await db.admitBbDispatch(threadId, [changed]), { decision: 'refuse' });
+  }
+  assert.deepEqual(await db.admitBbDispatch(threadId, [member, member]), { decision: 'refuse' });
+  const peer = await Database.open(f.path, f.options); defer(t, () => peer.close());
+  const admitted = await Promise.all([db.admitBbDispatch(threadId, [member]), peer.admitBbDispatch(threadId, [member])]);
+  assert.deepEqual(admitted.map(r => r.decision).sort(), ['admit', 'refuse']);
+  assert.equal(db.request(decision.effectId!).state, 'claimed');
+  const reopened = await Database.open(f.path, f.options); defer(t, () => reopened.close());
+  assert.deepEqual(await reopened.admitBbDispatch(threadId, [member]), { decision: 'refuse' });
+});
+
+test('R06 R33 A15: bb activation leaves consumption to the hook and queue re-evaluation never repeats on lost acknowledgement', async t => {
+  for (const lost of [false, true]) {
+    const f = await bbDispatchFixture(t), { db, member, threadId, launcher } = f;
+    const decision = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+    launcher.admit = async () => {
+      assert.equal(db.request(decision.effectId!).state, 'pending');
+      assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'admit' });
+      if (lost) throw new Error('lost hook acknowledgement');
+      return true;
+    };
+    if (lost) await assert.rejects(activateWorker(db, f.attemptId, f.reference, host, launcher), /lost hook/);
+    else assert.equal((await activateWorker(db, f.attemptId, f.reference, host, launcher))!.state, 'succeeded');
+    assert.equal(db.request(decision.effectId!).state, lost ? 'uncertain' : 'succeeded');
+    assert.equal(await activateWorker(db, f.attemptId, f.reference, host, launcher), null);
+    assert.equal(launcher.calls.filter(c => c.operation === 'activate').length, 1);
+    assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'refuse' });
+  }
+});
+
+test('R06 R33 A15: later dispatch needs matching recorded deliveries for every member, with no replay', async t => {
+  const f = await bbDispatchFixture(t), { db, threadId, member, reference } = f;
+  const permission = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'admit' });
+  const executor = { claimId: f.claimId, generation: host.generation };
+  await db.recordEffectOutcome(permission.effectId!, executor, 'succeeded', { admitted: true });
+  const next = { id: 'later', author: 'docket', content: 'Continue with the recorded steer' };
+  assert.deepEqual(await db.admitBbDispatch(threadId, [next]), { decision: 'refuse' });
+  const input = { attemptId: f.attemptId, message: next.content, mode: 'after_turn' };
+  const command = await db.recordCommand({ requestKey: 'later-command', operation: 'attempt.steer', caller: person,
+    input, fingerprint: canonicalJson(input) });
+  const effect = await db.recordEffect({ requestKey: 'later-effect', operation: 'worker.deliver', caller: person,
+    input: { reference, ...input, messageId: next.id, author: next.author }, fingerprint: 'later', parentId: command.id,
+    executor, attemptId: f.attemptId, target: { kind: 'worker', reference } });
+  await db.claimEffect(effect.id, executor);
+  for (const changed of [{ ...next, id: 'bad' }, { ...next, author: 'person' }, { ...next, content: 'bad' }]) {
+    assert.deepEqual(await db.admitBbDispatch(threadId, [next, changed]), { decision: 'refuse' });
+  }
+  assert.deepEqual(await db.admitBbDispatch(threadId, [next]), { decision: 'admit' });
+  assert.deepEqual(await db.admitBbDispatch(threadId, [next]), { decision: 'refuse' });
+  const terminalMember = { ...next, id: 'terminal' };
+  const pending = await db.recordEffect({ requestKey: 'terminal-delivery', operation: 'worker.deliver', caller: person,
+    input: { reference, ...input, messageId: terminalMember.id, author: terminalMember.author }, fingerprint: 'terminal',
+    parentId: command.id, executor, attemptId: f.attemptId, target: { kind: 'worker', reference } });
+  await db.claimEffect(pending.id, executor);
+  await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: 1, attemptId: f.attemptId, workerRef: reference,
+    observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
+    payload: { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host);
+  assert.deepEqual(await db.admitBbDispatch(threadId, [terminalMember]), { decision: 'refuse' });
+});
+
+test('R06 R33 A15: stale owners and fenced workers refuse hook admission without consuming activation', async t => {
+  for (const fenced of [false, true]) {
+    const f = await bbDispatchFixture(t);
+    if (fenced) await f.db.decideWorkerLaunch(f.attemptId, f.claimId, 'fence', host);
+    else {
+      await f.db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+      const raw = new DatabaseSync(f.path); defer(t, () => raw.close());
+      raw.prepare('UPDATE claims SET heartbeat_at = ? WHERE id = ?').run('2000-01-01T00:00:00.000Z', f.claimId);
+    }
+    assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [f.member]), { decision: 'refuse' });
+  }
+});
+
+test('R06 R33 A15: a queue acknowledgement without hook admission stays uncertain and is never re-evaluated twice', async t => {
+  const f = await bbDispatchFixture(t);
+  const permission = await f.db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  f.launcher.beforeActivate = async () => confirmed({ queued: true });
+  assert.equal((await activateWorker(f.db, f.attemptId, f.reference, host, f.launcher))!.state, 'uncertain');
+  assert.equal(f.db.request(permission.effectId!).state, 'pending');
+  assert.equal(await activateWorker(f.db, f.attemptId, f.reference, host, f.launcher), null);
+  assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [f.member]), { decision: 'refuse' });
+  assert.equal(f.launcher.calls.filter(c => c.operation === 'activate').length, 1);
+});
+
+for (const afterEvent of [false, true]) test(`R06 R33 A15: hook admission rolls back activation consumption with its event (${afterEvent})`, async t => {
+  const f = await bbDispatchFixture(t);
+  const permission = await f.db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  const restore = inject(f.db, 'attempt.prompt_admitted', afterEvent);
+  try { await assert.rejects(f.db.admitBbDispatch(f.threadId, [f.member]), /injected transaction failure/); }
+  finally { restore(); }
+  assert.equal(f.db.request(permission.effectId!).state, 'pending');
+  assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [f.member]), { decision: 'admit' });
+});
+
+test('R33 R34: environment allocation reuses only a matching held lease and refuses mismatched pool or repository', async t => {
+  const f = await fixture(t), value = await f.allocated();
+  assert.deepEqual(f.db.bbAllocation(value.allocation.leaseId), { path: value.allocation.path });
+  assert.deepEqual(f.db.bbAllocation(value.allocation.leaseId), { path: value.allocation.path });
+  assert.throws(() => f.db.bbAllocation('unknown'));
+  const raw = new DatabaseSync(f.path); defer(t, () => raw.close());
+  for (const allocation of [{ ...value.allocation, pool: join(f.root, 'other') },
+    { ...value.allocation, repository: { identity: 'other' } }, { ...value.allocation, holder: { attemptId: 'other' } }]) {
+    raw.prepare('UPDATE attempts SET allocation = ? WHERE id = ?').run(JSON.stringify(allocation), value.attemptId);
+    assert.throws(() => f.db.bbAllocation(value.allocation.leaseId));
+  }
+  raw.prepare("UPDATE attempts SET allocation = ?, lease_state = 'returned' WHERE id = ?").run(JSON.stringify(value.allocation), value.attemptId);
+  assert.throws(() => f.db.bbAllocation(value.allocation.leaseId));
+});

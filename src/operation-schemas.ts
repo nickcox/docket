@@ -70,6 +70,8 @@ function outputSchema(name: string): JsonSchema {
       input: view, result: nullable(view), effects: { type: 'array', maxItems: 20, items: object(identity) },
       effectsTotal: { type: 'integer', minimum: 0 } });
   }
+  if (name === 'host.bb-admit') return object({ decision: { enum: ['pass-through', 'hold', 'admit', 'refuse'] } });
+  if (name === 'host.bb-allocation') return object({ path: string });
   if (name === 'host.bind') return object({ path: string });
   if (name === 'host.usage') return object({ recorded: bool });
   if (name.startsWith('objective.')) return object({ objective: view });
@@ -138,6 +140,9 @@ export const coreOperations: OperationDefinition[] = [
   operation('objective.add', 'Create an open objective; null permissions and budget select all permissions and unlimited usage.',
     { id, request: string, ...objectiveFields, permissions: nullable(permissions), budget: nullable(budget) }, true, ['person']),
   operation('host.bind', 'Create a private host-service binding with an explicit operation list.', { directory: string, operations: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: string } }, true, ['person']),
+  operation('host.bb-admit', 'Decide admission for every queued member of a bb dispatch.', { threadId: string,
+    members: { type: 'array', minItems: 1, maxItems: 100, items: object({ id: string, author: string, content: { type: 'string' } }) } }, true, ['host']),
+  operation('host.bb-allocation', 'Return the existing path of a matching held allocation.', { leaseId: string }, false, ['host']),
   operation('host.usage', 'Record cumulative usage for a registered session.', { report: usageReport }, true, ['host']),
   operation('objective.confirm-usage', 'Confirm exact finished session usage gaps without inventing zero values.',
     { objectiveId: id, sessionGaps: { type: 'array', minItems: 1, items: usageGap }, reason: string }, true, ['person']),

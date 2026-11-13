@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { canonicalJson } from '../../src/configuration.ts';
 import type { JsonObject } from '../../src/storage/database.ts';
 import type { WorkerReference } from '../../src/storage/launch.ts';
 import { confirmed, rejected } from '../../src/adapters/command.ts';
@@ -13,6 +14,7 @@ export class FakeLauncher implements Launcher {
   beforePrepare?: () => Promise<Result<WorkerReference> | void>;
   afterPrepare?: (reference: WorkerReference) => Promise<Result<WorkerReference>>;
   beforeActivate?: () => Promise<Result<JsonObject> | void>;
+  admit?: (reference: WorkerReference) => Promise<boolean>;
   afterActivate?: () => Promise<Result<JsonObject>>;
   capabilities(_profile: JsonObject): LauncherCapabilities {
     return { preparation: 'non_acting', admission: true, activeSteering: false, afterTurnMessage: false,
@@ -25,23 +27,24 @@ export class FakeLauncher implements Launcher {
     const launcher = String((binding.specification.profile as JsonObject).launcher);
     const reference: WorkerReference = launcher === 'pi'
       ? { launcher, processId: '123', sessionId: binding.sessionId }
-      : { launcher, threadId: randomUUID() };
-    this.workers.set(JSON.stringify(reference), { binding, active: false, terminal: false, sequence: 0 });
+      : { launcher, threadId: randomUUID(), initialMessageId: randomUUID(), initialAuthor: 'docket' };
+    this.workers.set(canonicalJson(reference), { binding, active: false, terminal: false, sequence: 0 });
     return this.afterPrepare ? this.afterPrepare(reference) : confirmed(reference);
   }
   async activate(reference: WorkerReference, storedInput: JsonObject, effectId: string, claimGeneration: string): Promise<Result<JsonObject>> {
     this.calls.push({ operation: 'activate', effectId });
     const early = await this.beforeActivate?.();
     if (early) return early;
-    const worker = this.workers.get(JSON.stringify(reference));
+    const worker = this.workers.get(canonicalJson(reference));
     if (!worker || worker.active || worker.terminal || worker.binding.owner.generation !== claimGeneration) return rejected('Worker cannot activate');
+    if (this.admit && !await this.admit(reference)) return rejected('Admission refused');
     worker.active = true;
     worker.sequence++;
     this.prompts.push({ reference, input: storedInput, generation: claimGeneration });
     return this.afterActivate ? this.afterActivate() : confirmed({ admitted: true });
   }
   async inspect(reference: WorkerReference): Promise<WorkerObservation> {
-    const worker = this.workers.get(JSON.stringify(reference));
+    const worker = this.workers.get(canonicalJson(reference));
     return worker ? { status: 'known', sourceId: String(reference.threadId ?? reference.sessionId), sequence: worker.sequence,
       worker: worker.active ? 'active' : 'prepared', turn: worker.active ? 'running' : 'idle', terminal: worker.terminal,
       capabilities: this.capabilities(worker.binding.specification.profile as JsonObject) } : { status: 'absent' };
@@ -55,7 +58,7 @@ export class FakeLauncher implements Launcher {
   }
   async fence(reference: WorkerReference, effectId: string): Promise<Result<JsonObject>> {
     this.calls.push({ operation: 'fence', effectId });
-    const worker = this.workers.get(JSON.stringify(reference));
+    const worker = this.workers.get(canonicalJson(reference));
     if (!worker) return rejected('Absent worker');
     worker.terminal = true;
     worker.sequence++;

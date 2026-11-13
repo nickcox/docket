@@ -5,6 +5,7 @@ import { writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { checkFixture, person, head, start, host } from '../helpers/check-attempt.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
+import { canonicalJson } from '../../src/configuration.ts';
 import { dispatch } from '../../src/dispatch.ts';
 import { catalogue } from '../../src/catalog.ts';
 import { piWorkerPrompt } from '../../src/adapters/pi.ts';
@@ -35,6 +36,12 @@ async function fixture(t: Parameters<typeof checkFixture>[0], candidate = true, 
   const allocations: Allocation[] = [];
   let movedPin = false, uncertainCleanup = false, dirtyAfterPin = false;
   const launcher = new FakeLauncher();
+  launcher.admit = async reference => {
+    if (reference.launcher !== 'bb') return true;
+    const worker = launcher.workers.get(canonicalJson(reference))!;
+    return (await f.db.admitInitialBbPrompt(worker.binding.attemptId, String(reference.threadId),
+      f.db.claim(worker.binding.owner.claimId).ownerRef as typeof host)).kind === 'admitted';
+  };
   launcher.afterActivate = async () => {
     for (const worker of launcher.workers.values()) worker.terminal = true;
     return confirmed({ admitted: true });

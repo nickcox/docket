@@ -143,6 +143,8 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
     }
     if (operation.name === 'question.ask') return { question: await db.askQuestion(input as import('./storage/questions.ts').QuestionInput, bound as import('./storage/questions.ts').QuestionCaller, `question.command:${requestKey}`, command) };
     if (bound.kind === 'host') {
+      if (operation.name === 'host.bb-admit') return await db.admitBbDispatch(String(args.threadId), args.members as { id: string; author: string; content: string }[]);
+      if (operation.name === 'host.bb-allocation') return db.bbAllocation(String(args.leaseId));
       if (operation.name === 'supervisor.pending') {
         const deadline = Date.now() + Number(args.timeoutMs);
         while (!db.hasPendingNotifications(String(args.objectiveId)) && Date.now() < deadline) {

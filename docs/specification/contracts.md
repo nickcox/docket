@@ -80,7 +80,7 @@ Status task records contain id, title, state, ready, holdReason and blockedBy. S
 
 **R28.** One core catalogue defines operation name, description, strict input JSON Schema, allowed caller roles, binding-derived fields, whether it mutates, whether it plans, output schema and tool presentation. catalog show emits catalogueVersion 1 and these definitions. Hosts register tools and encode CLI input from it. They do not copy schemas or argument conversion.
 
-Every input property is required; nullable means the explicitly documented absence/default. Unknown fields refuse. Nested tool-input objects follow the same rule. The table below defines required fields; a notation such as String|null is a union, not an optional field. All mutations except context init use command replay records.
+Every input property is required; nullable means the explicitly documented absence/default. Unknown fields refuse. Nested tool-input objects follow the same rule. The table below defines required fields; a notation such as String|null is a union, not an optional field. All mutations except context init and host.bb-admit use command replay records. host.bb-admit consumes the recorded worker effect atomically; it never caches or replays an admit response.
 
 Shared types:
 
@@ -147,12 +147,18 @@ The operation-specific schema for ordinary task.add restricts kind to code/repor
 | supervisor.handled | objectiveId:Id, eventIds:UUID[] | Supervisor; contiguous processed batch |
 | host.observe | observation:Observation | Host service only; strict adapter observation |
 | host.usage | report:UsageReport | Host service only; session-bound accounting |
+| host.bb-admit | threadId:String, members:{id:String,author:String,content:String}[] | Host only through host invoke; returns decision pass-through, hold, admit or refuse; checks every queued member and consumes admission once |
+| host.bb-allocation | leaseId:String | Host only through host invoke; returns {path:String} only for a matching held allocation; otherwise policy_refused |
 | host.heartbeat / host.release | claimId:UUID, generation:UUID | Host service only; conditional ownership |
 | diagnostics.clean | attemptId:UUID, noProcesses:boolean, includeTranscript:boolean, dryRun:boolean | Person; only eligible diagnostic artefacts (R40); the session transcript only with includeTranscript |
 
 Permissions has the R18 boolean fields. An unknown field is refused, and a missing field takes the default set by the version that introduced it. Budget has exactly maxCost:number|null, currency:String|null, maxTokens:integer|null and maxWorkerTimeMs:integer|null. Cost requires currency; unlimited cost can retain a reporting currency. UsageGap has sessionId and metrics drawn from cost,tokens,workerTimeMs. CompletionStatement has position, statement and references; each reference has kind accepted_output|review, attemptId, candidateId, candidateCommit:Commit|null, artefactDigests:String[], evidenceEventId and reviewAttemptId:UUID|null. Code references require a commit; report-only references require retained artefact digests. Candidate IDs are generated UUIDs identifying immutable selection events.
 
 Observation has sourceId, sourceSequence, attemptId, workerRef, observedAt, kind, payloadVersion and payload validated by kind. Allowed observation kinds are prepared, activation_observed, turn_ended, terminal, later_turn, result_available, question and capability_failure. later_turn records a turn that the launcher observed starting on a worker after its terminal observation; it never reopens the attempt, and R11 treats it as a discrepancy. A host cannot submit output_accepted or no_processes as an observation.
+
+The bb launcher binds initialMessageId and initialAuthor with its thread reference before permission. The core stores initialInput, the exact worker protocol prompt, in bb's worker.prepare effect. The launcher queues that string unchanged and the hook compares its exact content; Pi uses the same prompt renderer without changing its activation path. These queue identities come from the trusted launcher, never thread metadata. A later worker.deliver effect records messageId, author and message before sending; admission requires all three and the exact bound reference, a claimed effect with a fresh owner, and no earlier admission. A grouped dispatch consumes nothing unless every member matches. Unknown threads pass through, tracked pending launches hold, and finished, fenced, unauthorised or replayed dispatches refuse. The owner's one queue re-evaluation has a separate worker.recheck effect; it does not claim worker.activate. Only the hook consumes that activation effect, in the same transaction as its admission decision. The Pi path still claims before calling activate.
+
+host.bb-allocation checks the recorded lease, holder, pool, repository, starting commit and output ref against the immutable specification and requires a held lease. It never acquires a workspace. Both bb operations are excluded from person, supervisor and worker catalogues. A host binding must explicitly list them; an operation outside that list returns permission_denied.
 
 UsageReport has sessionId, sourceSequence, observedAt, cost:{availability,value,currency}, tokens:{availability,input,output,total}, workerTimeMs:{availability,value}. availability is reported|unknown|unsupported; value fields are nonnegative or null consistent with availability. Supervisor workerTimeMs is unsupported.
 

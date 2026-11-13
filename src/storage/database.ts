@@ -4,6 +4,8 @@ import { workerDiagnostics, within } from '../worker-diagnostics.ts';
 import { nextAction } from '../next-action.ts';
 import type { TurnFailure } from '../adapters/launcher.ts';
 import { canonicalJson } from '../configuration.ts';
+import { workerPrompt } from '../worker-input.ts';
+import type { WorkerBinding } from '../adapters/launcher.ts';
 import { readFileSync } from 'node:fs';
 import { lstat, open, realpath, statfs, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -1720,7 +1722,9 @@ export class Database {
         correlationId: input.sessionId, actor: owner, occurredAt: new Date().toISOString(), attemptId,
         ...(objectiveId === null ? {} : { objectiveId }), payload: { sessionId: input.sessionId, kind: 'worker', objectiveId,
           attemptId, registeredAt: new Date().toISOString(), capabilities: [...capabilities], workerRef: null, restricted: true } });
-      const effect = this.workerEffect(attemptId, claimId, owner.generation, 'worker.prepare', input, { launcher: object(spec.profile).launcher! });
+      const stored = object(spec.profile).launcher === 'bb'
+        ? { ...input, initialInput: workerPrompt(input as WorkerBinding) } : input;
+      const effect = this.workerEffect(attemptId, claimId, owner.generation, 'worker.prepare', stored, { launcher: object(spec.profile).launcher! });
       return { effect: this.claimEffectInTransaction(effect.id, { claimId, generation: owner.generation }), claimed: true };
     });
   }
@@ -1930,18 +1934,101 @@ export class Database {
   async claimWorkerActivation(attemptId: string, reference: WorkerReference, host: WorkerHost): Promise<InitialPromptAdmission> {
     nonblank(attemptId); workerReference(reference); workerHost(host);
     const caller = object(host) as WorkerHost, bound = object(reference);
-    return this.write(() => {
+    return this.write(() => this.claimWorkerActivationInTransaction(attemptId, bound as WorkerReference, caller));
+  }
+
+  private claimWorkerActivationInTransaction(attemptId: string, bound: WorkerReference, caller: WorkerHost): InitialPromptAdmission {
+    const attempt = this.attemptRow(attemptId);
+    if (attempt.launch_state === 'fenced' || this.workerStopRequested(attemptId)) return { kind: 'fenced' };
+    if (attempt.launch_state === 'pending') return { kind: 'pending' };
+    if (json(JSON.parse(String(attempt.runtime_ref))) !== json(bound)) throw new StorageError('conflict', 'Activation reference does not match the bound worker');
+    this.workerClaim(attemptId, String(attempt.owner_claim_id), caller);
+    const effect = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.activate'").get(attemptId);
+    if (!effect) throw new StorageError('conflict', 'Activation effect is missing');
+    if (effect.state !== 'pending') return { kind: 'already_admitted' };
+    this.claimEffectInTransaction(String(effect.id), { claimId: String(attempt.owner_claim_id), generation: caller.generation });
+    this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.prompt_admitted', { effectId: String(effect.id), reference: bound });
+    return { kind: 'admitted', effectId: String(effect.id) };
+  }
+
+  /** Read-only permission check for the owner's one bb queue re-evaluation call. */
+  pendingBbActivation(attemptId: string, reference: WorkerReference, host: WorkerHost): StoredRequest | null {
+    return this.snapshot(() => {
       const attempt = this.attemptRow(attemptId);
-      if (attempt.launch_state === 'fenced' || this.workerStopRequested(attemptId)) return { kind: 'fenced' };
-      if (attempt.launch_state === 'pending') return { kind: 'pending' };
-      if (json(JSON.parse(String(attempt.runtime_ref))) !== json(bound)) throw new StorageError('conflict', 'Activation reference does not match the bound worker');
-      this.workerClaim(attemptId, String(attempt.owner_claim_id), caller);
-      const effect = this.db.prepare("SELECT * FROM requests WHERE attempt_id = ? AND operation = 'worker.activate'").get(attemptId);
-      if (!effect) throw new StorageError('conflict', 'Activation effect is missing');
-      if (effect.state !== 'pending') return { kind: 'already_admitted' };
-      this.claimEffectInTransaction(String(effect.id), { claimId: String(attempt.owner_claim_id), generation: caller.generation });
-      this.launchEvent(attemptId, String(attempt.task_id), caller, 'attempt.prompt_admitted', { effectId: String(effect.id), reference: bound });
-      return { kind: 'admitted', effectId: String(effect.id) };
+      if (attempt.launch_state !== 'permitted' || this.workerStopRequested(attemptId)) return null;
+      const effect = this.requests().find(r => r.attemptId === attemptId && r.operation === 'worker.activate');
+      if (!effect || effect.state !== 'pending' || json(effect.target!.reference) !== json(reference)) return null;
+      this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
+      this.checkWorkerEffectInTransaction(effect, { claimId: effect.claimId!, generation: host.generation });
+      return effect;
+    });
+  }
+
+  /** Host provenance permits asking; only stored queue identities and effects permit a turn. */
+  async admitBbDispatch(threadId: string, members: { id: string; author: string; content: string }[]): Promise<{ decision: 'pass-through' | 'hold' | 'admit' | 'refuse' }> {
+    nonblank(threadId);
+    const queued = structuredClone(members);
+    return this.write<{ decision: 'pass-through' | 'hold' | 'admit' | 'refuse' }>(() => {
+      const rows = this.db.prepare("SELECT * FROM attempts WHERE json_extract(runtime_ref, '$.launcher') = 'bb' AND json_extract(runtime_ref, '$.threadId') = ?").all(threadId);
+      if (!rows.length) return { decision: 'pass-through' };
+      if (rows.length !== 1 || !queued.length || new Set(queued.map(m => m.id)).size !== queued.length) return { decision: 'refuse' };
+      const attempt = rows[0]!;
+      if (attempt.launch_state === 'fenced' || attempt.execution_open !== 1 || attempt.outcome !== null || attempt.lease_state !== 'held'
+        || this.workerStopRequested(String(attempt.id)) || this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ?
+          AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'`).get(String(attempt.id))) return { decision: 'refuse' };
+      const reference = JSON.parse(String(attempt.runtime_ref)) as WorkerReference;
+      const preparation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.prepare');
+      if (attempt.launch_state === 'pending') {
+        return { decision: queued.length === 1 && queued[0]!.id === reference.initialMessageId
+          && queued[0]!.author === reference.initialAuthor && queued[0]!.content === preparation?.input.initialInput ? 'hold' : 'refuse' };
+      }
+      const activation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.activate');
+      const claim = this.claims().find(c => c.id === attempt.owner_claim_id && !c.releasedAt);
+      if (!claim || !activation) return { decision: 'refuse' };
+      const owner = claim.ownerRef as WorkerHost;
+      const deliveries: StoredRequest[] = [];
+      let initial = false;
+      for (const member of queued) {
+        if (activation.state === 'pending' && member.id === reference.initialMessageId && member.author === reference.initialAuthor
+          && member.content === preparation?.input.initialInput) {
+          initial = true;
+          continue;
+        }
+        const delivery = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.deliver'
+          && r.state === 'claimed' && r.input.messageId === member.id && r.input.author === member.author
+          && r.input.message === member.content && json(r.target?.reference) === json(reference));
+        if (!delivery || deliveries.some(r => r.id === delivery.id)
+          || this.events().some(e => e.kind === 'worker.delivery_admitted' && e.payload.effectId === delivery.id)) return { decision: 'refuse' };
+        deliveries.push(delivery);
+      }
+      // All checks precede consumption, so an unauthorised grouped member consumes nothing.
+      for (const delivery of deliveries) this.checkWorkerControlEffect(delivery.id, owner, reference);
+      if (initial && this.claimWorkerActivationInTransaction(String(attempt.id), reference, owner).kind !== 'admitted') return { decision: 'refuse' };
+      if (!initial && activation.state !== 'succeeded') return { decision: 'refuse' };
+      for (const delivery of deliveries) this.launchEvent(String(attempt.id), String(attempt.task_id), owner,
+        'worker.delivery_admitted', { effectId: delivery.id, reference });
+      return { decision: 'admit' as const };
+    }).catch(error => {
+      if ((error instanceof StorageError && error.code === 'conflict') || error instanceof CommandFailure) return { decision: 'refuse' as const };
+      throw error;
+    });
+  }
+
+  /** An environment reuses only a held allocation in this context's recorded pool/repository. */
+  bbAllocation(leaseId: string): { path: string } {
+    nonblank(leaseId);
+    return this.snapshot(() => {
+      const rows = this.db.prepare('SELECT * FROM attempts WHERE lease_id = ?').all(leaseId);
+      if (rows.length !== 1) throw new CommandFailure('policy_refused');
+      const attempt = this.decodeAttempt(rows[0]!);
+      const allocation = attempt.allocation;
+      const spec = attempt.specification, workspace = spec.workspace as JsonObject;
+      if (!allocation || attempt.leaseState !== 'held' || allocation.leaseId !== leaseId
+        || allocation.pool !== workspace.pool || allocation.path === allocation.pool || !inside(allocation.path, allocation.pool)
+        || canonicalJson(allocation.repository) !== canonicalJson(spec.repository)
+        || canonicalJson(allocation.holder) !== canonicalJson(workspace.holder)
+        || allocation.outputRef !== spec.outputRef || allocation.startingCommit !== spec.startingCommit) throw new CommandFailure('policy_refused');
+      return { path: allocation.path };
     });
   }
 

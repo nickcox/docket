@@ -55,7 +55,7 @@ export async function readHostBinding(path: string): Promise<HostBinding> {
 
 export async function loadHostBinding(path: string, operation: string) {
   const binding = await readHostBinding(path);
-  if (!binding.operations.includes(operation)) throw new CommandFailure('person_required');
+  if (!binding.operations.includes(operation)) throw new CommandFailure('permission_denied');
   const context = await openContext({ config: binding.config }, { readOnly: true });
   try {
     if (context.databaseId !== binding.databaseId || context.configuration.resolved.contextId !== binding.contextId) throw new CommandFailure('context_mismatch');

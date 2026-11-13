@@ -62,7 +62,7 @@ export async function controlWorker(db: Database, attemptId: string, reference: 
     }
     if (!stop && db.workerStopRequested(attemptId)) continue;
     const effect = await db.recordEffect({ requestKey: `control:${command.id}`, operation, caller: command.caller,
-      input: { reference, ...command.input }, fingerprint: command.fingerprint, parentId: command.id,
+      input: { reference, ...command.input, ...(!stop && reference.launcher === 'bb' ? { messageId: command.id, author: 'docket' } : {}) }, fingerprint: command.fingerprint, parentId: command.id,
       executor, attemptId, target: { kind: 'worker', reference } });
     await db.claimEffect(effect.id, executor);
     try {
@@ -118,7 +118,36 @@ export async function prepareWorker(db: Database, attemptId: string, host: Worke
   }
 }
 
-/** The caller must have committed permission. Claim, recheck, then make exactly one call. */
+/** bb re-evaluates the queue once; only the hook may claim its activation effect. */
+async function activateBbWorker(db: Database, attemptId: string, reference: WorkerReference,
+  host: WorkerHost, launcher: Launcher): Promise<StoredRequest | null> {
+  if (db.requests().some(r => r.attemptId === attemptId && r.operation === 'worker.recheck')) return null;
+  const activation = db.pendingBbActivation(attemptId, reference, host);
+  if (!activation) return null;
+  const executor = { claimId: activation.claimId!, generation: host.generation };
+  const recheck = await db.recordEffect({ requestKey: `bb-recheck:${activation.id}`, operation: 'worker.recheck',
+    caller: activation.caller, input: { reference, activationId: activation.id }, fingerprint: canonicalJson({ reference, activationId: activation.id }),
+    parentId: activation.parentId!, executor, attemptId, ...(activation.objectiveId ? { objectiveId: activation.objectiveId } : {}),
+    target: { kind: 'worker', reference } });
+  await db.claimEffect(recheck.id, executor);
+  try {
+    if (!db.pendingBbActivation(attemptId, reference, host)) throw new CommandFailure('launch_fenced');
+    const result = await launcher.activate(reference, activation.input.specification as JsonObject, activation.id, host.generation);
+    const current = db.request(activation.id);
+    if (current.state === 'claimed') await db.recordEffectOutcome(activation.id, executor,
+      result.status === 'confirmed' ? 'succeeded' : result.status === 'rejected' ? 'rejected' : 'uncertain', evidence(result));
+    // A queue acknowledgement alone is not proof of prompt admission.
+    const state = result.status === 'confirmed' && db.request(activation.id).state === 'succeeded' ? 'succeeded'
+      : result.status === 'rejected' ? 'rejected' : 'uncertain';
+    return await db.recordEffectOutcome(recheck.id, executor, state, evidence(result));
+  } catch (error) {
+    if (db.request(activation.id).state === 'claimed') await db.recordEffectOutcome(activation.id, executor, 'uncertain', { reason: String(error) });
+    if (db.request(recheck.id).state === 'claimed') await db.recordEffectOutcome(recheck.id, executor, 'uncertain', { reason: String(error) });
+    throw error;
+  }
+}
+
+/** The caller must have committed permission. Pi claims before its one activation call. */
 export async function activateWorker(db: Database, attemptId: string, reference: WorkerReference,
   host: WorkerHost, launcher: Launcher): Promise<StoredRequest | null> {
   host = { ...host };
@@ -126,6 +155,7 @@ export async function activateWorker(db: Database, attemptId: string, reference:
   if (!launcher.capabilities(db.attempt(attemptId).specification.profile as JsonObject).admission) {
     throw new StorageError('conflict', 'Launcher does not support activation admission');
   }
+  if (reference.launcher === 'bb') return activateBbWorker(db, attemptId, reference, host, launcher);
   const admission = await db.claimWorkerActivation(attemptId, reference, host);
   if (admission.kind !== 'admitted') return null;
   const effect = db.request(admission.effectId);
