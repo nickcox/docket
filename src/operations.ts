@@ -1,6 +1,7 @@
 import { cleanDiagnostics } from './diagnostics.ts';
 import { workerDiagnostics } from './worker-diagnostics.ts';
 import { userInfo } from 'node:os';
+import { writeHostBinding } from './host-binding.ts';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { canonicalJson, ConfigurationError } from './configuration.ts';
@@ -133,6 +134,13 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
   let runtime: Runtime | undefined;
   const services = async () => runtime ??= await (options.runtime ?? createRuntime)(db, context.configuration.resolved, options.home);
   try {
+    if (operation.name === 'host.bind') {
+      const record = await db.recordCommand(command);
+      const path = await writeHostBinding(String(args.directory), { version: 1, config: context.configuration.file,
+        contextId: context.configuration.resolved.contextId, databaseId: String(context.databaseId),
+        caller: { kind: 'host', id: record.id }, operations: args.operations as string[] });
+      return { path };
+    }
     if (operation.name === 'question.ask') return { question: await db.askQuestion(input as import('./storage/questions.ts').QuestionInput, bound as import('./storage/questions.ts').QuestionCaller, `question.command:${requestKey}`, command) };
     if (bound.kind === 'host') {
       if (operation.name === 'supervisor.pending') {

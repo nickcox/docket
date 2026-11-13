@@ -1,3 +1,4 @@
+import { loadHostBinding } from './host-binding.ts';
 import { executeOperation, findOperation } from "./catalog.ts";
 import type { OperationDefinition } from "./catalog.ts";
 import { CommandFailure, exitCodeFor, failureEnvelope, successEnvelope } from "./response.ts";
@@ -113,14 +114,34 @@ export async function runCli(
     if (argv.length < 2 || argv[0]?.startsWith("-") || argv[1]?.startsWith("-")) {
       throw new CommandFailure("invalid_input");
     }
-    const definition = findOperation(`${argv[0]}.${argv[1]}`);
+    const hostInvoke = argv[0] === 'host' && argv[1] === 'invoke';
+    let bindingPath: string | undefined;
+    let optionArgs = argv.slice(hostInvoke ? 3 : 2);
+    if (hostInvoke) {
+      const index = optionArgs.indexOf('--binding');
+      bindingPath = optionArgs[index + 1];
+      if (index < 0 || !bindingPath || bindingPath.startsWith('--')) throw new CommandFailure('invalid_input');
+      optionArgs = [...optionArgs.slice(0, index), ...optionArgs.slice(index + 2)];
+    }
+    const definition = findOperation(hostInvoke ? argv[2] ?? '' : `${argv[0]}.${argv[1]}`);
     if (!definition) throw new CommandFailure("unknown_operation");
     operation = definition.name;
-    const options = parseOptions(argv.slice(2));
+    const options = parseOptions(optionArgs);
     requestId = options.requestId;
-    if ((definition.name === 'catalog.show' && options.selector) || (definition.name !== 'catalog.show' && !options.selector)) throw new CommandFailure('invalid_input');
+    if (hostInvoke) {
+      if (options.selector || options.stdin || !options.input || !options.requestId || !optionArgs.includes('--json')) throw new CommandFailure('invalid_input');
+    } else if ((definition.name === 'catalog.show' && options.selector) || (definition.name !== 'catalog.show' && !options.selector)) throw new CommandFailure('invalid_input');
     const args = await readArgs(options, io);
     validateArgs(definition, args);
+    if (hostInvoke) {
+      const binding = await loadHostBinding(bindingPath!, definition.name);
+      const data = await binding.execute(args, requestId!, message => io.stderr(`${message}\n`));
+      const envelope = successEnvelope(operation, requestId, data);
+      output = `${JSON.stringify(envelope)}\n`;
+      if (Buffer.byteLength(output, 'utf8') > MAX_RESPONSE_BYTES) throw new CommandFailure('response_too_large');
+      io.stdout(output);
+      return exitCodeFor(envelope.outcome);
+    }
     if (definition.mutates && args.dryRun !== true) requestId ??= randomUUID();
     if (operation === 'status.watch') {
       const writeLine = (line: string) => {

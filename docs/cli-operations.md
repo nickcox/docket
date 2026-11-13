@@ -4,6 +4,26 @@
 
 Use `--config /absolute/context.json` or a registered `--context name`, and exactly one of `--stdin` and `--input file.json`. Ordinary commands write one version-1 envelope to stdout; `status.watch` writes NDJSON envelopes. Dispatch progress goes to stderr. Person mutations generate a request ID unless `--request-id key` is supplied. Reuse that key after a lost response, with the same input. Task mutations and their replay result commit together.
 
+## Private host-service bindings
+
+A person creates a binding with `host.bind`, using an explicit list of existing operations that allow the `host` role:
+
+```json
+{"directory":"/absolute/new-private-directory","operations":["catalog.show","supervisor.pending","supervisor.admitted"]}
+```
+
+Run `node bin/docket.ts host bind --config /absolute/context.json --input binding-request.json --json --request-id create-host-service`. The operation creates a new dedicated directory and returns the private `binding.json` path. It never overwrites a different binding. Repeating the same request key and input can recover the same file; changing either the input or an existing file refuses. Keep the directory outside worker workspaces and do not expose it to agents. Possession of this file grants its listed host-service calls; remove the file to revoke it.
+
+The version-1 file fixes the absolute configuration path, context ID, database ID, generated host-service caller ID and exact operation list. It permits no person, supervisor or worker role. It uses owner-only file/directory modes on macOS/Linux and a verified owner-only ACL on Windows. Missing, linked (including hard-linked), oversized, non-private and invalid-version files refuse. Context/database mismatches refuse. Only operations in both the host catalogue and the binding list are available; `catalog.show` returns that intersection.
+
+Invoke an operation through the binding:
+
+```sh
+node bin/docket.ts host invoke supervisor.pending --binding /absolute/new-private-directory/binding.json --input pending.json --json --request-id session-call-pending
+```
+
+Supply the operation's ordinary args object in the input file. Caller/configuration/permission overrides are not arguments. `host invoke` requires `--binding`, `--input`, `--json` and a request ID; it accepts neither stdin nor context/configuration overrides. Hosts must derive stable request keys from session, tool-call ID and operation and reuse them after a lost response, never from message text. Invocation uses argv, not a shell command assembled from input. Host `status.watch` returns one bounded page in an ordinary envelope, as the existing trusted binding API does; ordinary person `status.watch` retains its NDJSON stream.
+
 ## Questions
 
 `question.ask` takes exactly `{"text":"Which approach?","choices":["A","B"],"waiting":true}`. Only a bound worker or supervisor can ask. A worker's recipient is its task's objective supervisor, or a person when the task has no objective. A supervisor asks a person. Text, choices, waiting, asker, recipient and scope are immutable.

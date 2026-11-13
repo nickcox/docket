@@ -27,6 +27,21 @@ export async function windowsSecurePrivateDirectory(path: string, runner = comma
   if (!result.complete || result.code !== 0) throw new Error('Windows private directory ACL could not be secured and verified');
 }
 
+/** Verify owner-only access, including reads, for a host binding. */
+export async function windowsPrivateFile(path: string, runner = commandRunner): Promise<boolean> {
+  const run = runner({ environment: { ...windowsPowerShellEnvironment(), DOCKET_PRIVATE_FILE: path } });
+  const script = '$ErrorActionPreference = "Stop"; ' +
+    '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ' +
+    '$acl = Get-Acl -LiteralPath $env:DOCKET_PRIVATE_FILE; ' +
+    'if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 2 }; ' +
+    'foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) { ' +
+    'if ($rule.AccessControlType -eq "Allow" -and $rule.IdentityReference.Value -ne $sid) { exit 2 } }; exit 0';
+  const result = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(script, 'utf16le').toString('base64')], process.cwd());
+  if (!result.complete || (result.code !== 0 && result.code !== 2)) throw new Error('Windows private file ACL could not be verified');
+  return result.code === 0;
+}
+
 /** Windows mode bits do not describe who can replace person-controlled settings. */
 export async function windowsSettingsWritableOnlyByOwner(path: string, runner = commandRunner): Promise<boolean> {
   const run = runner({ environment: { ...windowsPowerShellEnvironment(), DOCKET_SETTINGS_PATH: path } });

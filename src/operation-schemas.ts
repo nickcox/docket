@@ -70,6 +70,7 @@ function outputSchema(name: string): JsonSchema {
       input: view, result: nullable(view), effects: { type: 'array', maxItems: 20, items: object(identity) },
       effectsTotal: { type: 'integer', minimum: 0 } });
   }
+  if (name === 'host.bind') return object({ path: string });
   if (name === 'host.usage') return object({ recorded: bool });
   if (name.startsWith('objective.')) return object({ objective: view });
   if (name === 'task.list') return paginated(view);
@@ -136,6 +137,7 @@ export const coreOperations: OperationDefinition[] = [
   ...['done', 'reopen'].map(action => operation(`task.${action}`, `Record a ${action} judgement without inventing acceptance evidence.`, { taskId: id, note: nullable(string) })),
   operation('objective.add', 'Create an open objective; null permissions and budget select all permissions and unlimited usage.',
     { id, request: string, ...objectiveFields, permissions: nullable(permissions), budget: nullable(budget) }, true, ['person']),
+  operation('host.bind', 'Create a private host-service binding with an explicit operation list.', { directory: string, operations: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: string } }, true, ['person']),
   operation('host.usage', 'Record cumulative usage for a registered session.', { report: usageReport }, true, ['host']),
   operation('objective.confirm-usage', 'Confirm exact finished session usage gaps without inventing zero values.',
     { objectiveId: id, sessionGaps: { type: 'array', minItems: 1, items: usageGap }, reason: string }, true, ['person']),
