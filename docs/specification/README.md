@@ -90,7 +90,7 @@ These documents form one specification. Requirement IDs R01–R40 are normative.
 | R31 | Reference-based launcher and capability contract | [Adapters](adapters.md#launchers) |
 | R32 | Workspace ownership and safe return contract | [Adapters](adapters.md#workspaces-and-repository) |
 | R33 | bb first-message admission, later-turn guard and detection, and uncertain sends | [Adapters](adapters.md#bb-launcher) |
-| R34 | bb environments, events, questions and supervision | [Adapters](adapters.md#bb-host) |
+| R34 | bb plugin environment provider and deferred bb features | [Adapters](adapters.md#bb-host) |
 | R35 | Minimal standalone Pi and restricted supervisor | [Adapters](adapters.md#standalone-pi) |
 | R36 | No speculative launch, replay or duplicated infrastructure | [Adapters](adapters.md#ownership-boundaries) |
 | R37 | Boundary tests and measured time budgets | [Delivery](delivery.md#testing) |

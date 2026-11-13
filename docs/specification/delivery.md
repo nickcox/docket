@@ -21,7 +21,7 @@ The first release supports the following capabilities before it is ready for eve
 | Objectives | Scoped permissions, token/cost/time budgets, deadlines and explicit evidence-backed completion |
 | Continuity | Worker/person questions, notes, ordered notification delivery/admission/handled state, compact briefings and classified person actions |
 | CLI and tools | Versioned results/configuration, one described tool catalogue, separate dispatch/continue operations and dry-run/execution agreement |
-| bb | Workers, retained environments, messages, questions and minimal status UI; ordinary supervisor sessions recorded as unrestricted unless separately qualified |
+| bb | Workers through the bb launcher on one machine, with the plugin's admission hook and environment provider; people and supervisors use the Docket CLI, and a supervisor in an ordinary bb thread is recorded as unrestricted |
 | Pi | Standalone worker/CLI, restricted supervisor for unattended supervision, essential question/status presentation and bounded briefing context |
 | Diagnostics | Eligible diagnostic cleanup with permanent identity/evidence retention; visible provider failures and explicit continuation |
 | Platforms | macOS workflow qualification; Linux/Windows CI and explicit qualification status |
@@ -42,6 +42,8 @@ The first release supports the following capabilities before it is ready for eve
 | Automatic fallback to another profile when a profile is limited | Dispatch on a limited profile refuses with provider_limited; a person or supervisor names another profile, and a person clears the limit with profile.clear |
 | Proof that every process a worker started has stopped | Automatic lease return depends on committed, retained work, not on process state |
 | Proof that no later bb turn can run on a finished worker | The plugin hook refuses later turns on a best-effort basis; Docket detects changes to a finished attempt's output before checks, acceptance, integration and return (R11) |
+| Docket events and questions delivered into bb, agent tools, person forms, a status UI and bb supervisor registration | Deferred; people and supervisors use the Docket CLI (R34) |
+| bb workers on another machine | The Docket context, the bb server and worker workspaces are on one machine (R33) |
 | Isolating bb workers from the person's provider settings, skills, extensions and tools | bb workers have the same capabilities as the person's ordinary coding threads, and the bb launcher documentation says so |
 | Automatic or periodic clean-up of diagnostics | diagnostics.clean is explicit and per attempt; session transcripts are kept unless a person asks to remove them |
 | Event-history compaction, request-key expiry and permanent-identity deletion | Domain identities and evidence remain available |
@@ -61,7 +63,7 @@ Each milestone has observable exit evidence.
 | M2: storage and domain operations | Tasks/graph, requests/claims, immutable specifications/events, known/unknown observations and pure decisions satisfy applicable A01–A16 and A48–A54 cases |
 | M3: standalone execution | One real Pi task demonstrates exact allocation/prompt/result, candidate retention, held outcome and person-confirmed return through the common operations |
 | M4: evidence and supervision | Checks/slots, reviews, continuations, rebase, acceptance/integration/return, objectives/budgets/questions/events, catalogue and restricted supervisor satisfy applicable A17–A47 cases |
-| M5: bb workflow | Qualified launcher and environment mechanism, trusted caller binding, startup reconciliation and minimal UI satisfy A55–A57 |
+| M5: bb workflow | Qualified bb launcher, admission hook and environment provider satisfy A55 and A56 |
 | M6: release qualification | A60 real objective, cross-platform checks, A59 context activation, complete requirement/evidence mapping and operator documentation |
 
 ## Testing

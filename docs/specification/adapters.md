@@ -50,21 +50,25 @@ Checks run in the attempt's own workspace after its worker is terminal, so they 
 
 ## bb launcher
 
-**R33.** Required workflow:
+**R33.** The bb launcher runs inside the Docket process that dispatched or continued the attempt, as the Pi launcher does. That process owns the worker through the same per-worker claim and heartbeat, and drives bb only through the `bb` command-line tool, kept behind the bb adapter. The Docket bb plugin has two jobs: the `message.dispatch` admission hook, and the environment provider that R34 describes. The Docket context, the bb server and the worker's workspace are on the same machine.
+
+Required workflow:
 
 1. Core reserves attempt, acquires/verifies lease and records a launch request.
-2. Plugin backend registers ownership and prepares a bb thread/environment. No task prompt may run yet.
+2. The launcher creates the bb thread with the profile's provider and model, the exact leased path as its environment and the stored initial input. The plugin's hook holds that first message, so no task prompt runs yet.
 3. Record the returned thread/reference and resource identity in the core. Conditionally permit launch under its owning claim.
-4. Admit the exact activation effect once. Any replay through the supported dispatch path after admission is blocked or exposed as uncertain, never reprompted.
-5. Use host events plus fresh reads to observe progress. At terminal candidate, validate result, record the fence, confirm stopped state, then record terminal/completion facts.
+4. The launcher asks bb to re-evaluate the held message. The hook asks the core to admit it, and the core consumes the exact activation effect once. Any replay through the supported dispatch path after admission is blocked or exposed as uncertain, never reprompted.
+5. The launcher observes progress by reading thread state and events through the `bb` tool. At terminal candidate, validate result, record the fence, confirm stopped state, then record terminal/completion facts.
 
-Stored thread metadata can locate a candidate binding, but cannot authorise it. The core database plus trusted host provenance establishes authority. Another agent/plugin can edit metadata; a valid-looking object is insufficient. The hook must check every member of grouped queued messages, not merely the first row's origin.
+If the owning process stops while its worker runs, nothing observes the worker until a person resolves the stale claim, as R08 describes for any launcher. A later dispatch or status read never adopts or restarts the worker. When Docket next reads that thread's events, it records the facts they show, including later turns.
+
+The plugin calls the core only through `docket host invoke` (R28), with a host-service binding limited to the admission and allocation operations it needs. Stored thread metadata can locate a candidate binding, but cannot authorise it. The core database plus trusted host provenance establishes authority. Another agent/plugin can edit metadata; a valid-looking object is insufficient. The hook must check every member of grouped queued messages, not merely the first row's origin. The hook lets messages to threads that are not Docket workers pass unchanged.
 
 A person's message to a worker is recorded as a steer request before delivery. A message from another agent is not a person action. While the Docket plugin is enabled, its hook rejects ordinary person messages, steers, follow-ups, provider retries, queue drains, unarchive/restart resumes and automatic continuations for a finished attempt.
 
-An intent precedes each SDK create/send. If a response is lost, inspect stable thread/queue/timeline identifiers where available; no matching message does not prove non-delivery. Remain uncertain unless an owner proves what happened. New attempt creation after resolution is explicit.
+An intent precedes each bb create/send. If a response is lost, inspect stable thread/queue/timeline identifiers where available; no matching message does not prove non-delivery. Remain uncertain unless an owner proves what happened. New attempt creation after resolution is explicit.
 
-The hook's refusal of later turns is a best-effort guard, not a guarantee. It works only while the Docket plugin is installed and enabled and messages pass through its hook. After a normal backend reload or server restart, the plugin registers its hook again before it reconciles tracked threads. bb can still run a later turn without Docket checking it: for example when the plugin is disabled, unloaded or replaced, when someone uses bb Send now or `bb thread queue send` on a worker, or in host recovery cases that qualification has not covered. Docket therefore does not rely on the refusal to protect a finished attempt's output. Instead it detects later changes, as R11 describes: before checks, acceptance, integration and return it checks the candidate commit, the result file and the workspace again, and the backend records a later turn that it observes on a finished worker's thread as a discrepancy.
+The hook's refusal of later turns is a best-effort guard, not a guarantee. It works only while the Docket plugin is installed and enabled and messages pass through its hook. After a normal plugin reload or server restart, the plugin registers its hook again before any message reaches it. bb can still run a later turn without Docket checking it: for example when the plugin is disabled, unloaded or replaced, when someone uses bb Send now or `bb thread queue send` on a worker, or in host recovery cases that qualification has not covered. Docket therefore does not rely on the refusal to protect a finished attempt's output. Instead it detects later changes, as R11 describes: before checks, acceptance, integration and return it checks the candidate commit, the result file and the workspace again, and the launcher records a later turn that it reads on a finished worker's thread as a discrepancy.
 
 A later turn that runs after the lease has been returned could change a workspace that another attempt has since acquired, and Docket cannot detect every such change. bb launcher documentation must state this limit and the paths that bypass the hook. The core must not treat idle/stopped alone as terminal evidence.
 
@@ -72,21 +76,15 @@ A bb worker runs with the provider's normal resources for the person who runs Do
 
 ## bb host
 
-**R34.** The backend launches and observes workers, and provides event/question delivery, a Treehouse environment provider and minimal status UI. It registers lifecycle handlers before reconciling tracked threads at startup. Reconciliation is read-only until matching authority/ownership is established; events missed while unloaded are not assumed replayed.
+**R34.** The bb plugin provides the admission hook (R33) and a Treehouse environment provider. Delivery of Docket events and questions into bb, agent tools, person forms, a status UI and bb supervisor registration are deferred. People and supervisors use the Docket CLI, including from an ordinary bb thread; such a supervisor is unrestricted (R17), and status and briefings say so. Worker questions reach the supervisor through the same core operations as for Pi.
 
 Environment create receives a recorded lease ID, verifies it in the core and returns its existing path without another acquisition. Repeated calls for the same allocation have the same result. Record database/task/attempt/lease identity and starting merge base. Environment removal calls core return rules; if unmet, refuse with a usable command. Archive/delete/cascade/removal retries must never destroy the path or run destructive teardown before the core authorises return.
 
 Requested adapter settings are no automatic retirement, externally owned path and no host setup/teardown; verify their actual semantics against the pinned SDK. The bb Git view should compare against the attempt's actual starting commit where supported, with the base branch named and any difference explained. It must not silently compare inherited output as new task changes.
 
-The backend fixes caller/config/objective/session/request identity before invoking catalogue tools. Person form submissions come from a verified person interaction; sender labels/metadata are not enough. Agent tools return compact readable summaries to the person and full bounded structured data to the model.
+Unattended supervision can use restricted standalone Pi with bb workers. For that case, bb workers may be children of a dedicated labelled anchor thread rather than inventing a bb parent for a Pi conversation; core objective/session links remain authoritative.
 
-Open person questions are visible before attempt details, retain choices and answer action after restart, and disappear only after the answer is recorded. Backend transports the answer through the same core operation as CLI. UI exposes no direct database actions.
-
-Minimal UI shows objective progress, budget availability/spending, ready/held/running work, current candidates/checks/reviews, open questions, preserved leases, uncertain effects/claims and next actions. It can use existing bb environment/Git/PR interfaces; no custom board is required.
-
-A bb supervisor thread is unrestricted unless a qualified provider removes all tools except the catalogue. Unrestricted sessions require an observing person; status/briefing records this limit. Unattended supervision can use restricted standalone Pi with bb workers. For that case, bb workers may be children of a dedicated labelled anchor thread rather than inventing a bb parent for a Pi conversation; core objective/session links remain authoritative.
-
-Register one backend/process claim as needed for long-lived database access and per-resource worker claims for its active attempts. If the backend stops, unresolved claims block new work. Heartbeat expiry does not reassign them. The process code/config version remains fixed while operating; context reconfiguration/upgrades require explicit quiescence.
+The plugin holds no Docket claims and makes no domain decisions; it has no SQLite access. If the plugin is not running, the hook cannot hold a first message, so the launcher refuses to create a worker thread until the plugin answers a readiness check.
 
 ## Standalone Pi
 
@@ -98,7 +96,7 @@ The restricted Pi supervisor exposes only catalogue tools, with no general shell
 
 Shutdown/error preserves outstanding event IDs and tool request keys. A fresh supervisor session starts with current briefing and pending notifications. It does not reconstruct authority from an old conversation or restart an existing worker.
 
-Keeping the machine awake is a host service invoked once per active execution/check period where configured. Under bb, the bb host already holds a sleep assertion for as long as its server runs, so Docket's bb backend relies on it and starts no keep-awake helper of its own. The standalone Pi path, which has no such host, starts its own. Native helper failure warns in diagnostics without inventing termination. It is not a safety prerequisite, and closing a laptop may still suspend processes. Lost heartbeats remain uncertainty after wake.
+Keeping the machine awake is a host service invoked once per active execution/check period where configured. Under bb, the bb host already holds a sleep assertion for as long as its server runs, so Docket's bb launcher relies on it and starts no keep-awake helper of its own. The standalone Pi path, which has no such host, starts its own. Native helper failure warns in diagnostics without inventing termination. It is not a safety prerequisite, and closing a laptop may still suspend processes. Lost heartbeats remain uncertainty after wake.
 
 ## Qualification gates
 
@@ -115,10 +113,12 @@ Qualification pins the SDK/provider/host versions and records source/type eviden
 | Gate | Experiment and required outcome | If it fails |
 | --- | --- | --- |
 | Q1a | Prepare thread while holding first message; crash before/after reference bind, race a fence and activation, drain queue/retry through the ordinary dispatch path. Count provider input admissions; at most one, only after committed permission. | Select another protected creation/provider mechanism; never weaken R06. |
-| Q1b | With the Docket plugin enabled, finish a worker, then send, retry and steer it through ordinary bb dispatch. The hook refuses each message and no further worker input runs. After a backend reload and a server restart, the hook is registered before tracked threads are reconciled. Then run a later turn on the finished worker through a path that bypasses the hook, such as Send now, and change its output: Docket reports the change before checks, acceptance, integration or return. | Fix the hook or the detection before qualifying the bb launcher. A path whose refusal cannot be made to work is documented as a limit; detection is still required. |
+| Q1b | With the Docket plugin enabled, finish a worker, then send, retry and steer it through ordinary bb dispatch. The hook refuses each message and no further worker input runs. After a plugin reload and a server restart, the hook is registered before any message reaches it. Then run a later turn on the finished worker through a path that bypasses the hook, such as Send now, and change its output: Docket reports the change before checks, acceptance, integration or return. | Fix the hook or the detection before qualifying the bb launcher. A path whose refusal cannot be made to work is documented as a limit; detection is still required. |
 | Q1c | Lose SDK create/send response; inspect queue/timeline and replay command key. No second create/send without definite non-occurrence proof; uncertainty visible. | Keep unresolved effect; do not add blind retry. |
 | Q2a | Run a worker with the profile's provider and model in its Treehouse worktree. Record the actual cwd, provider and model, and which user/project settings, skills, extensions and context sources it loaded. Verify that it can edit, run fast checks and commit, which writes to the backing repository's `.git`. | Document the difference. Restrict the supported provider/profile only if the worker cannot do its work. |
-| Q2b | With the plugin enabled, inspect real interrupted/completed turns across backend reload and bb restart; compare provider events, thread state, queued inputs and result. Idle is never sufficient; a later turn after recovery is recorded as a discrepancy. | Revise terminal mechanism before adapter acceptance. |
+| Q2b | With the plugin enabled, inspect real interrupted/completed turns across plugin reload and bb restart; compare provider events, thread state, queued inputs and result. Idle is never sufficient; a later turn after recovery is recorded as a discrepancy. | Revise terminal mechanism before adapter acceptance. |
 | Q2c | Archive/delete worker and parent/project, attempt environment removal and retries, with dirty output/active worker/preserved lease. Path/lease remains until core return is authorised; no premature teardown scripts. | Use externally attached retained paths as a qualified fallback, with explicit identity mapping and removal refusal. |
+
+The first bb combination to qualify is bb's Pi provider with Pi's default model.
 
 Tests may use synthetic providers/peers first. A real bb objective and standalone Pi dispatch are still required. Qualification evidence identifies the versions, environment, budget and observed results of each real experiment.
