@@ -5,11 +5,13 @@ export interface Member {
   id: string;
   initiator: 'user' | 'agent' | 'system';
   senderThreadId: string | null;
-  content: { type: string; text?: string }[];
+  content: readonly { type: string; text?: string }[];
 }
 export interface Dispatch {
   thread: { id: string };
   queuedMessages: Member[];
+  input: { blocks: Member['content'] };
+  initiator: Member['initiator'] | 'mixed';
   environmentIntent: { kind: string; environmentProviderId?: string } | null;
 }
 export type Decision = { action: 'proceed' } | { action: 'wait'; reason: string } | { action: 'reject'; message: string };
@@ -61,9 +63,14 @@ export function register(bb: Port, execute?: Run): void {
   };
   bb.experimental_hooks.on('message.dispatch', async context => {
     try {
-      const members = context.queuedMessages.map(member => ({
+      // Inline sends have no queue row. The local label is only for duplicate
+      // member detection, never correlation; the core matches recorded content.
+      const messages = context.queuedMessages.length ? context.queuedMessages : [
+        { id: 'inline', initiator: context.initiator, content: context.input.blocks },
+      ];
+      const members = messages.map(member => ({
         id: member.id,
-        author: member.senderThreadId === null ? member.initiator : `${member.initiator}:${member.senderThreadId}`,
+        author: member.initiator,
         content: member.content.map(block => {
           if (block.type !== 'text' || typeof block.text !== 'string') throw new Error('Unsupported message block');
           return block.text;
@@ -114,9 +121,7 @@ export function register(bb: Port, execute?: Run): void {
           // Registration/configuration readiness only; no domain mutation or send.
           const config = await settings!.get();
           if (!config.executable.trim() || !config.binding.trim()) throw new Error('Missing settings');
-          // The pinned host cannot yet correlate sender-chosen IDs with queued rows.
-          // Do not advertise readiness and let a launcher create an unusable worker.
-          return { exitCode: 1, stdout: JSON.stringify({ version: 1, ready: false, providerId, reason: 'queue_identity_unresolved' }) };
+          return { exitCode: 0, stdout: JSON.stringify({ version: 1, ready: true, providerId }) };
         }
         if (argv.length === 2 && argv[0] === 'recheck' && /^thr_[a-zA-Z0-9_-]+$/u.test(argv[1]!)) {
           // SDK 0.6.132 rechecks globally, not by thread. Each hook still asks the core.

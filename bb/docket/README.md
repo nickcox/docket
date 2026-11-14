@@ -6,10 +6,9 @@ control commands. It has no SQLite access, claims, event delivery, domain tools,
 forms, status UI or supervisor registration. The core is called only through
 `docket host invoke`. Everything must run on the same machine.
 
-**Not ready for worker activation:** the pinned host's queue identity contract
-cannot currently match Docket's recorded delivery identifiers. See
-[queue identity](#queue-identity). Do not use this plugin as qualification evidence
-or create real workers with it until that contract is resolved.
+Offline-tested, not live-qualified. See [queue identity](#queue-identity) for
+single-use content correlation and its identical-copy limit. These tests are not
+Q1/Q2 qualification evidence.
 
 ## Installation and settings
 
@@ -35,11 +34,11 @@ bb supervisor is unrestricted; use the Docket CLI for domain operations.
 
 ## Launcher commands
 
-- `bb docket ready`: currently returns exit 1 with
-  `{version:1,ready:false,providerId:"docket",reason:"queue_identity_unresolved"}`
-  after checking settings. This deliberately blocks thread creation until the
-  queue identity contract is resolved. A non-zero exit, missing command or invalid
-  response must stop the launcher **before thread creation**. Registration alone
+- `bb docket ready`: returns exit 0 with
+  `{version:1,ready:true,providerId:"docket"}` when the plugin is registered and
+  its executable and binding settings are nonblank. A non-zero exit, missing
+  command or invalid response must stop the launcher **before thread creation**.
+  This does not validate the binding file or probe the command. Registration alone
   is not evidence of database availability, provider qualification or continued
   plugin presence.
 - `bb docket recheck <threadId>`: requests re-evaluation, never sends a message.
@@ -81,8 +80,10 @@ Inspected SDK 0.6.132 `bundled-types/bb-plugin-sdk.d.ts`:
 `MessageDispatchHookContext` and `threadQueuedMessageSchema`. Queue rows expose
 `id`, `initiator`, `senderThreadId`, content and origin, but **no client request
 ID**. Inline dispatch has an empty queued list and no request ID. The plugin
-currently passes row `id`, author `initiator` (or `initiator:senderThreadId` for
-agent senders) and text content, not the first row's aggregate author.
+passes row `id`, author category `initiator` and exact text content per member,
+not the first row's aggregate author. Inline sends expose no queue rows; the
+plugin passes their input blocks and initiator as one member with a local
+`inline` label. This label, like queue IDs, is not used for correlation.
 
 Installed bb 0.49.0 `server/dist/start-server.js` confirms:
 
@@ -93,12 +94,18 @@ Installed bb 0.49.0 `server/dist/start-server.js` confirms:
 - CLI `thread-MZN2MO7V.js` queue create accepts message/model/attachments, not an
   ID. CLI messages without a sender have author category `user`, not `docket`.
 
-Core `admitBbDispatch` currently matches `initialMessageId/initialAuthor`, and
-later `worker.deliver` intents record command ID/author `docket`. Those values
-cannot match these real rows. No unsafe content-only identity fallback is used.
-A question is pending about a sender-chosen text envelope versus an upstream bb
-contract change. The present offline tests cover transport and fail-closed
-mapping, **not successful real queue admission**.
+Core `admitBbDispatch` matches exact content with author category `user` against
+single-use recorded sends on the bound thread: stored `worker.prepare.initialInput`
+through the one activation admission, then claimed `worker.deliver.message`
+effects. The launcher must run CLI sends without `BB_THREAD_ID`, which would
+attribute them to an agent instead. No IDs or markers are inserted into text.
+An identical copy arriving first is admitted in place of the recorded send; the
+worker still receives that text once per authorised send. This cannot prove which
+sender's copy ran. Two identical recorded sends can each admit one member. Every
+group member must match before anything is consumed; replays refuse. Correlation
+is localised in the core so a future sender-chosen host ID can replace it.
+Offline tests exercise this with real temporary SQLite and fake boundaries,
+**not successful real queue admission**.
 
 ## R33 limits
 

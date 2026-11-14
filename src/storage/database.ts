@@ -1964,7 +1964,7 @@ export class Database {
     });
   }
 
-  /** Host provenance permits asking; only stored queue identities and effects permit a turn. */
+  /** Host provenance permits asking; only unused recorded sends permit a turn. */
   async admitBbDispatch(threadId: string, members: { id: string; author: string; content: string }[]): Promise<{ decision: 'pass-through' | 'hold' | 'admit' | 'refuse' }> {
     nonblank(threadId);
     const queued = structuredClone(members);
@@ -1978,9 +1978,14 @@ export class Database {
           AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'`).get(String(attempt.id))) return { decision: 'refuse' };
       const reference = JSON.parse(String(attempt.runtime_ref)) as WorkerReference;
       const preparation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.prepare');
+      // bb generates queue IDs and exposes no sender-chosen ID to the hook.
+      // Keep correlation here so a future host identifier can replace exact content.
+      // An identical copy arriving first consumes the send in its place: the worker
+      // still receives that text at most once per authorised send.
+      const matches = (member: { author: string; content: string }, content: unknown) =>
+        member.author === 'user' && member.content === content;
       if (attempt.launch_state === 'pending') {
-        return { decision: queued.length === 1 && queued[0]!.id === reference.initialMessageId
-          && queued[0]!.author === reference.initialAuthor && queued[0]!.content === preparation?.input.initialInput ? 'hold' : 'refuse' };
+        return { decision: queued.length === 1 && matches(queued[0]!, preparation?.input.initialInput) ? 'hold' : 'refuse' };
       }
       const activation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.activate');
       const claim = this.claims().find(c => c.id === attempt.owner_claim_id && !c.releasedAt);
@@ -1989,24 +1994,26 @@ export class Database {
       const deliveries: StoredRequest[] = [];
       let initial = false;
       for (const member of queued) {
-        if (activation.state === 'pending' && member.id === reference.initialMessageId && member.author === reference.initialAuthor
-          && member.content === preparation?.input.initialInput) {
+        if (!initial && activation.state === 'pending' && matches(member, preparation?.input.initialInput)) {
           initial = true;
           continue;
         }
         const delivery = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.deliver'
-          && r.state === 'claimed' && r.input.messageId === member.id && r.input.author === member.author
-          && r.input.message === member.content && json(r.target?.reference) === json(reference));
-        if (!delivery || deliveries.some(r => r.id === delivery.id)
-          || this.events().some(e => e.kind === 'worker.delivery_admitted' && e.payload.effectId === delivery.id)) return { decision: 'refuse' };
+          && r.state === 'claimed' && matches(member, r.input.message) && json(r.target?.reference) === json(reference)
+          && !deliveries.some(selected => selected.id === r.id)
+          && !this.events().some(e => e.kind === 'worker.delivery_admitted' && e.payload.effectId === r.id));
+        if (!delivery) return { decision: 'refuse' };
         deliveries.push(delivery);
       }
       // All checks precede consumption, so an unauthorised grouped member consumes nothing.
       for (const delivery of deliveries) this.checkWorkerControlEffect(delivery.id, owner, reference);
       if (initial && this.claimWorkerActivationInTransaction(String(attempt.id), reference, owner).kind !== 'admitted') return { decision: 'refuse' };
       if (!initial && activation.state !== 'succeeded') return { decision: 'refuse' };
-      for (const delivery of deliveries) this.launchEvent(String(attempt.id), String(attempt.task_id), owner,
-        'worker.delivery_admitted', { effectId: delivery.id, reference });
+      for (const delivery of deliveries) this.insertEvent({
+        sourceKey: `worker.delivery_admitted:${delivery.id}`, kind: 'worker.delivery_admitted', payloadVersion: 1,
+        correlationId: String(attempt.id), actor: owner, occurredAt: new Date().toISOString(),
+        attemptId: String(attempt.id), taskId: String(attempt.task_id), payload: { effectId: delivery.id, reference },
+      });
       return { decision: 'admit' as const };
     }).catch(error => {
       if ((error instanceof StorageError && error.code === 'conflict') || error instanceof CommandFailure) return { decision: 'refuse' as const };

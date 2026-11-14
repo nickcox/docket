@@ -27,7 +27,7 @@ export class FakeLauncher implements Launcher {
     const launcher = String((binding.specification.profile as JsonObject).launcher);
     const reference: WorkerReference = launcher === 'pi'
       ? { launcher, processId: '123', sessionId: binding.sessionId }
-      : { launcher, threadId: randomUUID(), initialMessageId: randomUUID(), initialAuthor: 'docket' };
+      : { launcher, threadId: randomUUID() };
     this.workers.set(canonicalJson(reference), { binding, active: false, terminal: false, sequence: 0 });
     return this.afterPrepare ? this.afterPrepare(reference) : confirmed(reference);
   }

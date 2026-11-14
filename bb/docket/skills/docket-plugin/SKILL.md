@@ -17,8 +17,13 @@ Configure `executable` (no shell arguments) and secret `binding` through
 provider `docket` takes only the recorded `leaseId`, returns its verified path
 and refuses removal. Use Docket core return operations instead.
 
-This plugin is unqualified and queue identity compatibility remains unresolved.
-Do not activate real workers. Disabled/unloaded/replaced hooks and direct queue
+Readiness checks registration and nonblank settings, not binding validity or
+live qualification. CLI sends must not inherit BB_THREAD_ID. The core matches
+exact text and author category user against single-use recorded sends, not bb's
+generated queue IDs. An identical copy arriving first consumes the send in its
+place. No correlation marker is added to message text.
+
+This plugin remains live-unqualified. Disabled/unloaded/replaced hooks and direct queue
 sends can bypass admission; later turns can modify even returned workspaces.
 Workers retain the person's normal provider settings, resources and tools.
 See the plugin README for installation and the complete R33/R34 limits.

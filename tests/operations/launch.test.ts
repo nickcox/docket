@@ -622,7 +622,7 @@ async function bbDispatchFixture(t: { after: (fn: () => Promise<void> | void) =>
   const launcher = new FakeLauncher();
   const preparation = await prepareWorker(f.db, value.attemptId, host, launcher);
   const reference = preparation.result!.reference as WorkerReference;
-  const member = { id: String(reference.initialMessageId), author: String(reference.initialAuthor), content: String(preparation.input.initialInput) };
+  const member = { id: 'bb-generated-initial', author: 'user', content: String(preparation.input.initialInput) };
   return { ...f, ...value, launcher, reference, member, threadId: String(reference.threadId) };
 }
 
@@ -632,7 +632,7 @@ test('R06 R33 A15: bb hook holds before permission, matches every queued member 
   assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'hold' });
   assert.deepEqual(await db.admitBbDispatch(threadId, [member, { ...member, id: 'unauthorised' }]), { decision: 'refuse' });
   const decision = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
-  for (const changed of [{ ...member, id: 'forged' }, { ...member, author: 'person' }, { ...member, content: 'forged' }]) {
+  for (const changed of [{ ...member, author: 'agent' }, { ...member, author: 'system' }, { ...member, content: 'forged' }]) {
     assert.deepEqual(await db.admitBbDispatch(threadId, [member, changed]), { decision: 'refuse' });
     assert.equal(db.request(decision.effectId!).state, 'pending');
     assert.deepEqual(await db.admitBbDispatch(threadId, [changed]), { decision: 'refuse' });
@@ -671,29 +671,69 @@ test('R06 R33 A15: later dispatch needs matching recorded deliveries for every m
   assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'admit' });
   const executor = { claimId: f.claimId, generation: host.generation };
   await db.recordEffectOutcome(permission.effectId!, executor, 'succeeded', { admitted: true });
-  const next = { id: 'later', author: 'docket', content: 'Continue with the recorded steer' };
+  const next = { id: 'bb-generated-later', author: 'user', content: 'Continue with the recorded steer' };
   assert.deepEqual(await db.admitBbDispatch(threadId, [next]), { decision: 'refuse' });
   const input = { attemptId: f.attemptId, message: next.content, mode: 'after_turn' };
   const command = await db.recordCommand({ requestKey: 'later-command', operation: 'attempt.steer', caller: person,
     input, fingerprint: canonicalJson(input) });
   const effect = await db.recordEffect({ requestKey: 'later-effect', operation: 'worker.deliver', caller: person,
-    input: { reference, ...input, messageId: next.id, author: next.author }, fingerprint: 'later', parentId: command.id,
+    input: { reference, ...input }, fingerprint: 'later', parentId: command.id,
     executor, attemptId: f.attemptId, target: { kind: 'worker', reference } });
   await db.claimEffect(effect.id, executor);
-  for (const changed of [{ ...next, id: 'bad' }, { ...next, author: 'person' }, { ...next, content: 'bad' }]) {
+  for (const changed of [{ ...next, id: 'other', author: 'agent' }, { ...next, id: 'other', author: 'system' }, { ...next, id: 'other', content: 'bad' }]) {
     assert.deepEqual(await db.admitBbDispatch(threadId, [next, changed]), { decision: 'refuse' });
   }
   assert.deepEqual(await db.admitBbDispatch(threadId, [next]), { decision: 'admit' });
   assert.deepEqual(await db.admitBbDispatch(threadId, [next]), { decision: 'refuse' });
   const terminalMember = { ...next, id: 'terminal' };
   const pending = await db.recordEffect({ requestKey: 'terminal-delivery', operation: 'worker.deliver', caller: person,
-    input: { reference, ...input, messageId: terminalMember.id, author: terminalMember.author }, fingerprint: 'terminal',
+    input: { reference, ...input }, fingerprint: 'terminal',
     parentId: command.id, executor, attemptId: f.attemptId, target: { kind: 'worker', reference } });
   await db.claimEffect(pending.id, executor);
   await db.recordWorkerObservation({ sourceId: host.id, sourceSequence: 1, attemptId: f.attemptId, workerRef: reference,
     observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
     payload: { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host);
   assert.deepEqual(await db.admitBbDispatch(threadId, [terminalMember]), { decision: 'refuse' });
+});
+
+test('R06 R33 A15: an identical first copy consumes activation in place of the recorded send', async t => {
+  const f = await bbDispatchFixture(t);
+  const copy = { ...f.member, id: 'copy-arrived-first' };
+  assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [copy]), { decision: 'hold' });
+  await f.db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [copy, f.member]), { decision: 'refuse' });
+  assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [copy]), { decision: 'admit' });
+  assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [f.member]), { decision: 'refuse' });
+});
+
+test('R06 R33 A15: two identical recorded deliveries admit two members, grouped mismatch consumes neither', async t => {
+  const f = await bbDispatchFixture(t), { db, threadId, reference } = f;
+  const permission = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  await db.admitBbDispatch(threadId, [f.member]);
+  const executor = { claimId: f.claimId, generation: host.generation };
+  await db.recordEffectOutcome(permission.effectId!, executor, 'succeeded', { admitted: true });
+  const input = { attemptId: f.attemptId, message: 'Identical authorised text', mode: 'after_turn' };
+  for (const index of [1, 2]) {
+    const command = await db.recordCommand({ requestKey: `same-command-${index}`, operation: 'attempt.steer', caller: person,
+      input, fingerprint: canonicalJson(input) });
+    const effect = await db.recordEffect({ requestKey: `same-effect-${index}`, operation: 'worker.deliver', caller: person,
+      input: { reference, ...input }, fingerprint: 'same', parentId: command.id,
+      executor, attemptId: f.attemptId, target: { kind: 'worker', reference } });
+    await db.claimEffect(effect.id, executor);
+  }
+  const members = [1, 2].map(index => ({ id: `bb-copy-${index}`, author: 'user', content: input.message }));
+  for (const invalid of [{ ...members[1]!, content: 'unrecorded' }, { ...members[1]!, author: 'agent' }]) {
+    assert.deepEqual(await db.admitBbDispatch(threadId, [members[0]!, invalid]), { decision: 'refuse' });
+    assert.equal(db.events().filter(e => e.kind === 'worker.delivery_admitted').length, 0);
+  }
+  assert.deepEqual(await db.admitBbDispatch(threadId, [...members, { ...members[0]!, id: 'third' }]), { decision: 'refuse' });
+  const restore = inject(db, 'worker.delivery_admitted', true);
+  try { await assert.rejects(db.admitBbDispatch(threadId, members), /injected transaction failure/); }
+  finally { restore(); }
+  assert.equal(db.events().filter(e => e.kind === 'worker.delivery_admitted').length, 0);
+  assert.deepEqual(await db.admitBbDispatch(threadId, members), { decision: 'admit' });
+  assert.equal(db.events().filter(e => e.kind === 'worker.delivery_admitted').length, 2);
+  assert.deepEqual(await db.admitBbDispatch(threadId, [{ ...members[0]!, id: 'original-arrives-later' }]), { decision: 'refuse' });
 });
 
 test('R06 R33 A15: stale owners and fenced workers refuse hook admission without consuming activation', async t => {

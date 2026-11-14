@@ -62,7 +62,7 @@ export async function controlWorker(db: Database, attemptId: string, reference: 
     }
     if (!stop && db.workerStopRequested(attemptId)) continue;
     const effect = await db.recordEffect({ requestKey: `control:${command.id}`, operation, caller: command.caller,
-      input: { reference, ...command.input, ...(!stop && reference.launcher === 'bb' ? { messageId: command.id, author: 'docket' } : {}) }, fingerprint: command.fingerprint, parentId: command.id,
+      input: { reference, ...command.input }, fingerprint: command.fingerprint, parentId: command.id,
       executor, attemptId, target: { kind: 'worker', reference } });
     await db.claimEffect(effect.id, executor);
     try {
