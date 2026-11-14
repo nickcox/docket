@@ -626,6 +626,20 @@ async function bbDispatchFixture(t: { after: (fn: () => Promise<void> | void) =>
   return { ...f, ...value, launcher, reference, member, threadId: String(reference.threadId) };
 }
 
+test('R06 A14: unbound first prompt holds without environment intent, unrelated text and authors pass through', async t => {
+  const f = await fixture(t), value = await f.started();
+  const launcher = new FakeLauncher();
+  const prepare = launcher.prepare.bind(launcher);
+  launcher.prepare = async (binding, effectId) => {
+    const member = { id: 'bb-generated-before-bind', author: 'user', content: String(binding.initialInput) };
+    assert.deepEqual(await f.db.admitBbDispatch('thr_unbound', [member]), { decision: 'hold' });
+    assert.deepEqual(await f.db.admitBbDispatch('thr_unbound', [{ ...member, author: 'agent' }]), { decision: 'pass-through' });
+    assert.deepEqual(await f.db.admitBbDispatch('thr_unbound', [{ ...member, content: `${member.content}changed` }]), { decision: 'pass-through' });
+    return prepare(binding, effectId);
+  };
+  await prepareWorker(f.db, value.attemptId, host, launcher);
+});
+
 test('R06 R33 A15: bb hook holds before permission, matches every queued member and consumes admission once across reopen', async t => {
   const f = await bbDispatchFixture(t), { db, threadId, member } = f;
   assert.deepEqual(await db.admitBbDispatch('ordinary', [member]), { decision: 'pass-through' });

@@ -77,6 +77,7 @@ test('R34 returns only the verified recorded allocation, repeats safely and refu
   assert.deepEqual(f.environment.policy, { retireGraceMs: null });
   for (let i = 0; i < 2; i++) assert.deepEqual(await f.environment.create({ inputs: { leaseId: 'lease' } }), { status: 'created', path, ownsPath: false });
   assert.deepEqual(f.calls.map(c => c.input), [{ leaseId: 'lease' }, { leaseId: 'lease' }]);
+  assert.match((await f.environment.remove()).message, /docket attempt return/);
   assert.equal((await f.environment.remove()).status, 'failed');
   assert.equal(f.calls.length, 2);
   f.set({ path: 'relative' });
@@ -88,13 +89,19 @@ test('R34 returns only the verified recorded allocation, repeats safely and refu
 
 test('R33 R34 launcher readiness and bounded recheck commands register without bb', async () => {
   const f = fixture();
+  f.set({ operations: [{ name: 'host.bb-admit' }, { name: 'host.bb-allocation' }] });
   const readiness = await f.cli.run(['ready']);
   assert.equal(readiness.exitCode, 0);
   assert.deepEqual(JSON.parse(readiness.stdout!), { version: 1, ready: true, providerId: 'docket' });
   assert.equal((await f.cli.run(['recheck', 'thr_worker'])).exitCode, 0);
   assert.equal(f.rechecks(), 1);
   assert.equal((await f.cli.run(['recheck', 'bad', 'extra'])).exitCode, 2);
-  assert.equal(f.calls.length, 0);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0]!.operation, 'catalog.show');
+  f.set({ operations: [{ name: 'host.bb-admit' }] });
+  assert.equal((await f.cli.run(['ready'])).exitCode, 1);
+  f.fail();
+  assert.equal((await f.cli.run(['ready'])).exitCode, 1);
   assert.equal((await fixture({ executable: 'fake-docket', binding: '' }).cli.run(['ready'])).exitCode, 1);
   assert.equal((await fixture({ executable: '', binding: 'configured' }).cli.run(['ready'])).exitCode, 1);
 });

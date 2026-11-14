@@ -106,7 +106,7 @@ export function register(bb: Port, execute?: Run): void {
       } catch { return { status: 'failed', message: 'Docket could not verify the recorded lease; inspect it with the Docket CLI' }; }
     },
     async remove() {
-      return { status: 'failed', message: 'Docket owns this lease. Use docket workspace return with the exact attempt identity after core retention checks.' };
+      return { status: 'failed', message: 'Docket owns this lease. Use docket attempt return with the exact attempt identity after core retention checks.' };
     },
   });
   bb.cli.register({
@@ -118,9 +118,12 @@ export function register(bb: Port, execute?: Run): void {
     async run(argv) {
       try {
         if (argv.length === 1 && argv[0] === 'ready') {
-          // Registration/configuration readiness only; no domain mutation or send.
           const config = await settings!.get();
           if (!config.executable.trim() || !config.binding.trim()) throw new Error('Missing settings');
+          const catalog = await call('catalog.show', {});
+          const operations = catalog.operations;
+          if (!Array.isArray(operations) || !['host.bb-admit', 'host.bb-allocation'].every(name =>
+            operations.some((operation: { name?: string }) => operation?.name === name))) throw new Error('Incomplete binding');
           return { exitCode: 0, stdout: JSON.stringify({ version: 1, ready: true, providerId }) };
         }
         if (argv.length === 2 && argv[0] === 'recheck' && /^thr_[a-zA-Z0-9_-]+$/u.test(argv[1]!)) {

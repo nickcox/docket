@@ -1970,7 +1970,17 @@ export class Database {
     const queued = structuredClone(members);
     return this.write<{ decision: 'pass-through' | 'hold' | 'admit' | 'refuse' }>(() => {
       const rows = this.db.prepare("SELECT * FROM attempts WHERE json_extract(runtime_ref, '$.launcher') = 'bb' AND json_extract(runtime_ref, '$.threadId') = ?").all(threadId);
-      if (!rows.length) return { decision: 'pass-through' };
+      if (!rows.length) {
+        // Thread creation can reach the hook before prepare returns its reference.
+        // Only hold an exact pending first prompt; unrelated threads pass unchanged.
+        const pending = this.requests().some(r => r.operation === 'worker.prepare'
+          && ['pending', 'claimed', 'uncertain'].includes(r.state)
+          && this.attemptRow(r.attemptId!).runtime_ref === null
+          && (r.input.specification as JsonObject)?.profile !== null
+          && ((r.input.specification as JsonObject)?.profile as JsonObject)?.launcher === 'bb'
+          && queued.some(m => m.author === 'user' && m.content === r.input.initialInput));
+        return { decision: pending ? 'hold' : 'pass-through' };
+      }
       if (rows.length !== 1 || !queued.length || new Set(queued.map(m => m.id)).size !== queued.length) return { decision: 'refuse' };
       const attempt = rows[0]!;
       if (attempt.launch_state === 'fenced' || attempt.execution_open !== 1 || attempt.outcome !== null || attempt.lease_state !== 'held'
@@ -2220,7 +2230,13 @@ export class Database {
     const value = object(observation) as WorkerObservation, actor = object(host) as WorkerHost;
     return this.write(() => {
       const attempt = this.attemptRow(value.attemptId);
-      this.workerClaim(value.attemptId, String(attempt.owner_claim_id), actor);
+      if (value.kind === 'later_turn') {
+        // A finished worker's owner is released, not replaced. Discrepancy evidence
+        // cannot grant permission or adopt its worker, and retains that exact owner.
+        const claim = this.claims().find(c => c.id === attempt.owner_claim_id);
+        if (!claim || claim.attemptId !== value.attemptId || claim.role !== 'worker_owner'
+          || json(claim.ownerRef) !== json(actor)) throw new StorageError('conflict', 'Later-turn owner mismatch');
+      } else this.workerClaim(value.attemptId, String(attempt.owner_claim_id), actor);
       if (attempt.runtime_ref === null || json(JSON.parse(String(attempt.runtime_ref))) !== json(value.workerRef)) {
         throw new StorageError('result_identity_mismatch', 'Observation worker does not match the attempt');
       }

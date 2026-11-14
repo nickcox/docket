@@ -150,6 +150,9 @@ test('A17/A18 R11/R33: a later-turn observation requires terminal evidence and a
   for (const patch of [{ payloadVersion: 2 }, { payload: { terminal: true } }, { sourceSequence: -1 }, { observedAt: 'invalid' }]) {
     await assert.rejects(observeWorker(f.db, { ...later, ...patch } as typeof later, host), { code: 'result_invalid' });
   }
+  const owner = f.db.claims().find(c => c.attemptId === a.id && c.role === 'worker_owner')!;
+  await f.db.releaseClaim({ claimId: owner.id, generation: host.generation }, { terminal: true, attemptId: a.id }, person);
+  await assert.rejects(observeWorker(f.db, later, { ...host, id: 'wrong-owner' }), { code: 'conflict' });
   await observeWorker(f.db, later, host);
   assert.equal(f.db.laterTurnDiscrepancy(a.id)?.code, 'result_discrepancy');
   assert.equal(f.db.attempt(a.id).outcome, null, 'A later turn cannot complete an attempt');
