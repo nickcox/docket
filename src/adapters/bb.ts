@@ -1,5 +1,5 @@
-import { isAbsolute } from 'node:path';
-import { mkdir } from 'node:fs/promises';
+import { isAbsolute, resolve } from 'node:path';
+import { mkdir, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { commandRunner, confirmed, rejected, uncertain, type Runner, type Result } from './command.ts';
 import type { Launcher, LauncherCapabilities, MessageMode, Usage, WorkerBinding, WorkerObservation } from './launcher.ts';
@@ -11,10 +11,13 @@ export interface BbExecutionProfile {
   executable: string;
   passEnvironment: string[];
   credentialVariable?: string;
+  projectId?: string;
+  machineId?: string;
 }
 export interface BbEvent { threadId: string; seq: number; type: string; data: JsonObject }
 export interface BbOptions {
   profiles: Record<string, BbExecutionProfile>;
+  repository?: string;
   environment?: NodeJS.ProcessEnv;
   run?: Runner;
   admission: (effectId: string) => boolean;
@@ -26,6 +29,10 @@ const capabilities: LauncherCapabilities = {
   stopTurn: true, terminalFence: true, fenceEnforcement: 'best_effort', usageMetrics: ['tokens'],
   observationSources: ['bb_events'],
 };
+class BbRefusal extends Error {
+  readonly evidence: JsonObject;
+  constructor(evidence: JsonObject) { super('bb validation refusal'); this.evidence = evidence; }
+}
 const object = (v: unknown): v is JsonObject => !!v && typeof v === 'object' && !Array.isArray(v);
 
 /** CLI-only owner. Effects are attempted once; reads never repair or restart a thread. */
@@ -38,7 +45,8 @@ export class BbLauncher implements Launcher {
   constructor(options: BbOptions) {
     this.options = options;
     for (const profile of Object.values(options.profiles)) {
-      if (!profile || Object.keys(profile).some(k => !['executable', 'passEnvironment', 'credentialVariable'].includes(k))
+      if (!profile || Object.keys(profile).some(k => !['executable', 'passEnvironment', 'credentialVariable', 'projectId', 'machineId'].includes(k))
+        || [profile.projectId, profile.machineId].some(id => id !== undefined && (typeof id !== 'string' || !/^[\w-]+$/.test(id)))
         || !isAbsolute(profile.executable) || !Array.isArray(profile.passEnvironment)
         || [...profile.passEnvironment, ...(profile.credentialVariable === undefined ? [] : [profile.credentialVariable])]
           .some(k => typeof k !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || /^(DOCKET_|BB_)/.test(k))) {
@@ -59,9 +67,16 @@ export class BbLauncher implements Launcher {
       if (!/^(DOCKET_|BB_)/.test(key) && host[key] !== undefined) environment[key] = host[key];
     }
     const result = await (this.options.run ?? commandRunner({ environment }))(profile.executable, args, process.cwd());
-    if (!result.complete || result.code !== 0) throw new Error('bb response unavailable');
+    if (!result.complete) throw new Error('bb response unavailable');
     const value: unknown = JSON.parse(result.stdout);
-    if (object(value) && value.ok === false) throw new Error('bb refused command');
+    // bb 0.49.0 thread-MZN2MO7V.js and chunk-U6DC65F7.js raise
+    // missing_required before spawn/send. Generic ok:false and invalid_request
+    // do not prove non-occurrence (chunk-ZE7UK6GW.js wraps remote failures).
+    if (object(value) && value.ok === false && object(value.error)
+      && args[0] === 'thread' && ['spawn', 'tell'].includes(args[1]!)
+      && result.code === 1 && value.error.code === 'missing_required'
+      && typeof value.error.message === 'string' && value.error.message.trim()) throw new BbRefusal(value);
+    if (result.code !== 0 || (object(value) && value.ok === false)) throw new Error('bb response unavailable');
     return value;
   }
   private once(id: string): boolean {
@@ -81,6 +96,31 @@ export class BbLauncher implements Launcher {
       const ready = await this.call(executionProfile, ['docket', 'ready']);
       if (!object(ready) || ready.version !== 1 || ready.ready !== true) throw new Error();
     } catch { return rejected('Docket bb plugin is not ready', { neverStarted: true }); }
+    const execution = this.options.profiles[executionProfile]!;
+    let projectId = execution.projectId;
+    const nextAction = 'Run bb project create --name <name> --root <repository> --machine <machine>, or set projectId in the bb execution profile';
+    if (!projectId) {
+      if (!this.options.repository || !execution.machineId) return rejected('Configure the local machineId in the bb execution profile for project lookup', { neverStarted: true, nextAction });
+      try {
+        const projects = await this.call(executionProfile, ['project', 'list', '--json']);
+        if (!Array.isArray(projects) || projects.some(p => !object(p) || typeof p.id !== 'string' || !Array.isArray(p.sources))) throw new Error();
+        const repository = await realpath(this.options.repository);
+        const matches = [];
+        for (const project of projects) {
+          if (project.kind === 'personal') continue;
+          for (const source of project.sources) {
+            if (!object(source) || source.type !== 'local_path' || source.hostId !== execution.machineId
+              || typeof source.path !== 'string' || !isAbsolute(source.path)) continue;
+            let path: string;
+            try { path = await realpath(source.path); } catch { continue; }
+            if (resolve(path) === resolve(repository)) { matches.push(project); break; }
+          }
+        }
+        if (matches.length !== 1) return rejected('Expected exactly one bb project linked to the backing repository on this machine',
+          { neverStarted: true, matches: matches.map(p => p.id), repository: this.options.repository, nextAction });
+        projectId = matches[0].id;
+      } catch { return rejected('Cannot read bb projects; no thread created', { neverStarted: true, nextAction }); }
+    }
     try {
       await mkdir(dirname(binding.resultPath), { recursive: true, mode: 0o700 });
       await mkdir(join(dirname(binding.resultPath), 'artefacts'), { recursive: true, mode: 0o700 });
@@ -88,14 +128,18 @@ export class BbLauncher implements Launcher {
     } catch { return rejected('Cannot prepare retained result directories', { neverStarted: true }); }
     try {
       // Inline argv preserves trailing newlines; --prompt-file strips them in bb 0.49.0.
-      const args = ['thread', 'spawn', '--json', '--provider', String(profile.provider), '--model', String(profile.model),
+      const args = ['thread', 'spawn', '--json', '--project', projectId!, '--provider', String(profile.provider), '--model', String(profile.model),
         '--environment', binding.allocation.path, '--prompt', binding.initialInput];
+      if (execution.machineId) args.push('--machine', execution.machineId);
       if (typeof profile.reasoning === 'string') args.push('--reasoning-level', profile.reasoning);
       const value = await this.call(executionProfile, args);
       if (!object(value) || typeof value.id !== 'string' || !/^thr_[\w-]+$/.test(value.id)) throw new Error();
       return confirmed({ launcher: 'bb', threadId: value.id, executionProfile, provider: String(profile.provider),
         model: String(profile.model), path: binding.allocation.path, sessionId: binding.sessionId, resultPath: binding.resultPath });
-    } catch { return uncertain('bb create response lost or unreadable', { effectId, sessionId: binding.sessionId }); }
+    } catch (error) {
+      if (error instanceof BbRefusal) return rejected('bb refused creation before creating a thread', error.evidence);
+      return uncertain('bb create response lost or unreadable', { effectId, sessionId: binding.sessionId });
+    }
   }
   async activate(reference: WorkerReference, _input: JsonObject, effectId: string, _generation: string): Promise<Result<JsonObject>> {
     if (!this.once(effectId)) return uncertain('bb activation already attempted', reference);
@@ -166,7 +210,10 @@ export class BbLauncher implements Launcher {
         mode === 'active_steering' ? 'steer' : 'queue', '--', message]);
       if (!object(value) || value.threadId !== reference.threadId || !['queued', 'sent', 'steered'].includes(String(value.delivery))) throw new Error();
       return confirmed(value);
-    } catch { return uncertain('bb send response lost or unreadable', reference); }
+    } catch (error) {
+      if (error instanceof BbRefusal) return rejected('bb refused send before delivery', error.evidence);
+      return uncertain('bb send response lost or unreadable', reference);
+    }
   }
   async stop(reference: WorkerReference, effectId: string): Promise<Result<JsonObject>> {
     if (!this.once(effectId)) return uncertain('bb stop already attempted', reference);

@@ -86,7 +86,7 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
       const checked = db.checkWorkerEffect(effectId, { claimId: request.claimId!, generation });
       return JSON.stringify(checked.input.specification) === JSON.stringify(input);
     } });
-  const bb = new BbLauncher({ profiles: profiles.bb ?? {}, admission: effectId => db.request(effectId).state === 'claimed'
+  const bb = new BbLauncher({ repository: config.repository, profiles: profiles.bb ?? {}, admission: effectId => db.request(effectId).state === 'claimed'
       || db.request(effectId).state === 'succeeded',
     observe: async (reference, events) => {
       const preparation = db.requests().find(r => r.operation === 'worker.prepare' && r.result?.reference

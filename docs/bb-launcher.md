@@ -6,7 +6,7 @@ execution profile in `~/.config/docket/execution-profiles.json`, alongside the
 existing `pi` and `checks` maps:
 
 ```json
-{"bb":{"local":{"executable":"/absolute/path/to/bb","passEnvironment":[]}}}
+{"bb":{"local":{"executable":"/absolute/path/to/bb","passEnvironment":[],"machineId":"host_LOCAL"}}}
 ```
 
 Task profiles select `launcher: "bb"` and `executionProfile: "local"`, with an
@@ -17,6 +17,52 @@ uses the exact leased environment path. Before rechecking the held prompt, the
 launcher verifies that path and provider, and the held queue row's model.
 A successful recheck reply is not admission: the owner waits for the core's
 activation claim. Lost or malformed effect replies are uncertain, never retried.
+
+## Project set-up
+
+A person must link the backing repository to a standard bb project on this
+machine before dispatching. Docket never creates or changes bb projects:
+
+```text
+bb project create --name <name> --root <repository> --machine <machine>
+bb project list --json
+```
+
+Use the context's backing repository, not a leased pool folder. Set `machineId`
+in the person-controlled bb execution profile to this machine's exact bb host
+ID. This explicit local-machine declaration prevents a source on another
+machine with an identical filesystem path from being selected. No host-ID
+file or bb database is read. The launcher matches `local_path` sources by that
+ID and canonical filesystem path, counting each project once. Missing or
+ambiguous matches are definite pre-create refusals with the set-up command as
+the next action. A missing machine declaration also refuses before creation.
+
+An optional `projectId` in that same execution profile overrides lookup. It is
+passed literally as `--project`; the person must select a standard project with
+a checkout on this machine. `machineId`, when supplied, is also passed as
+`--machine`. Without it, an explicit project uses bb's local-machine resolution.
+The personal project cannot accept the leased path environment.
+
+## Definite refusals and uncertainty
+
+Only a complete exit-1 JSON error envelope for `thread spawn` or `thread tell`
+with `ok:false`, `error.code:"missing_required"` and a nonblank error message
+is classified as a definite bb validation rejection. Its envelope is retained
+as evidence. The inspected CLI raises this usage error before the external
+create/send. A timeout, missing or unparseable output, generic `error`, and
+`invalid_request` without command-specific proof remain uncertain. No call is
+retried, including after a definite rejection under the same effect ID.
+
+In particular, `ok:false` alone is **not** bb's promise of non-occurrence.
+`chunk-WWZ7D6EQ.js` emits that shape for every caught CLI error;
+`chunk-ZE7UK6GW.js` (`z`, `v`, `_`) wraps remote failures, including failures
+after a request may have acted. `thread-MZN2MO7V.js` spawn action calls the
+flag-only `$` helper (`u` in `chunk-U6DC65F7.js`), raises `missing_required`
+before `threads.spawn`, and requires `--project`. The tell action resolves
+its thread ID through `I` (`E` in `chunk-U6DC65F7.js`), which raises
+`missing_required` before send. These are the only bb error codes treated as
+definite by this adapter. Local readiness, directory and project-lookup
+refusals are definite because no thread-create call has yet been made.
 
 ## Source evidence
 
