@@ -50,7 +50,7 @@ Checks run in the attempt's own workspace after its worker is terminal, so they 
 
 ## bb launcher
 
-**R33.** The bb launcher runs inside the Docket process that dispatched or continued the attempt, as the Pi launcher does. That process owns the worker through the same per-worker claim and heartbeat, and drives bb only through the `bb` command-line tool, kept behind the bb adapter. The Docket bb plugin has two jobs: the `message.dispatch` admission hook, and the environment provider that R34 describes. The Docket context, the bb server and the worker's workspace are on the same machine.
+**R33.** The bb launcher runs inside the Docket process that dispatched or continued the attempt, as the Pi launcher does. That process owns the worker through the same per-worker claim and heartbeat, and drives bb only through the `bb` command-line tool, kept behind the bb adapter. The Docket bb plugin has one job: the `message.dispatch` admission hook. The Docket context, the bb server and the worker's workspace are on the same machine.
 
 Required workflow:
 
@@ -62,7 +62,7 @@ Required workflow:
 
 If the owning process stops while its worker runs, nothing observes the worker until a person resolves the stale claim, as R08 describes for any launcher. A later dispatch or status read never adopts or restarts the worker. When Docket next reads that thread's events, it records the facts they show, including later turns.
 
-The plugin calls the core only through `docket host invoke` (R28), with a host-service binding limited to the admission and allocation operations it needs. Stored thread metadata can locate a candidate binding, but cannot authorise it. The core database plus trusted host provenance establishes authority. Another agent/plugin can edit metadata; a valid-looking object is insufficient. The hook must check every member of grouped queued messages, not merely the first row's origin. The hook lets messages to threads that are not Docket workers pass unchanged.
+The plugin calls the core only through `docket host invoke` (R28), with a host-service binding limited to the admission operation it needs. Stored thread metadata can locate a candidate binding, but cannot authorise it. The core database plus trusted host provenance establishes authority. Another agent/plugin can edit metadata; a valid-looking object is insufficient. The hook must check every member of grouped queued messages, not merely the first row's origin. The hook lets messages to threads that are not Docket workers pass unchanged.
 
 A person's message to a worker is recorded as a steer request before delivery. A message from another agent is not a person action. While the Docket plugin is enabled, its hook rejects ordinary person messages, steers, follow-ups, provider retries, queue drains, unarchive/restart resumes and automatic continuations for a finished attempt.
 
@@ -76,11 +76,11 @@ A bb worker runs with the provider's normal resources for the person who runs Do
 
 ## bb host
 
-**R34.** The bb plugin provides the admission hook (R33) and a Treehouse environment provider. Delivery of Docket events and questions into bb, agent tools, person forms, a status UI and bb supervisor registration are deferred. People and supervisors use the Docket CLI, including from an ordinary bb thread; such a supervisor is unrestricted (R17), and status and briefings say so. Worker questions reach the supervisor through the same core operations as for Pi.
+**R34.** The bb plugin provides only the admission hook (R33). Delivery of Docket events and questions into bb, agent tools, person forms, a status UI and bb supervisor registration are deferred. People and supervisors use the Docket CLI, including from an ordinary bb thread; such a supervisor is unrestricted (R17), and status and briefings say so. Worker questions reach the supervisor through the same core operations as for Pi.
 
-Environment create receives a recorded lease ID, verifies it in the core and returns its existing path without another acquisition. Repeated calls for the same allocation have the same result. Record database/task/attempt/lease identity and starting merge base. Environment removal calls core return rules; if unmet, refuse with a usable command. Archive/delete/cascade/removal retries must never destroy the path or run destructive teardown before the core authorises return.
+The launcher gives bb the leased Treehouse path as an existing workspace, so bb attaches it through its own checkout environment rather than creating a workspace. bb must not own, retire, run set-up or teardown scripts in, or remove that folder; qualification confirms this against the pinned bb version. Archive/delete/cascade/removal retries must never destroy the path or run destructive teardown before the core authorises return. The core keeps sole control of the lease and its return.
 
-Requested adapter settings are no automatic retirement, externally owned path and no host setup/teardown; verify their actual semantics against the pinned SDK. The bb Git view should compare against the attempt's actual starting commit where supported, with the base branch named and any difference explained. It must not silently compare inherited output as new task changes.
+bb's environment record for that folder outlives the lease. When Treehouse recycles the folder for a later attempt, an earlier worker's thread can still be attached to it, and a later bb worker in the same folder may reuse that record. The admission hook refuses later turns on a finished worker, but a turn that bypasses the hook could change a folder another attempt now holds (R33). Docket does not remove bb environment records; bb launcher documentation states this limit and the manual commands to archive an old worker thread and delete its environment. The bb Git view may show details from that record; Docket's own records of the starting commit and output ref are authoritative.
 
 Unattended supervision can use restricted standalone Pi with bb workers. For that case, bb workers may be children of a dedicated labelled anchor thread rather than inventing a bb parent for a Pi conversation; core objective/session links remain authoritative.
 
