@@ -626,7 +626,7 @@ async function bbDispatchFixture(t: { after: (fn: () => Promise<void> | void) =>
   return { ...f, ...value, launcher, reference, member, threadId: String(reference.threadId) };
 }
 
-test('R06 A14: unbound first prompt holds without environment intent, unrelated text and authors pass through', async t => {
+test('R06 R33 R34 A14: unbound pending first prompt holds, unrelated text and authors pass through', async t => {
   const f = await fixture(t), value = await f.started();
   const launcher = new FakeLauncher();
   const prepare = launcher.prepare.bind(launcher);
@@ -782,19 +782,4 @@ for (const afterEvent of [false, true]) test(`R06 R33 A15: hook admission rolls 
   finally { restore(); }
   assert.equal(f.db.request(permission.effectId!).state, 'pending');
   assert.deepEqual(await f.db.admitBbDispatch(f.threadId, [f.member]), { decision: 'admit' });
-});
-
-test('R33 R34: environment allocation reuses only a matching held lease and refuses mismatched pool or repository', async t => {
-  const f = await fixture(t), value = await f.allocated();
-  assert.deepEqual(f.db.bbAllocation(value.allocation.leaseId), { path: value.allocation.path });
-  assert.deepEqual(f.db.bbAllocation(value.allocation.leaseId), { path: value.allocation.path });
-  assert.throws(() => f.db.bbAllocation('unknown'));
-  const raw = new DatabaseSync(f.path); defer(t, () => raw.close());
-  for (const allocation of [{ ...value.allocation, pool: join(f.root, 'other') },
-    { ...value.allocation, repository: { identity: 'other' } }, { ...value.allocation, holder: { attemptId: 'other' } }]) {
-    raw.prepare('UPDATE attempts SET allocation = ? WHERE id = ?').run(JSON.stringify(allocation), value.attemptId);
-    assert.throws(() => f.db.bbAllocation(value.allocation.leaseId));
-  }
-  raw.prepare("UPDATE attempts SET allocation = ?, lease_state = 'returned' WHERE id = ?").run(JSON.stringify(value.allocation), value.attemptId);
-  assert.throws(() => f.db.bbAllocation(value.allocation.leaseId));
 });

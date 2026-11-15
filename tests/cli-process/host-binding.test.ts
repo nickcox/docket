@@ -8,9 +8,9 @@ import { fixture, realEntry } from '../helpers/cli-operations.ts';
 test('R17 R28 A37: private host invoke fixes authority, context and operation list without changing ordinary calls', async t => {
   const f = await fixture(t, 'code-result', realEntry);
   const directory = join(f.home, 'host-service');
-  const created = f.invoke('host.bind', { directory, operations: ['catalog.show', 'status.watch', 'supervisor.pending', 'host.bb-admit', 'host.bb-allocation'] }, 'create-host');
+  const created = f.invoke('host.bind', { directory, operations: ['catalog.show', 'status.watch', 'supervisor.pending', 'host.bb-admit'] }, 'create-host');
   assert.equal(created.status, 0, created.stderr);
-  assert.equal(f.invoke('host.bind', { directory, operations: ['catalog.show', 'status.watch', 'supervisor.pending', 'host.bb-admit', 'host.bb-allocation'] }, 'create-host').status, 0);
+  assert.equal(f.invoke('host.bind', { directory, operations: ['catalog.show', 'status.watch', 'supervisor.pending', 'host.bb-admit'] }, 'create-host').status, 0);
   const path = created.data.path as string;
   assert.equal(path, join(directory, 'binding.json'));
   const original = await readFile(path, 'utf8');
@@ -34,8 +34,6 @@ test('R17 R28 A37: private host invoke fixes authority, context and operation li
   assert.deepEqual((await invoke('host.bb-admit', dispatch)).envelope.data, { decision: 'pass-through' });
   assert.equal((await invoke('host.bb-admit', { ...dispatch, caller: binding.caller })).envelope.code, 'invalid_input');
   assert.equal((await invoke('host.bb-admit', { ...dispatch, members: [{ id: 'message', content: 'Missing author' }] })).envelope.code, 'invalid_input');
-  assert.equal(f.invoke('host.bb-allocation', { leaseId: 'unknown' }).envelope.code, 'person_required');
-  assert.equal((await invoke('host.bb-allocation', { leaseId: 'unknown' })).envelope.code, 'policy_refused');
   assert.equal(f.invoke('objective.add', { id: 'goal', request: 'Work', criteria: ['Works'], scope: '', constraints: '',
     permissions: {}, budget: null, deadline: null }).status, 0);
   const pending = { objectiveId: 'goal', afterSequence: 0, timeoutMs: 0 };

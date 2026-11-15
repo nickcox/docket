@@ -1,8 +1,7 @@
 # Docket bb plugin – unqualified
 
 This is separate from `bb/plugin`, the experimental synthetic probe. It provides
-only dispatch admission, a recorded-allocation environment provider and launcher
-control commands. It has no SQLite access, claims, event delivery, domain tools,
+only dispatch admission and launcher control commands. It has no SQLite access, claims, event delivery, domain tools,
 forms, status UI or supervisor registration. The core is called only through
 `docket host invoke`. Everything must run on the same machine.
 
@@ -24,8 +23,8 @@ The person configures these plugin settings:
 - `executable`: Docket executable on the server machine, default `docket`. No
   shell or arguments; use an absolute executable path where PATH is unsuitable.
 - `binding`: absolute path to a private version 1 host-service binding, created
-  by trusted Docket host set-up, limited to `host.bb-admit` and
-  `host.bb-allocation`. Never take it from thread metadata. Docket validates its
+  by trusted Docket host set-up, limited to `host.bb-admit`.
+  Never take it from thread metadata. Docket validates its
   permissions, identity and operation scope on every invocation. This setting is
   secret; the plugin does not read the binding itself or log command output.
 
@@ -35,10 +34,11 @@ bb supervisor is unrestricted; use the Docket CLI for domain operations.
 ## Launcher commands
 
 - `bb docket ready`: returns exit 0 with
-  `{version:1,ready:true,providerId:"docket"}` when the plugin is registered and
+  `{version:1,ready:true}` when the plugin is registered and
   its executable and binding settings are nonblank. A non-zero exit, missing
   command or invalid response must stop the launcher **before thread creation**.
-  This does not validate the binding file or probe the command. Registration alone
+  It probes `catalog.show` through the binding and requires `host.bb-admit`.
+  Registration alone
   is not evidence of database availability, provider qualification or continued
   plugin presence.
 - `bb docket recheck <threadId>`: requests re-evaluation, never sends a message.
@@ -49,30 +49,41 @@ bb supervisor is unrestricted; use the Docket CLI for domain operations.
   The launcher must observe admission and can make further explicit bounded
   recheck requests. Never use `thread queue send` to release held work.
 
-The hook is registered before settings, environment or CLI registration, on each
-normal load/reload. It passes every queued member to the core. Unknown replies,
-malformed envelopes, command failures and unsupported message blocks hold. A
-Docket provider intent before reference binding holds even when the core cannot
-locate that thread. Metadata and intent can locate or block, never grant authority.
+The hook is registered before settings or CLI registration, on each normal
+load/reload. It passes every queued member to the core. Unknown replies,
+malformed envelopes, command failures and unsupported message blocks hold.
+Before reference binding, the core holds messages matching a pending first
+prompt's exact text and user author category. Unrelated threads pass through;
+thread metadata never grants authority.
 
-## Environment provider (R34)
+## Workspace attachment (R34)
 
-Select provider `docket` with inputs `{ "leaseId": "<recorded lease>" }` through
-the CLI/SDK; no frontend inputs control is supplied. Create calls
-`host.bb-allocation` and returns only its absolute recorded path, with
-`ownsPath:false`. Repeated calls reverify the same lease. No acquisition,
-directory creation/removal, setup, teardown or Git mutation occurs here.
-`retireGraceMs:null` disables automatic retirement; the pinned SDK documents that
-`ownsPath:false` also suppresses both host environment scripts. Remove always
-refuses with a Docket return hint, including archive/delete/cascade retries.
-Only the core can authorise workspace return. No restore or existing-path shortcut
-bypasses allocation verification. The command transport uses private temporary
-JSON input files and removes those, never workspace paths.
+The launcher passes `--environment <leased Treehouse path>`. bb attaches this
+existing folder through its own checkout environment, without owning, retiring,
+scripting or removing it. Only Docket controls the lease and its return.
 
-The allocation operation currently returns only `path`, so this plugin cannot
-supply a verified starting merge base or identity resource to bb's Git view.
-Do not interpret bb's default base as exact attempt evidence; use the recorded
-Docket specification and starting commit. This remains a qualification limit.
+bb's environment record outlives the lease. When Treehouse recycles the folder,
+an earlier worker's thread can stay attached and a later bb worker may reuse the
+record. The hook refuses later turns on a finished worker, but a turn that
+bypasses the hook could change a folder another attempt holds. Docket does not
+remove bb environment records. Docket's recorded starting commit and output ref,
+not bb's Git view, are authoritative.
+
+After core retention checks and stopping/fencing the worker, manually archive
+the old worker thread (and any other threads holding the environment), then delete
+the environment record. Obtain its ID from the thread, never guess from the path:
+
+```text
+bb thread show <thread-id> --json
+bb thread archive <thread-id> --json
+bb environment delete <environment-id> --json
+bb environment show <environment-id> --json
+```
+
+Deletion refuses while live threads hold the environment. Cleanup is asynchronous;
+check `bb environment show` for destroyed/removed evidence. These commands never
+delete the folder or run teardown scripts for this attached checkout, and do not
+return the Treehouse lease or authorise recycling it.
 
 ## Queue identity
 

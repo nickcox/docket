@@ -2031,24 +2031,6 @@ export class Database {
     });
   }
 
-  /** An environment reuses only a held allocation in this context's recorded pool/repository. */
-  bbAllocation(leaseId: string): { path: string } {
-    nonblank(leaseId);
-    return this.snapshot(() => {
-      const rows = this.db.prepare('SELECT * FROM attempts WHERE lease_id = ?').all(leaseId);
-      if (rows.length !== 1) throw new CommandFailure('policy_refused');
-      const attempt = this.decodeAttempt(rows[0]!);
-      const allocation = attempt.allocation;
-      const spec = attempt.specification, workspace = spec.workspace as JsonObject;
-      if (!allocation || attempt.leaseState !== 'held' || allocation.leaseId !== leaseId
-        || allocation.pool !== workspace.pool || allocation.path === allocation.pool || !inside(allocation.path, allocation.pool)
-        || canonicalJson(allocation.repository) !== canonicalJson(spec.repository)
-        || canonicalJson(allocation.holder) !== canonicalJson(workspace.holder)
-        || allocation.outputRef !== spec.outputRef || allocation.startingCommit !== spec.startingCommit) throw new CommandFailure('policy_refused');
-      return { path: allocation.path };
-    });
-  }
-
   /** Recovery may close pending admission without adopting its worker or refreshing its owner. */
   async fencePendingLaunch(attemptId: string, caller: TaskActor): Promise<void> {
     text(attemptId); taskActor(caller);

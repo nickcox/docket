@@ -11,7 +11,7 @@ existing `pi` and `checks` maps:
 
 Task profiles select `launcher: "bb"` and `executionProfile: "local"`, with an
 explicit provider and model. The enabled Docket plugin must have a host-service
-binding whose catalogue includes `host.bb-admit` and `host.bb-allocation`.
+binding whose catalogue includes `host.bb-admit`.
 Readiness refuses before thread creation if that check fails. Thread creation
 uses the exact leased environment path. Before rechecking the held prompt, the
 launcher verifies that path and provider, and the held queue row's model.
@@ -42,6 +42,37 @@ passed literally as `--project`; the person must select a standard project with
 a checkout on this machine. `machineId`, when supplied, is also passed as
 `--machine`. Without it, an explicit project uses bb's local-machine resolution.
 The personal project cannot accept the leased path environment.
+
+## Workspace attachment and environment records (R34)
+
+The launcher supplies `--environment <leased Treehouse path>`. bb attaches the
+existing folder through its own checkout environment; it does not own, retire,
+run set-up or teardown scripts in, or remove the folder. Docket alone controls
+the lease and return. Archive/delete/cascade behaviour still needs pinned A56
+qualification.
+
+bb's environment record outlives the lease. When Treehouse recycles the folder,
+an earlier worker's thread can stay attached and a later bb worker may reuse the
+record. The hook refuses later turns on a finished worker, but a turn that
+bypasses the hook could change a folder another attempt holds. Docket does not
+remove bb environment records. Docket's recorded starting commit and output ref
+remain authoritative, not bb's Git view of that record.
+
+After core retention checks and stopping/fencing the worker, manually archive
+the old worker thread (and any other threads holding the environment), then delete
+the environment record. Use the environment ID from the thread, not a path guess:
+
+```text
+bb thread show <thread-id> --json
+bb thread archive <thread-id> --json
+bb environment delete <environment-id> --json
+bb environment show <environment-id> --json
+```
+
+Deletion refuses while live threads hold the environment. Cleanup is asynchronous;
+check `bb environment show` for destroyed/removed evidence. These commands never
+delete the folder or run teardown scripts for this attached checkout. They do not
+return a Treehouse lease or authorise recycling it.
 
 ## Definite refusals and uncertainty
 

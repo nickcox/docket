@@ -2,13 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { register, leaseInputs, type Port, type Dispatch } from '../bb/docket/plugin.ts';
+import { register, type Port, type Dispatch } from '../bb/docket/plugin.ts';
 import type { Run } from '../bb/docket/command.ts';
 
 function fixture(config = { executable: 'fake-docket', binding: join('private', 'binding.json') }) {
   const order: string[] = [];
   let hook!: Parameters<Port['experimental_hooks']['on']>[1];
-  let environment!: Parameters<Port['experimental_environments']['register']>[0];
   let cli!: Parameters<Port['cli']['register']>[0];
   let result: Record<string, unknown> = { decision: 'hold' };
   let failure = false, rechecks = 0;
@@ -30,12 +29,11 @@ function fixture(config = { executable: 'fake-docket', binding: join('private', 
       async recheck() { rechecks++; },
     },
     settings: { define() { order.push('settings'); return { async get() { return config; } }; } },
-    experimental_environments: { register(value) { order.push('environment'); environment = value; } },
     cli: { register(value) { order.push('cli'); cli = value; } },
   }, execute);
-  return { order, calls, hook, environment, cli, set(value: Record<string, unknown>) { result = value; }, fail() { failure = true; }, malformed(raw: string) { rawReply = raw; }, rechecks: () => rechecks };
+  return { order, calls, hook, cli, set(value: Record<string, unknown>) { result = value; }, fail() { failure = true; }, malformed(raw: string) { rawReply = raw; }, rechecks: () => rechecks };
 }
-const context = (): Dispatch => ({ thread: { id: 'thr_worker' }, environmentIntent: null,
+const context = (): Dispatch => ({ thread: { id: 'thr_worker' },
   input: { blocks: [{ type: 'text', text: 'inline text' }] }, initiator: 'user', queuedMessages: [
   { id: 'queued_1', initiator: 'user', senderThreadId: null, content: [{ type: 'text', text: 'first' }] },
   { id: 'queued_2', initiator: 'agent', senderThreadId: 'thr_sender', content: [{ type: 'text', text: 'second' }] },
@@ -43,7 +41,7 @@ const context = (): Dispatch => ({ thread: { id: 'thr_worker' }, environmentInte
 
 test('R33 registers hook first and maps every result, unknowns and failures fail closed', async () => {
   const f = fixture();
-  assert.deepEqual(f.order, ['hook', 'settings', 'environment', 'cli']);
+  assert.deepEqual(f.order, ['hook', 'settings', 'cli']);
   for (const [decision, action] of [['hold', 'wait'], ['admit', 'proceed'], ['refuse', 'reject'], ['pass-through', 'proceed'], ['unknown', 'wait']]) {
     f.set({ decision });
     assert.equal((await f.hook(context())).action, action);
@@ -60,10 +58,8 @@ test('R33 registers hook first and maps every result, unknowns and failures fail
   assert.equal((await f.hook(context())).action, 'wait');
 });
 
-test('R33 unbound Docket provider intent holds even on core pass-through; inline sends use content and author category', async () => {
+test('R33 R34 inline sends use content and author category', async () => {
   const f = fixture();
-  f.set({ decision: 'pass-through' });
-  assert.equal((await f.hook({ ...context(), environmentIntent: { kind: 'provider', environmentProviderId: 'docket' } })).action, 'wait');
   f.set({ decision: 'admit' });
   assert.equal((await f.hook({ ...context(), queuedMessages: [] })).action, 'proceed');
   assert.deepEqual(f.calls.at(-1)!.input, { threadId: 'thr_worker', members: [
@@ -71,34 +67,18 @@ test('R33 unbound Docket provider intent holds even on core pass-through; inline
   ] });
 });
 
-test('R34 returns only the verified recorded allocation, repeats safely and refuses removal', async () => {
-  const f = fixture(), path = join(process.cwd(), 'recorded-workspace');
-  f.set({ path, untrustedExtra: 'ignored' });
-  assert.deepEqual(f.environment.policy, { retireGraceMs: null });
-  for (let i = 0; i < 2; i++) assert.deepEqual(await f.environment.create({ inputs: { leaseId: 'lease' } }), { status: 'created', path, ownsPath: false });
-  assert.deepEqual(f.calls.map(c => c.input), [{ leaseId: 'lease' }, { leaseId: 'lease' }]);
-  assert.match((await f.environment.remove()).message, /docket attempt return/);
-  assert.equal((await f.environment.remove()).status, 'failed');
-  assert.equal(f.calls.length, 2);
-  f.set({ path: 'relative' });
-  assert.equal((await f.environment.create({ inputs: { leaseId: 'lease' } })).status, 'failed');
-  f.fail();
-  assert.equal((await f.environment.create({ inputs: { leaseId: 'lease' } })).status, 'failed');
-  assert.ok('issues' in leaseInputs['~standard'].validate({ path }));
-});
-
 test('R33 R34 launcher readiness and bounded recheck commands register without bb', async () => {
   const f = fixture();
-  f.set({ operations: [{ name: 'host.bb-admit' }, { name: 'host.bb-allocation' }] });
+  f.set({ operations: [{ name: 'host.bb-admit' }] });
   const readiness = await f.cli.run(['ready']);
   assert.equal(readiness.exitCode, 0);
-  assert.deepEqual(JSON.parse(readiness.stdout!), { version: 1, ready: true, providerId: 'docket' });
+  assert.deepEqual(JSON.parse(readiness.stdout!), { version: 1, ready: true });
   assert.equal((await f.cli.run(['recheck', 'thr_worker'])).exitCode, 0);
   assert.equal(f.rechecks(), 1);
   assert.equal((await f.cli.run(['recheck', 'bad', 'extra'])).exitCode, 2);
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0]!.operation, 'catalog.show');
-  f.set({ operations: [{ name: 'host.bb-admit' }] });
+  f.set({ operations: [{ name: 'catalog.show' }] });
   assert.equal((await f.cli.run(['ready'])).exitCode, 1);
   f.fail();
   assert.equal((await f.cli.run(['ready'])).exitCode, 1);
