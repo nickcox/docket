@@ -53,6 +53,12 @@ test('R17 R28 A37: private host invoke fixes authority, context and operation li
   assert.equal((await invoke()).envelope.code, 'invalid_input');
   // Remove the second link before testing other file properties.
   await unlink(hard);
+  const linkedDirectory = join(f.home, 'linked-host');
+  await symlink(directory, linkedDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.equal((await invoke('catalog.show', {}, join(linkedDirectory, 'binding.json'))).envelope.code, 'invalid_input');
+  assert.equal(f.invoke('host.bind', { directory: linkedDirectory, operations: binding.operations }, 'linked-directory').envelope.code, 'invalid_input');
+  assert.equal(f.invoke('host.bind', { directory: join(linkedDirectory, 'nested'), operations: binding.operations }, 'linked-ancestor').envelope.code, 'invalid_input');
+  await unlink(linkedDirectory);
   if (process.platform !== 'win32') {
     const linked = join(directory, 'linked.json');
     await symlink(path, linked);
@@ -60,6 +66,9 @@ test('R17 R28 A37: private host invoke fixes authority, context and operation li
     await chmod(path, 0o644);
     assert.equal((await invoke()).envelope.code, 'invalid_input');
     await chmod(path, 0o600);
+    await chmod(directory, 0o755);
+    assert.equal((await invoke()).envelope.code, 'invalid_input');
+    await chmod(directory, 0o700);
   }
   for (const value of [{ ...binding, version: 2 }, { ...binding, caller: { kind: 'person', id: 'forged' } }, { ...binding, operations: ['task.add'] }]) {
     await writeFile(path, JSON.stringify(value));

@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat, mkdir, open } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { createBinding, catalogueForRole } from './binding.ts';
 import { openContext } from './context.ts';
 import { strictJson } from './configuration.ts';
@@ -29,10 +29,35 @@ function valid(value: unknown): value is HostBinding {
     && b.operations.every(name => catalogueForRole('host').some(op => op.name === name));
 }
 
+/** Inspect every component: native realpath can expand Windows short names without a link. */
+export async function assertUnlinkedHostPath(
+  path: string,
+  inspect: (path: string) => Promise<{ isSymbolicLink(): boolean }> = lstat,
+  paths = { dirname, resolve },
+): Promise<void> {
+  let current = paths.resolve(path);
+  for (;;) {
+    // lstat reports both symbolic links and Windows junctions as symbolic links.
+    if ((await inspect(current)).isSymbolicLink()) throw new Error('Linked path');
+    const parent = paths.dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+async function checkBindingDirectory(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Invalid directory');
+  if (process.platform === 'win32') {
+    if (!await windowsPrivateFile(path)) throw new Error('Not private');
+  } else if (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0) throw new Error('Not private');
+}
+
 export async function readHostBinding(path: string): Promise<HostBinding> {
   try {
     const absolute = resolve(path);
-    if (await realpath(absolute) !== absolute) throw new Error('Linked path');
+    await assertUnlinkedHostPath(absolute);
+    await checkBindingDirectory(dirname(absolute));
     const before = await lstat(absolute);
     if (!before.isFile() || before.nlink !== 1 || before.size > MAX_BINDING_BYTES) throw new Error('Invalid file');
     if (process.platform === 'win32') {
@@ -77,8 +102,9 @@ export async function writeHostBinding(directory: string, binding: HostBinding):
   const root = resolve(directory), path = join(root, 'binding.json');
   try {
     await mkdir(root, { mode: 0o700 });
-    if (await realpath(root) !== root) throw new Error('Linked directory');
+    await assertUnlinkedHostPath(root);
     if (process.platform === 'win32') await windowsSecurePrivateDirectory(root);
+    await checkBindingDirectory(root);
     const file = await open(path, 'wx', 0o600);
     try { await file.writeFile(`${JSON.stringify(binding)}\n`); } finally { await file.close(); }
   } catch (error) {
