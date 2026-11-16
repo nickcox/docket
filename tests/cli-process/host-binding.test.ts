@@ -50,12 +50,12 @@ test('R17 R28 A37: private host invoke fixes authority, context and operation li
   assert.equal((await invoke('catalog.show', {}, join(f.home, 'absent'))).envelope.code, 'invalid_input');
   const hard = join(directory, 'hard.json');
   await link(path, hard);
-  assert.equal((await invoke()).envelope.code, 'invalid_input');
+  assert.match((await invoke()).envelope.diagnostics[0].message, /more than one hard link/u);
   // Remove the second link before testing other file properties.
   await unlink(hard);
   const linkedDirectory = join(f.home, 'linked-host');
   await symlink(directory, linkedDirectory, process.platform === 'win32' ? 'junction' : 'dir');
-  assert.equal((await invoke('catalog.show', {}, join(linkedDirectory, 'binding.json'))).envelope.code, 'invalid_input');
+  assert.match((await invoke('catalog.show', {}, join(linkedDirectory, 'binding.json'))).envelope.diagnostics[0].message, /linked path/u);
   assert.equal(f.invoke('host.bind', { directory: linkedDirectory, operations: binding.operations }, 'linked-directory').envelope.code, 'invalid_input');
   assert.equal(f.invoke('host.bind', { directory: join(linkedDirectory, 'nested'), operations: binding.operations }, 'linked-ancestor').envelope.code, 'invalid_input');
   await unlink(linkedDirectory);
@@ -76,10 +76,12 @@ test('R17 R28 A37: private host invoke fixes authority, context and operation li
   }
   for (const field of ['contextId', 'databaseId']) {
     await writeFile(path, JSON.stringify({ ...binding, [field]: 'another-context' }));
-    assert.equal((await invoke()).envelope.code, 'context_mismatch');
+    const mismatch = (await invoke()).envelope;
+    assert.equal(mismatch.code, 'context_mismatch');
+    assert.match(mismatch.diagnostics[0].message, /context or database mismatch/u);
   }
   await writeFile(path, ' '.repeat(16 * 1024 + 1));
-  assert.equal((await invoke()).envelope.code, 'invalid_input');
+  assert.match((await invoke()).envelope.diagnostics[0].message, /too large/u);
   await writeFile(path, original);
   assert.equal((await invoke()).status, 0);
   assert.equal(f.invoke('host.bind', { directory: join(f.home, 'bad'), operations: ['task.add'] }).envelope.code, 'invalid_input');

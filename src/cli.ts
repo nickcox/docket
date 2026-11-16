@@ -182,7 +182,10 @@ export async function runCli(
       failure.envelope.diagnostics[0]!.message = `Invalid configuration at ${field}.`;
     }
     if (error instanceof ContextError || error instanceof CommandFailure) failure.envelope.data = error.data;
-    if (error instanceof CommandFailure) failure.envelope.nextAction = error.nextAction;
+    if (error instanceof CommandFailure) {
+      failure.envelope.nextAction = error.nextAction;
+      if (error.diagnostic) failure.envelope.diagnostics[0]!.message = error.diagnostic.slice(0, 1024);
+    }
     exitCode = failure.exitCode;
     output = `${JSON.stringify(failure.envelope)}\n`;
     io.stderr(`${failure.envelope.diagnostics[0]?.message}\n`);

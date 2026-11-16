@@ -85,7 +85,11 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
   if (error instanceof UnknownProfileError) throw new CommandFailure('invalid_input', { ...data, ...error.details });
   if (error instanceof NoEligibleTaskError) throw new CommandFailure('not_ready', { ...data, skippedTasks: error.skippedTasks });
   if (error instanceof ConfigurationError) throw error;
-  if (error instanceof CommandFailure) throw new CommandFailure(error.code, { ...data, ...error.data }, error.nextAction);
+  if (error instanceof CommandFailure) {
+    const failure = new CommandFailure(error.code, { ...data, ...error.data }, error.nextAction);
+    if (error.diagnostic) failure.diagnostic = error.diagnostic;
+    throw failure;
+  }
   if (error instanceof OwnerReadError) throw new CommandFailure('owner_unknown', data);
   if (error instanceof TypeError) throw new CommandFailure('invalid_input', data);
   if (!(error instanceof StorageError)) throw new CommandFailure('internal_failure', data);

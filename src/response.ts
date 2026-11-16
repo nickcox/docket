@@ -47,6 +47,7 @@ export type FailureCode = keyof typeof failures;
 
 export class CommandFailure extends Error {
   readonly code: FailureCode;
+  diagnostic?: string;
 
   readonly data: Record<string, unknown>;
   readonly nextAction: Envelope['nextAction'];

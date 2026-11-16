@@ -20,7 +20,7 @@ test('R17 A37: host binding link checks accept Windows short names and letter ca
     for (const linked of inspected) {
       await assert.rejects(assertUnlinkedHostPath(path, async component => ({
         isSymbolicLink: () => component === linked,
-      }), win32), /Linked path/);
+      }), win32), /linked path/);
     }
   }
 });

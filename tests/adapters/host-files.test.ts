@@ -53,7 +53,7 @@ test('R31/R35: private Windows directory ACL replacement removes explicit grants
     { complete: false, code: 0 }, { complete: true, code: 99 },
   ]) {
     const secure = windowsSecurePrivateDirectory('private directory', options => {
-      assert.deepEqual(options?.environment, { ...windowsPowerShellEnvironment(), DOCKET_PRIVATE_DIRECTORY: 'private directory' });
+      assert.deepEqual(options?.environment, { ...windowsPowerShellEnvironment(), DOCKET_PRIVATE_PATH: 'private directory' });
       return async (executable, args) => {
         assert.equal(executable, 'powershell.exe');
         assert.deepEqual(args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-EncodedCommand']);
@@ -61,14 +61,15 @@ test('R31/R35: private Windows directory ACL replacement removes explicit grants
         assert.ok(script.includes('[System.Security.AccessControl.DirectorySecurity]::new()'));
         assert.ok(script.includes('SetAccessRuleProtection($true, $false)'));
         assert.ok(script.indexOf('Set-Acl') < script.indexOf('Get-Acl'));
-        assert.ok(script.includes('$rules.Count -ne 1'));
-        return { ...result, stdout: '', stderr: '' };
+        assert.ok(script.includes('$rules.Count -eq 1'));
+        assert.ok(!script.includes('SetOwner'));
+        return { ...result, stdout: JSON.stringify({ user: 'S-1-5-21-1', owner: 'S-1-5-32-544', secured: true, entries: [{ sid: 'S-1-5-21-1', allow: true }] }), stderr: '' };
       };
     });
     if (result.complete && result.code === 0) await secure;
-    else await assert.rejects(secure, { message: 'Windows private directory ACL could not be secured and verified' });
+    else await assert.rejects(secure, { message: 'Windows directory ACL could not be secured or read' });
   }
-  await assert.rejects(windowsSecurePrivateDirectory('private directory', () => async () => { throw new Error('spawn failed'); }), /spawn failed/);
+  await assert.rejects(windowsSecurePrivateDirectory('private directory', () => async () => { throw new Error('spawn failed'); }), /ACL could not be secured or read/);
   if (process.platform === 'win32') {
     const directory = await mkdtemp(join(await realpath(tmpdir()), 'docket-private-acl-'));
     t.after(() => rm(directory, { recursive: true, force: true }));

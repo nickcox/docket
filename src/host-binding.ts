@@ -5,9 +5,25 @@ import { createBinding, catalogueForRole } from './binding.ts';
 import { openContext } from './context.ts';
 import { strictJson } from './configuration.ts';
 import { CommandFailure } from './response.ts';
-import { windowsPrivateFile, windowsSecurePrivateDirectory } from './adapters/host-files.ts';
+import { PrivateFileError, windowsPrivateFile, windowsSecurePrivateDirectory } from './adapters/host-files.ts';
 
 export const MAX_BINDING_BYTES = 16 * 1024;
+
+export function hostBindingRefusal(error: unknown, fallback: string): CommandFailure {
+  const failure = new CommandFailure('invalid_input');
+  const conditions: Record<string, string> = { ENOENT: 'file or directory is missing', ENOTDIR: 'not a directory',
+    ELOOP: 'linked path', EACCES: 'file or directory access denied', EPERM: 'file or directory access denied' };
+  const code = error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : '';
+  const reason = error instanceof PrivateFileError ? error.message : conditions[code] ?? fallback;
+  failure.diagnostic = `Host binding refused: ${reason}.`.slice(0, 1024);
+  return failure;
+}
+
+function checkPosixPrivacy(info: { uid: number; mode: number }): void {
+  if (info.uid !== process.getuid!()) throw new PrivateFileError('owner mismatch');
+  if ((info.mode & 0o077) !== 0) throw new PrivateFileError('group or other access');
+}
+
 interface HostBinding {
   version: 1;
   config: string;
@@ -38,7 +54,7 @@ export async function assertUnlinkedHostPath(
   let current = paths.resolve(path);
   for (;;) {
     // lstat reports both symbolic links and Windows junctions as symbolic links.
-    if ((await inspect(current)).isSymbolicLink()) throw new Error('Linked path');
+    if ((await inspect(current)).isSymbolicLink()) throw new PrivateFileError('linked path');
     const parent = paths.dirname(current);
     if (parent === current) return;
     current = parent;
@@ -47,10 +63,10 @@ export async function assertUnlinkedHostPath(
 
 async function checkBindingDirectory(path: string): Promise<void> {
   const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Invalid directory');
-  if (process.platform === 'win32') {
-    if (!await windowsPrivateFile(path)) throw new Error('Not private');
-  } else if (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0) throw new Error('Not private');
+  if (info.isSymbolicLink()) throw new PrivateFileError('linked path');
+  if (!info.isDirectory()) throw new PrivateFileError('not a directory');
+  if (process.platform === 'win32') await windowsPrivateFile(path);
+  else checkPosixPrivacy(info);
 }
 
 export async function readHostBinding(path: string): Promise<HostBinding> {
@@ -59,23 +75,30 @@ export async function readHostBinding(path: string): Promise<HostBinding> {
     await assertUnlinkedHostPath(absolute);
     await checkBindingDirectory(dirname(absolute));
     const before = await lstat(absolute);
-    if (!before.isFile() || before.nlink !== 1 || before.size > MAX_BINDING_BYTES) throw new Error('Invalid file');
-    if (process.platform === 'win32') {
-      if (!await windowsPrivateFile(absolute)) throw new Error('Not private');
-    } else if (before.uid !== process.getuid!() || (before.mode & 0o077) !== 0) throw new Error('Not private');
+    if (!before.isFile()) throw new PrivateFileError('not a regular file');
+    if (before.nlink !== 1) throw new PrivateFileError('more than one hard link');
+    if (before.size > MAX_BINDING_BYTES) throw new PrivateFileError('too large');
+    if (process.platform === 'win32') await windowsPrivateFile(absolute);
+    else checkPosixPrivacy(before);
     const file = await open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
       const info = await file.stat();
-      if (!info.isFile() || info.dev !== before.dev || info.ino !== before.ino || info.nlink !== 1 || info.size > MAX_BINDING_BYTES) throw new Error('Changed file');
-      if (process.platform !== 'win32' && (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0)) throw new Error('Not private');
+      if (!info.isFile()) throw new PrivateFileError('not a regular file');
+      if (info.dev !== before.dev || info.ino !== before.ino) throw new PrivateFileError('file changed while opening');
+      if (info.nlink !== 1) throw new PrivateFileError('more than one hard link');
+      if (info.size > MAX_BINDING_BYTES) throw new PrivateFileError('too large');
+      if (process.platform !== 'win32') checkPosixPrivacy(info);
       const buffer = Buffer.alloc(MAX_BINDING_BYTES + 1);
       const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-      if (bytesRead > MAX_BINDING_BYTES) throw new Error('Too large');
-      const value = strictJson(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead)));
-      if (!valid(value)) throw new Error('Invalid binding');
+      if (bytesRead > MAX_BINDING_BYTES) throw new PrivateFileError('too large');
+      let value: unknown;
+      try { value = strictJson(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead))); }
+      catch { throw new PrivateFileError('invalid content'); }
+      if (value && typeof value === 'object' && 'version' in value && value.version !== 1) throw new PrivateFileError('wrong version');
+      if (!valid(value)) throw new PrivateFileError('invalid content');
       return value;
     } finally { await file.close(); }
-  } catch { throw new CommandFailure('invalid_input'); }
+  } catch (error) { throw hostBindingRefusal(error, 'file metadata or binding could not be read'); }
 }
 
 export async function loadHostBinding(path: string, operation: string) {
@@ -83,7 +106,11 @@ export async function loadHostBinding(path: string, operation: string) {
   if (!binding.operations.includes(operation)) throw new CommandFailure('permission_denied');
   const context = await openContext({ config: binding.config }, { readOnly: true });
   try {
-    if (context.databaseId !== binding.databaseId || context.configuration.resolved.contextId !== binding.contextId) throw new CommandFailure('context_mismatch');
+    if (context.databaseId !== binding.databaseId || context.configuration.resolved.contextId !== binding.contextId) {
+      const failure = new CommandFailure('context_mismatch');
+      failure.diagnostic = 'Host binding refused: context or database mismatch.';
+      throw failure;
+    }
   } finally { context.database.close(); }
   const trusted = createBinding(binding.caller, { config: binding.config });
   return {
@@ -98,7 +125,8 @@ export async function loadHostBinding(path: string, operation: string) {
 
 /** A new dedicated directory avoids changing permissions on an existing host directory. */
 export async function writeHostBinding(directory: string, binding: HostBinding): Promise<string> {
-  if (!valid(binding) || Buffer.byteLength(JSON.stringify(binding)) > MAX_BINDING_BYTES) throw new CommandFailure('invalid_input');
+  if (!valid(binding)) throw hostBindingRefusal(new PrivateFileError('wrong version or invalid content'), 'invalid content');
+  if (Buffer.byteLength(JSON.stringify(binding)) > MAX_BINDING_BYTES) throw hostBindingRefusal(new PrivateFileError('too large'), 'too large');
   const root = resolve(directory), path = join(root, 'binding.json');
   try {
     await mkdir(root, { mode: 0o700 });
@@ -108,9 +136,9 @@ export async function writeHostBinding(directory: string, binding: HostBinding):
     const file = await open(path, 'wx', 0o600);
     try { await file.writeFile(`${JSON.stringify(binding)}\n`); } finally { await file.close(); }
   } catch (error) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') throw new CommandFailure('invalid_input');
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') throw hostBindingRefusal(error, 'directory or file could not be created');
     const existing = await readHostBinding(path);
-    if (JSON.stringify(existing) !== JSON.stringify(binding)) throw new CommandFailure('invalid_input');
+    if (JSON.stringify(existing) !== JSON.stringify(binding)) throw hostBindingRefusal(new PrivateFileError('existing binding differs'), 'existing binding differs');
   }
   await readHostBinding(path);
   return path;
