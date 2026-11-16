@@ -184,7 +184,13 @@ export function workerObservation(value: WorkerObservation): void {
   if (value.payloadVersion !== 1) invalid('Unsupported observation payload version');
   const payload = record(value.payload);
   if (value.kind === 'terminal') {
-    if (value.workerRef.launcher === 'pi') {
+    if (payload.personConfirmedStopped === true) {
+      fields(payload, ['personConfirmedStopped', 'evidence', 'scope']);
+      text(payload.evidence);
+      const scope = record(payload.scope);
+      fields(scope, ['claimId', 'generation', 'ownerRef', 'commandRequestKey']);
+      text(scope.claimId); text(scope.generation); text(scope.commandRequestKey); record(scope.ownerRef);
+    } else if (value.workerRef.launcher === 'pi') {
       fields(payload, ['directChildExited']);
       if (payload.directChildExited !== true) invalid('Pi terminal observation requires direct child exit');
     } else if (value.workerRef.launcher === 'bb') {

@@ -446,6 +446,21 @@ test('R07: Pi terminal proof requires direct child exit and rejects process-stop
   assert.throws(() => workerObservation({ ...observation, payload: { directChildExited: true, noProcesses: true } }), refuses('result_invalid'));
 });
 
+test('R07/A17: person-confirmed terminal payloads require evidence and scope, and never mix launcher facts', async () => {
+  const { workerObservation } = await import('../../src/storage/results.ts');
+  for (const workerRef of [{ launcher: 'pi', sessionId: 'session', processId: '123' }, { launcher: 'bb', threadId: 'thread' }]) {
+    const payload = { personConfirmedStopped: true, evidence: 'Inspected this exact stopped worker',
+      scope: { claimId: 'claim', generation: 'generation', ownerRef: { kind: 'host', id: 'host' }, commandRequestKey: 'resolve' } };
+    const observation: WorkerObservation = { sourceId: 'person', sourceSequence: 0, attemptId: 'attempt', workerRef,
+      observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1, payload };
+    workerObservation(observation);
+    for (const invalid of [{ ...payload, evidence: ' ' }, { ...payload, scope: {} }, { ...payload, personConfirmedStopped: false },
+      { ...payload, directChildExited: true }, { ...payload, turnEnded: true, threadStopped: true, fenceRecorded: true }]) {
+      assert.throws(() => workerObservation({ ...observation, payload: invalid }), refuses('result_invalid'));
+    }
+  }
+});
+
 test('R10/R25: simultaneous validation and completion through independent stores retain one result and outcome', async t => {
   const f = await fixture(t); await f.save();
   const other = await Database.open(f.path, f.options); defer(t, () => other.close());

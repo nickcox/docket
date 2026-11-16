@@ -2209,6 +2209,9 @@ export class Database {
   /** Old source sequences still carry independent facts. A duplicate cannot erase terminal evidence. */
   async recordWorkerObservation(observation: WorkerObservation, host: WorkerHost): Promise<Attempt> {
     workerObservation(observation); workerHost(host);
+    if (observation.kind === 'terminal' && observation.payload.personConfirmedStopped === true) {
+      throw new StorageError('result_invalid', 'Person-confirmed terminal evidence requires claim resolution');
+    }
     const value = object(observation) as WorkerObservation, actor = object(host) as WorkerHost;
     return this.write(() => {
       const attempt = this.attemptRow(value.attemptId);
@@ -3040,11 +3043,18 @@ export class Database {
   async resolveClaimByPerson(id: string, evidence: string, caller: TaskActor, command: CommandInput): Promise<Claim> {
     taskActor(caller); nonblank(evidence);
     if (caller.kind !== 'person') throw new CommandFailure('person_required');
+    if (command.input.confirmStopped !== true) throw new CommandFailure('process_confirmation_required');
+    if (command.operation !== 'claim.resolve' || command.input.claimId !== id || command.input.evidence !== evidence
+      || command.input.dryRun !== false || command.fingerprint !== canonicalJson(command.input)
+      || json(command.caller) !== json(caller)) throw new StorageError('conflict', 'Claim resolution scope mismatch');
     return this.writeTask(command, () => {
       const claim = this.decodeClaim(this.claimRow(id));
-      if (claim.releasedAt) return claim;
       const proof = { claimId: id, generation: claim.generation, ownerRef: claim.ownerRef, evidence, confirmStopped: true };
-      if (claim.role === 'worker_owner' && claim.attemptId !== undefined) this.recordConfirmedStopInTransaction(claim.attemptId, caller);
+      if (claim.role === 'worker_owner' && claim.attemptId !== undefined) {
+        this.recordConfirmedStopInTransaction(claim.attemptId, caller);
+        this.recordPersonConfirmedStopInTransaction(claim, evidence, caller, command);
+      }
+      if (claim.releasedAt) return claim;
       this.db.prepare('UPDATE claims SET released_at = ?, release_evidence = ?, revision = revision + 1 WHERE id = ?')
         .run(new Date().toISOString(), json(proof), id);
       this.storageEvent('claim.resolved', caller, proof);
@@ -3072,6 +3082,22 @@ export class Database {
     this.insertEvent({ sourceKey: `worker.observation:${json([attemptId, observation.sourceId, 0])}`, kind: 'worker.observed',
       payloadVersion: 1, correlationId: attemptId, actor: object(caller), occurredAt: observation.observedAt,
       attemptId, taskId: String(attempt.task_id), requestId: request.id, payload: observation });
+  }
+
+  /** Recovery confirms only this bound worker, without inventing launcher observations (R07/R08). */
+  private recordPersonConfirmedStopInTransaction(claim: Claim, evidence: string, caller: TaskActor, command: CommandInput): void {
+    const attemptId = claim.attemptId!, attempt = this.attemptRow(attemptId);
+    if (attempt.runtime_ref === null || this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
+      AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(attemptId)) return;
+    const observation: WorkerObservation = { sourceId: `claim.resolve:${json([claim.id, command.requestKey])}`,
+      sourceSequence: 0, attemptId, workerRef: object(JSON.parse(String(attempt.runtime_ref))) as WorkerReference,
+      observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
+      payload: { personConfirmedStopped: true, evidence,
+        scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef, commandRequestKey: command.requestKey } } };
+    workerObservation(observation);
+    this.insertEvent({ sourceKey: `worker.observation:${json([attemptId, observation.sourceId, 0])}`, kind: 'worker.observed',
+      payloadVersion: 1, correlationId: attemptId, actor: object(caller), occurredAt: observation.observedAt,
+      attemptId, taskId: String(attempt.task_id), payload: observation });
   }
 
   async resolveEffectByPerson(id: string, happened: boolean, evidence: string, caller: TaskActor, command: CommandInput): Promise<StoredRequest> {

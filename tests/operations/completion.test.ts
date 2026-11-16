@@ -443,6 +443,84 @@ test('R11: person discards terminal missing/invalid results without retention an
   }
 });
 
+for (const pi of [true, false]) {
+  for (const released of [false, true]) {
+    test(`R07/R08/A16/A17: ${pi ? 'Pi' : 'bb'} owner dies before stop; ${released ? 'released' : 'active'} claim recovery records terminal once, then discard succeeds`, async t => {
+      const f = await fixture(t, false, pi);
+      const a = await f.attempt('lost-owner', ['Criterion'], undefined, head, start, policyContent, 'prepared');
+      const activation = f.db.requests().find(r => r.attemptId === a.id && r.operation === 'worker.activate')!;
+      await f.db.closePendingEffect(activation.id, 'withdrawn', { reason: 'Owner died before activation' }, person);
+      await unlink(a.binding.resultPath);
+      const claim = f.db.claims().find(c => c.attemptId === a.id && c.role === 'worker_owner')!;
+      if (released) await f.db.releaseClaim({ claimId: claim.id, generation: claim.generation }, { evidence: 'Earlier stopped evidence' }, host);
+      const originalClaim = f.db.claim(claim.id), otherClaims = f.db.claims().filter(c => c.id !== claim.id);
+      const effects = f.db.requests().filter(r => r.category === 'effect');
+      const before = f.db.attempt(a.id);
+      const resolve = (key: string, evidence = 'Inspected this exact worker and owner; both stopped') => {
+        const input = { claimId: claim.id, confirmStopped: true, evidence, dryRun: false };
+        return f.db.resolveClaimByPerson(claim.id, evidence, person,
+          { requestKey: key, operation: 'claim.resolve', caller: person, input, fingerprint: canonicalJson(input) });
+      };
+      const discard = { requestKey: 'discard-recovered', attemptId: a.id, caller: person,
+        discard: { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Abandoned worker' } };
+      await assert.rejects(returnAttempt(f.db, discard, f.services), /terminal/);
+      const personPayload = { personConfirmedStopped: true, evidence: 'Host cannot assert person confirmation',
+        scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef, commandRequestKey: 'forged' } };
+      await assert.rejects(f.db.recordWorkerObservation({ ...a.observation('terminal', 0), payload: personPayload }, host),
+        { code: 'result_invalid' });
+      await resolve('recover');
+      await resolve('recover');
+      await resolve('recover-again', 'Rechecked this exact stopped worker');
+      const terminal = f.db.events().filter(e => e.attemptId === a.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
+      assert.equal(terminal.length, 1);
+      assert.deepEqual(terminal[0]!.payload.payload, { personConfirmedStopped: true,
+        evidence: 'Inspected this exact worker and owner; both stopped', scope: {
+          claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef, commandRequestKey: 'recover' } });
+      assert.equal(terminal[0]!.payload.sourceId, `claim.resolve:${JSON.stringify([claim.id, 'recover'])}`);
+      assert.deepEqual(terminal[0]!.actor, person);
+      if (released) assert.deepEqual(f.db.claim(claim.id), originalClaim);
+      assert.deepEqual(f.db.claims().filter(c => c.id !== claim.id), otherClaims);
+      assert.deepEqual(f.db.requests().filter(r => r.category === 'effect'), effects);
+      assert.deepEqual(f.db.attempt(a.id), before, 'Recovery does not reopen launch or settle execution');
+      assert.equal(f.db.validatedWorkerResult(a.id), null);
+      await returnAttempt(f.db, discard, f.services);
+      assert.equal(f.db.attempt(a.id).executionOpen, false);
+      assert.equal(f.db.attempt(a.id).leaseState, 'returned');
+      await f.db.releaseTask('lost-owner', person);
+      const next = await f.db.reserveAttempt({ requestKey: 'redispatch', taskId: 'lost-owner', caller: person, startingCommit: start,
+        checks: parseCheckPolicy(start, policyContent, contextChecks),
+        delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+      assert.notEqual(next.attempt.id, a.id);
+    });
+  }
+}
+
+test('R07/R08/A16/A17: claim recovery keeps succeeded stop/fence evidence unchanged', async t => {
+  for (const pi of [true, false]) {
+    for (const operation of ['worker.emergency-stop', 'worker.fence']) {
+      const f = await fixture(t, false, pi);
+      const a = await f.attempt('stopped-owner', ['Criterion'], undefined, head, start, policyContent, 'prepared');
+      const claim = f.db.claims().find(c => c.attemptId === a.id && c.role === 'worker_owner')!;
+      const executor = { claimId: claim.id, generation: claim.generation };
+      const parent = await f.db.recordCommand({ requestKey: 'stop-command', operation: 'attempt.stop', caller: host, input: {}, fingerprint: 'stop' });
+      const stop = await f.db.recordEffect({ requestKey: 'stop-effect', operation, caller: host, input: {}, fingerprint: 'stop',
+        parentId: parent.id, executor, attemptId: a.id, target: { kind: 'worker', reference: a.observation('terminal', 0).workerRef } });
+      await f.db.claimEffect(stop.id, executor);
+      await f.db.recordEffectOutcome(stop.id, executor, 'succeeded', { status: 'confirmed', value: { terminal: true } });
+      const effects = f.db.requests().filter(r => r.category === 'effect');
+      const input = { claimId: claim.id, confirmStopped: true, evidence: 'Confirmed this stopped worker', dryRun: false };
+      await f.db.resolveClaimByPerson(claim.id, input.evidence, person,
+        { requestKey: 'resolve-stop', operation: 'claim.resolve', caller: person, input, fingerprint: canonicalJson(input) });
+      const terminal = f.db.events().filter(e => e.attemptId === a.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
+      assert.equal(terminal.length, 1);
+      assert.equal(terminal[0]!.payload.sourceId, `stop:${stop.id}`);
+      assert.equal(terminal[0]!.requestId, stop.id);
+      assert.deepEqual(terminal[0]!.payload.payload, pi ? { directChildExited: true } : { turnEnded: true, threadStopped: true, fenceRecorded: true });
+      assert.deepEqual(f.db.requests().filter(r => r.category === 'effect'), effects);
+    }
+  }
+});
+
 test('A21/R11: automatic return records its origin, cleans integrated refs and keeps manual output', async t => {
   for (const local of [true, false]) {
     const f = await fixture(t, local);

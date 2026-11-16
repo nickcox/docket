@@ -14,6 +14,10 @@ import type { TaskActor } from '../../src/storage/tasks.ts';
 import { supervisorPermissions } from '../../src/authority.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { configuration } from '../fixtures/configuration.ts';
+import { applicationId } from '../../src/storage/database.ts';
+import type { Runtime } from '../../src/runtime.ts';
+import { prepareWorker } from '../../src/workers.ts';
+import { FakeLauncher } from '../helpers/fake-launcher.ts';
 
 const person: TaskActor = { kind: 'person', id: 'operator' };
 const supervisor: TaskActor = { kind: 'supervisor', id: 'supervisor', objectiveId: 'goal', sessionId: 'session' };
@@ -36,6 +40,36 @@ async function fixture(t: test.TestContext) {
   const binding = createBinding(caller, { config: file }, { home });
   return { db, file, home, caller, binding };
 }
+
+test('R07/R08/A16/A17: person claim recovery still refuses a known non-terminal worker, including a released claim', async t => {
+  const f = await fixture(t), db = f.db, launcher = new FakeLauncher();
+  await db.addTask({ id: 'worker', title: 'Worker', kind: 'code', criteria: ['Works'] }, person);
+  const reservation = await db.reserveAttempt({ requestKey: 'dispatch', taskId: 'worker', caller: person, startingCommit: 'a'.repeat(40),
+    checks: parseCheckPolicy('a'.repeat(40), null, { executionProfile: 'test', fast: [], full: [] }),
+    delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+  const id = reservation.attempt.id;
+  const [owner] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch', ownerRef: person,
+    schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
+  const executor = { claimId: owner!.id, generation: owner!.generation };
+  const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, person);
+  const input = acquisition.effect.input, workspace = input.workspace as Record<string, any>;
+  await db.recordAllocation(id, acquisition.effect.id, executor, { leaseId: 'lease', holder: workspace.holder,
+    path: join(String(workspace.pool), 'worker'), pool: String(workspace.pool), repository: input.repository as Record<string, any>,
+    outputRef: String(input.outputRef), startingCommit: 'a'.repeat(40) });
+  await db.startAttempt(id, person);
+  const host = { kind: 'host' as const, id: 'host', generation: 'generation' };
+  await prepareWorker(db, id, host, launcher);
+  const claim = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner')!;
+  const args = { claimId: claim.id, confirmStopped: true, evidence: 'Claims this worker stopped', dryRun: false };
+  const runtime = async () => ({ launcher }) as unknown as Runtime;
+  for (const released of [false, true]) {
+    if (released) await db.releaseClaim({ claimId: claim.id, generation: claim.generation }, { evidence: 'Earlier release' }, host);
+    const before = { claims: db.claims(), requests: db.requests(), events: db.events(), attempt: db.attempt(id) };
+    for (const dryRun of [true, false]) await assert.rejects(executeCoreOperation(findOperation('claim.resolve')!, { ...args, dryRun },
+      () => {}, { config: f.file }, `resolve-${released}-${dryRun}`, { home: f.home, caller: person, runtime }), code('owner_unresolved'));
+    assert.deepEqual({ claims: db.claims(), requests: db.requests(), events: db.events(), attempt: db.attempt(id) }, before);
+  }
+});
 
 test('R17/R28/A37/A52: generated role catalogues and strict bound schemas expose no caller or approval override', async t => {
   const f = await fixture(t);

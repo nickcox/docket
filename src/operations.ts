@@ -373,7 +373,10 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             if (observation.status === 'known' && !observation.terminal) throw new CommandFailure('owner_unresolved', { claimId: claim.id });
           }
         }
-        const plan = { steps: claim.releasedAt ? [] : [step('claim.resolve', claim.id, ['person', 'stopped_owner', 'scoped_evidence'])], scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef } };
+        const needsTerminal = claim.role === 'worker_owner' && claim.attemptId !== undefined
+          && db.requests().some(r => r.attemptId === claim.attemptId && r.operation === 'worker.prepare' && r.result?.reference)
+          && !db.events().some(e => e.attemptId === claim.attemptId && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
+        const plan = { steps: claim.releasedAt && !needsTerminal ? [] : [step('claim.resolve', claim.id, ['person', 'stopped_owner', 'scoped_evidence'])], scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef } };
         if (args.dryRun) return plan;
         return { claim: await db.resolveClaimByPerson(claim.id, String(args.evidence), caller, command), ...plan };
       }
