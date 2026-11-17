@@ -270,6 +270,8 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
     db.requireNoLaterTurnDiscrepancy(attempt.id);
   }
   if (attempt.leaseState === 'returned') return { steps: [] };
+  const bound = db.requests().some(r => r.attemptId === attempt.id && r.operation === 'worker.prepare' && r.result?.reference);
+  if (!bound && db.claims().some(c => c.attemptId === attempt.id && c.role === 'worker_owner' && !c.releasedAt)) refuse('Worker owner claim is unresolved');
   if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
   const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
   const authorisation = db.events().find(e => e.sourceKey === `return.authorised:${attempt.id}`);

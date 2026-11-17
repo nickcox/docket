@@ -16,6 +16,8 @@ import { confirmed, rejected, uncertain } from '../../src/adapters/command.ts';
 import { FakeLauncher } from '../helpers/fake-launcher.ts';
 import { PiLauncher } from '../../src/adapters/pi.ts';
 import { canonicalJson } from '../../src/configuration.ts';
+import { returnAttempt } from '../../src/completion.ts';
+import type { CompletionServices } from '../../src/completion.ts';
 
 const person = { kind: 'person' as const, id: 'operator' };
 const host: WorkerHost = { kind: 'host', id: 'backend', generation: 'generation-1' };
@@ -68,6 +70,77 @@ async function fixture(t: { after: (fn: () => Promise<void> | void) => void }) {
   }
   return { db, root, path, options, allocated, started, prepared };
 }
+
+test('R07/R08/A14/A16/A17: unbound uncertain preparation needs scoped stop confirmation and resolved ownership before discard', async t => {
+  for (const released of [false, true]) {
+    const { db, started } = await fixture(t), a = await started('task', 'other');
+    const launcher = new FakeLauncher();
+    launcher.beforePrepare = async () => uncertain('Preparation timed out after starting the process');
+    const prepare = await prepareWorker(db, a.attemptId, host, launcher);
+    assert.equal(prepare.state, 'uncertain');
+    const executor = { claimId: a.claimId, generation: host.generation };
+    const parent = await db.recordCommand({ requestKey: 'emergency', operation: 'attempt.stop', caller: host, input: {}, fingerprint: 'emergency' });
+    const stop = await db.recordEffect({ requestKey: 'emergency-effect', operation: 'worker.emergency-stop', caller: host,
+      input: {}, fingerprint: 'emergency', parentId: parent.id, executor, attemptId: a.attemptId,
+      target: { kind: 'worker', reference: { launcher: 'pi', sessionId: String(prepare.input.sessionId) } } });
+    await db.claimEffect(stop.id, executor);
+    await db.recordEffectOutcome(stop.id, executor, 'succeeded', { status: 'confirmed', value: { exit: { code: null, signal: 'SIGTERM' }, terminal: true } });
+    let returned = false;
+    const unused = async (): Promise<never> => { throw new Error('Unexpected external call'); };
+    const services: CompletionServices = {
+      profile: { id: 'test', tools: {}, dependencies: {} }, run: unused,
+      repository: { identity: unused, readCheckPolicy: unused, inspectRef: async () => confirmed({ state: 'absent' }),
+        inspectWorkspace: async () => confirmed({ branch: a.allocation.outputRef, head: hash, clean: true, uncommitted: [], untracked: [] }),
+        compare: unused, verifyRetention: unused, conditionalFastForward: unused, conditionalDeleteRef: unused,
+        command: unused, createPinnedRef: unused, conditionalMoveRef: unused, prepareRebase: unused },
+      workspace: { inspect: async () => confirmed({ state: returned ? 'absent' : 'matching' }),
+        returnLease: async () => { returned = true; return confirmed({ returned: true }); } },
+    };
+    const discard = { requestKey: 'discard-unbound', attemptId: a.attemptId, caller: person,
+      discard: { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Abandoned preparation' } };
+    await assert.rejects(returnAttempt(db, discard, services), /terminal/);
+    const effectInput = { effectId: prepare.id, outcome: 'happened', confirmStopped: true, evidence: 'Exact prepare process stopped by emergency stop', dryRun: false };
+    const resolveEffect = () => db.resolveEffectByPerson(prepare.id, true, effectInput.evidence, person, { requestKey: 'resolve-prepare',
+      operation: 'effect.resolve', caller: person, input: effectInput, fingerprint: canonicalJson(effectInput) });
+    if (!released) {
+      await resolveEffect();
+      await assert.rejects(returnAttempt(db, discard, services), /terminal/, 'Effect resolution does not resolve worker ownership');
+    }
+    const claim = db.claim(a.claimId);
+    if (released) await db.releaseClaim(executor, { evidence: 'Earlier owner release without terminal evidence' }, host);
+    const input = { claimId: claim.id, confirmStopped: true, evidence: 'Exact unbound worker and owner inspected and stopped', dryRun: false };
+    const resolve = (key: string, confirmStopped = true) => db.resolveClaimByPerson(claim.id, input.evidence, person,
+      { requestKey: key, operation: 'claim.resolve', caller: person, input: { ...input, confirmStopped }, fingerprint: canonicalJson({ ...input, confirmStopped }) });
+    await assert.rejects(resolve('no-confirmation', false), /process_confirmation_required/);
+    await assert.rejects(returnAttempt(db, discard, services), /terminal/);
+    await resolve('resolve-owner');
+    if (released) {
+      await assert.rejects(returnAttempt(db, discard, services), /unresolved effect/);
+      assert.equal(returned, false);
+      assert.equal(db.attempt(a.attemptId).leaseState, 'held');
+      await resolveEffect();
+    }
+    await resolve('resolve-owner');
+    await resolve('recheck-owner');
+    const terminal = db.events().filter(e => e.attemptId === a.attemptId && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0]!.payload.workerRef, null, 'Recovery must not invent a bound reference');
+    assert.deepEqual(terminal[0]!.payload.payload, { personConfirmedStopped: true, evidence: input.evidence,
+      scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef, commandRequestKey: 'resolve-owner' } });
+    const [held] = await db.registerClaims([{ resourceKey: `worker:${a.attemptId}`, role: 'worker_owner', attemptId: a.attemptId,
+      generation: host.generation, ownerRef: host, schemaFamily: applicationId, schemaVersion: 1, configRevision: 1,
+      heartbeatAt: new Date().toISOString() }], host);
+    await assert.rejects(returnAttempt(db, discard, services), /claim is unresolved/);
+    assert.equal(returned, false);
+    await db.releaseClaim({ claimId: held!.id, generation: held!.generation }, { evidence: 'Exact owner stopped' }, host);
+    await returnAttempt(db, discard, services);
+    assert.equal(returned, true);
+    assert.equal(db.attempt(a.attemptId).leaseState, 'returned');
+    assert.equal(db.attempt(a.attemptId).outcome, 'failed');
+    assert.equal(db.task('task').state, 'queued');
+    assert.equal(db.task('task').holdReason, 'discarded');
+  }
+});
 
 for (const proven of [true, false]) test(`R20/A40: failed preparation records zero only with never-started proof (${proven})`, async t => {
   const { db, started } = await fixture(t);

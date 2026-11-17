@@ -8,6 +8,18 @@ import { Database, applicationId } from '../../src/storage/database.ts';
 import { parseConfiguration } from '../../src/configuration.ts';
 import { definition, fixture, snapshot } from '../helpers/cli-operations.ts';
 
+test('R07/R08/R27: storage policy refusals expose a bounded conflict reason in data and diagnostics', async t => {
+  const f = await fixture(t);
+  for (const taskId of ['missing-task', 'x'.repeat(2000)]) {
+    const refused = f.invoke('task.show', { taskId });
+    const reason = `Unknown task: ${taskId}`.slice(0, 1024);
+    assert.equal(refused.envelope.code, 'policy_refused');
+    assert.equal(refused.data.reason, reason);
+    assert.equal(refused.envelope.diagnostics[0].message, reason);
+    assert.ok(refused.data.reason.length <= 1024);
+  }
+});
+
 test('R29/R04/R27: unknown profiles refuse definitions, automatic dispatch reports skips and status explains the repair', async t => {
   const f = await fixture(t);
   assert.equal(f.invoke('task.add', { id: 'removed', definition: { ...definition, profile: 'worker' }, objectiveId: null }).status, 0);

@@ -109,7 +109,10 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
   if (/unresolved|Interrupted effect/iu.test(message)) throw new CommandFailure('effect_uncertain', data);
   if (/retained|output changed/iu.test(message)) throw new CommandFailure('not_retained', data);
   if (/candidate/iu.test(message)) throw new CommandFailure('candidate_missing', data);
-  throw new CommandFailure('policy_refused', data);
+  const reason = message.slice(0, 1024);
+  const failure = new CommandFailure('policy_refused', { ...data, reason });
+  failure.diagnostic = reason;
+  throw failure;
 }
 
 export async function executeCoreOperation(operation: OperationDefinition, args: Record<string, unknown>, progress: (message: string) => void,
@@ -378,7 +381,6 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           }
         }
         const needsTerminal = claim.role === 'worker_owner' && claim.attemptId !== undefined
-          && db.requests().some(r => r.attemptId === claim.attemptId && r.operation === 'worker.prepare' && r.result?.reference)
           && !db.events().some(e => e.attemptId === claim.attemptId && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
         const plan = { steps: claim.releasedAt && !needsTerminal ? [] : [step('claim.resolve', claim.id, ['person', 'stopped_owner', 'scoped_evidence'])], scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef } };
         if (args.dryRun) return plan;

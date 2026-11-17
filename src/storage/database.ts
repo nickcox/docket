@@ -2771,6 +2771,10 @@ export class Database {
       if (!storedRow) throw new StorageError('conflict', 'Missing completion authorisation');
       const stored = this.decodeEvent(storedRow), attemptId = stored.attemptId!, attempt = this.completionGuard(attemptId);
       this.requestAuthority(this.decodeRequest(this.requestRow(stored.requestId!)));
+      if (operation === 'return' && attempt.runtime_ref === null && this.db.prepare(`SELECT 1 FROM claims WHERE attempt_id = ?
+        AND role = 'worker_owner' AND released_at IS NULL LIMIT 1`).get(attemptId)) {
+        throw new StorageError('conflict', 'Worker owner claim is unresolved');
+      }
       if (operation === 'integrate') this.checkIntegrationAuthority(stored.actor as TaskActor, attemptId);
       const rebasing = ['pin', 'rebase', 'move', 'attach'].includes(operation);
       const suffix = rebasing || operation === 'diagnostics' ? `:${stored.id}` : operation === 'integrate' ? `:${String(object(stored.payload.candidate).id)}` : '';
@@ -3084,17 +3088,20 @@ export class Database {
       attemptId, taskId: String(attempt.task_id), requestId: request.id, payload: observation });
   }
 
-  /** Recovery confirms only this bound worker, without inventing launcher observations (R07/R08). */
+  /** Recovery confirms this claim's worker, bound or not, without inventing launcher observations (R07/R08). */
   private recordPersonConfirmedStopInTransaction(claim: Claim, evidence: string, caller: TaskActor, command: CommandInput): void {
     const attemptId = claim.attemptId!, attempt = this.attemptRow(attemptId);
-    if (attempt.runtime_ref === null || this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
+    if (this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed'
       AND json_extract(payload, '$.kind') = 'terminal' LIMIT 1`).get(attemptId)) return;
-    const observation: WorkerObservation = { sourceId: `claim.resolve:${json([claim.id, command.requestKey])}`,
-      sourceSequence: 0, attemptId, workerRef: object(JSON.parse(String(attempt.runtime_ref))) as WorkerReference,
-      observedAt: new Date().toISOString(), kind: 'terminal', payloadVersion: 1,
+    // An unbound worker has no launcher reference. Only this person-only recovery
+    // path may record terminal evidence without one, scoped to its exact owner claim.
+    const observation = { sourceId: `claim.resolve:${json([claim.id, command.requestKey])}`,
+      sourceSequence: 0, attemptId, workerRef: attempt.runtime_ref === null ? null
+        : object(JSON.parse(String(attempt.runtime_ref))) as WorkerReference,
+      observedAt: new Date().toISOString(), kind: 'terminal' as const, payloadVersion: 1 as const,
       payload: { personConfirmedStopped: true, evidence,
         scope: { claimId: claim.id, generation: claim.generation, ownerRef: claim.ownerRef, commandRequestKey: command.requestKey } } };
-    workerObservation(observation);
+    if (observation.workerRef !== null) workerObservation({ ...observation, workerRef: observation.workerRef });
     this.insertEvent({ sourceKey: `worker.observation:${json([attemptId, observation.sourceId, 0])}`, kind: 'worker.observed',
       payloadVersion: 1, correlationId: attemptId, actor: object(caller), occurredAt: observation.observedAt,
       attemptId, taskId: String(attempt.task_id), payload: observation });
