@@ -62,22 +62,23 @@ function checkResolutionAction(checkRequestId: string) {
     'If this run was interrupted, a person must confirm its owner has stopped before resolving this exact request.');
 }
 function attemptView(db: Database, id: string) {
-  const interruptedCheck = db.requests().find(r => r.attemptId === id && r.operation === 'checks.run'
+  const requests = db.requests({ attemptId: id });
+  const interruptedCheck = requests.find(r => r.operation === 'checks.run'
     && ['claimed', 'uncertain'].includes(r.state));
-  const attempt = db.attempt(id), preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
-  const stateDirectory = String(db.events().find(event => event.sourceKey === 'database.initialised')!.payload.stateDirectory);
-  const diagnostics = workerDiagnostics(stateDirectory, db.requests().filter(r => r.attemptId === id && r.operation === 'worker.prepare'));
+  const attempt = db.attempt(id), preparation = requests.find(r => r.operation === 'worker.prepare');
+  const stateDirectory = String(db.events({ sourceKey: 'database.initialised' })[0]!.payload.stateDirectory);
+  const diagnostics = workerDiagnostics(stateDirectory, requests.filter(r => r.operation === 'worker.prepare'));
   return { ...attempt, sessionTranscriptPath: diagnostics?.transcript ?? null, identity: { databaseId: attempt.specification.databaseId, contextId: attempt.specification.contextId,
     taskId: attempt.taskId, attemptId: id, leaseId: attempt.allocation?.leaseId ?? null, sessionId: preparation?.input.sessionId ?? null },
     workerRef: preparation?.result?.reference ?? null, result: db.validatedWorkerResult(id),
     resultInvalid: db.invalidWorkerResult(id),
     nextAction: interruptedCheck ? checkResolutionAction(interruptedCheck.id) : db.invalidWorkerResult(id) ? invalidResultAction(id) : null,
-    terminalEvidence: db.events().filter(e => e.attemptId === id && e.kind === 'worker.observed' && e.payload.kind === 'terminal'),
-    taskTransitionApplied: db.events().some(e => e.attemptId === id && e.kind === 'acceptance.finished'),
+    terminalEvidence: db.events({ attemptId: id, kinds: ['worker.observed'] }).filter(e => e.payload.kind === 'terminal'),
+    taskTransitionApplied: db.events({ attemptId: id, kinds: ['acceptance.finished'] }).length > 0,
     acceptance: attempt.candidate ? db.acceptance(id, String(attempt.candidate.id)) : null,
     review: db.reviewEvidence(id),
-    checks: db.requests().filter(r => r.attemptId === id && r.operation === 'checks.run'),
-    effects: db.requests().filter(r => r.attemptId === id && r.category === 'effect') };
+    checks: requests.filter(r => r.operation === 'checks.run'),
+    effects: requests.filter(r => r.category === 'effect') };
 }
 function mapStorage(error: unknown, db: Database, requestKey: string): never {
   const request = db.requests().find(r => r.requestKey === requestKey);
@@ -191,9 +192,10 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
       case 'diagnostics.clean': return await cleanDiagnostics(db, args as unknown as Parameters<typeof cleanDiagnostics>[1], caller, requestKey);
       case 'profile.clear': return await db.clearProfile(String(args.profile), caller, Boolean(args.dryRun));
       case 'status.show': {
-        const attempts = db.events().filter(e => e.kind === 'attempt.reserved').map(e => db.attempt(e.attemptId!)).filter(a => visibleTask(db.task(a.taskId)));
+        const readyIds = new Set(db.readyTasks().map(t => t.id));
+        const attempts = db.events({ kinds: ['attempt.reserved'] }).map(e => db.attempt(e.attemptId!)).filter(a => visibleTask(db.task(a.taskId)));
         const tasks = db.tasks().filter(visibleTask).map(t => {
-          const ready = db.readyTasks().some(task => task.id === t.id);
+          const ready = readyIds.has(t.id);
           const problem = t.state === 'queued' ? unknownProfile(context.configuration.resolved, t.profile) : null;
           return { id: t.id, title: t.title, state: t.state, ready, holdReason: t.holdReason, blockedBy: t.blockerIds,
             reason: problem?.reason ?? t.holdReason ?? (ready ? 'Task is ready to dispatch.' : null),
@@ -201,16 +203,24 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
               : t.holdReason !== null ? action('task.show', { taskId: t.id }, 'Inspect the task hold before deciding how to proceed.')
               : ready ? action('attempt.dispatch', { taskId: t.id, profile: null, dryRun: true }, 'Plan dispatch of the ready task.') : null };
         }).filter(t => !args.attentionOnly || t.reason !== null);
-        const requests = db.requests().filter(r => caller.kind !== 'supervisor' || (r.attemptId ? visibleTask(db.task(db.attempt(r.attemptId).taskId)) : r.objectiveId === caller.objectiveId));
+        const requests = db.statusRequests().filter(r => caller.kind !== 'supervisor' || (r.attemptId ? visibleTask(db.task(db.attempt(r.attemptId).taskId)) : r.objectiveId === caller.objectiveId));
+        const requestsByAttempt = new Map<string, typeof requests>();
+        for (const request of requests) {
+          if (!request.attemptId) continue;
+          const group = requestsByAttempt.get(request.attemptId) ?? [];
+          group.push(request);
+          requestsByAttempt.set(request.attemptId, group);
+        }
         const attentionAttempts = (await Promise.all(attempts.map(async a => {
-          const checks = requests.filter(r => r.attemptId === a.id && r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
-          const interruptedCheck = requests.find(r => r.attemptId === a.id && r.operation === 'checks.run'
+          const attemptRequests = requestsByAttempt.get(a.id) ?? [];
+          const checks = attemptRequests.filter(r => r.operation === 'checks.run' && r.input.commit === a.candidate?.commit).at(-1);
+          const interruptedCheck = attemptRequests.find(r => r.operation === 'checks.run'
             && ['claimed', 'uncertain'].includes(r.state));
           const checksState = checks?.state === 'withdrawn' ? 'interrupted' : String(checks?.result?.status ?? checks?.state ?? 'missing');
           const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
           const resolved = a.leaseState === 'returned' || db.task(a.taskId).state === 'done'
-            || db.events().some(e => e.attemptId === a.id && e.kind === 'return.authorised' && e.payload.discard);
-          const currentReturnReason = a.allocation && a.leaseState !== 'returned'
+            || db.events({ attemptId: a.id, kinds: ['return.authorised'] }).some(e => e.payload.discard);
+          const currentReturnReason = a.allocation && !resolved
             ? await leaseReturnReason(db, a.id, caller, (await services()).completion) : null;
           const returnReason = currentReturnReason === 'Lease is ready to return.' && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;

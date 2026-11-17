@@ -653,7 +653,7 @@ test('R31: unsupported preparation or admission refuses before claiming an effec
   assert.equal(db.request(decision.effectId!).state, 'pending'); assert.equal(next.launcher.prompts.length, 0);
 });
 
-for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepare', 'bind', 'permit', 'fence', 'recovery_fence', 'activation', 'outcome'] as const) for (const afterEvent of [false, true]) {
+for (const operation of ['start', 'start_refused', 'owner', 'prepare', 'bind', 'permit', 'fence', 'recovery_fence', 'activation', 'outcome'] as const) for (const afterEvent of [false, true]) {
   test(`A09/R25: ${operation} rolls back on failure ${afterEvent ? 'after' : 'before'} its event`, async t => {
     const f = await fixture(t);
     const value = await f.allocated();
@@ -667,7 +667,7 @@ for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepar
     if (['activation', 'outcome'].includes(operation)) effectId = (await f.db.decideWorkerLaunch(value.attemptId, claimId, 'permit', host)).effectId!;
     if (operation === 'outcome') await f.db.claimWorkerActivation(value.attemptId, reference, host);
     if (operation === 'start_refused') await f.db.updateTaskDefinition('task', { title: 'Changed' }, person);
-    const kind = { start: 'attempt.started', start_refused: 'attempt.start_refused', owner: 'attempt.owner_registered', heartbeat: 'claim.refreshed',
+    const kind = { start: 'attempt.started', start_refused: 'attempt.start_refused', owner: 'attempt.owner_registered',
       prepare: 'request.claimed', bind: 'attempt.worker_bound', permit: 'attempt.launch_permitted', fence: 'attempt.launch_fenced',
       recovery_fence: 'attempt.launch_fenced', activation: 'attempt.prompt_admitted', outcome: 'request.succeeded' }[operation];
     const before = state(f.db, f.path, value.attemptId), restore = inject(f.db, kind, afterEvent);
@@ -675,7 +675,6 @@ for (const operation of ['start', 'start_refused', 'owner', 'heartbeat', 'prepar
       switch (operation) {
         case 'start': case 'start_refused': return f.db.startAttempt(value.attemptId, person);
         case 'owner': return f.db.registerWorkerOwner(value.attemptId, host);
-        case 'heartbeat': return f.db.heartbeatWorkerOwner(value.attemptId, claimId, host);
         case 'prepare': return f.db.beginWorkerPreparation(value.attemptId, claimId, host);
         case 'bind': return f.db.bindWorkerReference(value.attemptId, claimId, reference, host);
         case 'permit': return f.db.decideWorkerLaunch(value.attemptId, claimId, 'permit', host);

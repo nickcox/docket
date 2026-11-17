@@ -46,6 +46,39 @@ function snapshot(db: Database) {
   return { claims: db.claims(), requests: db.requests(), events: db.events() };
 }
 
+test('R08/A16/A17: refresh stores the heartbeat without events and staleness uses the claims row', async t => {
+  const { db } = await fixture(t);
+  const [claim] = await db.registerClaims([claimInput()], actor);
+  const before = db.events();
+  const now = Date.now();
+  await db.refreshClaim(identity(claim!), new Date(now).toISOString(), actor);
+  assert.equal(db.claims()[0]!.heartbeatAt, new Date(now).toISOString());
+  assert.deepEqual(db.events(), before);
+  assert.deepEqual(db.notificationPage(before.at(-1)!.seq), []);
+  assert.deepEqual(db.admissionBlockers(now + 29999), []);
+  assert.equal(db.admissionBlockers(now + 30000)[0]!.kind, 'claim');
+  assert.equal(db.admissionBlockers(now - 1)[0]!.kind, 'claim');
+  await assert.rejects(db.refreshClaim({ claimId: claim!.id, generation: 'wrong' }, new Date(now).toISOString(), actor));
+  assert.deepEqual(db.events(), before);
+});
+
+test('R08/R25/A09: a heartbeat update rolls back if the transaction fails after the row change', async t => {
+  const { db, path, options } = await fixture(t);
+  const [claim] = await db.registerClaims([claimInput()], actor);
+  const before = snapshot(db);
+  const internals = db as unknown as { changed(result: { changes: number | bigint }): void };
+  const original = internals.changed;
+  internals.changed = function (result) {
+    original.call(db, result);
+    throw new Error('injected heartbeat transaction failure');
+  };
+  try {
+    await assert.rejects(db.refreshClaim(identity(claim!), new Date(0).toISOString(), actor), /heartbeat transaction failure/);
+  } finally { internals.changed = original; }
+  using reopened = await Database.open(path, options);
+  assert.deepEqual(snapshot(reopened), before);
+});
+
 test('R09/R27: request.show uses the public key and returns bounded, redacted immutable evidence without writes', async t => {
   const { db } = await fixture(t);
   const { effect, parent, claim } = await effectFixture(db);
@@ -329,7 +362,6 @@ test('A09/A10/R25: failure after the last resource event rolls back the whole cl
 test('A09/A10/R25: every new transaction rolls back state and event on injected failure before and after insertion', async t => {
   const changes: [string, (db: Database, claim: Claim, input: EffectInput) => Promise<unknown>, boolean?][] = [
     ['registerClaims', db => db.registerClaims([claimInput('z'), claimInput('a')], actor)],
-    ['refreshClaim', (db, claim) => db.refreshClaim(identity(claim), new Date().toISOString(), actor)],
     ['releaseClaim', (db, claim) => db.releaseClaim(identity(claim), { terminal: true }, actor)],
     ['recordCommand', db => db.recordCommand(command('new-command'))],
     ['recordEffect', (db, _claim, input) => db.recordEffect({ ...input, requestKey: 'new-effect' })],

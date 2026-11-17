@@ -25,7 +25,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   });
   const continuationInput = args.sourceAttemptId ? { sourceAttemptId: args.sourceAttemptId, sourceCommit: args.sourceCommit ?? null,
     ...(args.note == null ? {} : { note: args.note }) } : {};
-  const previous = db.requests().find(r => r.requestKey === requestKey);
+  const previous = db.requests({ requestKey })[0];
   // A replay never starts another owner or resumes an interrupted remote call.
   if (previous) {
     const replay = await db.reserveAttempt({ requestKey, caller, ...continuationInput, ...(args.taskId === null ? {} : { taskId: args.taskId }),
@@ -37,7 +37,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     return { attempt: replay.attempt, leaseReturn, replayed: true, skippedTasks: replay.skippedTasks, steps: [] };
   }
   const config = db.checkConfiguration();
-  const configured = db.events().findLast(e => e.kind === 'context.configured')!.payload.resolved as JsonObject;
+  const configured = db.events({ kinds: ['context.configured'] }).at(-1)!.payload.resolved as JsonObject;
   const inherited = args.sourceAttemptId ? await continuationEvidence(db, args.sourceAttemptId, args.taskId!, runtime, args.sourceCommit ?? null) : null;
   const starting = inherited ? { state: 'present' as const, commit: inherited.startingCommit }
     : known(await runtime.repository.inspectRef(`refs/heads/${String(configured.baseBranch).replace(/^refs\/heads\//u, '')}`));
@@ -103,7 +103,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
   };
   const observeUsage = async () => {
     if (!reference) return;
-    const session = db.events().find(e => e.kind === 'session.registered' && e.attemptId === id);
+    const session = db.events({ attemptId: id, kinds: ['session.registered'] })[0];
     if (!session) return;
     // Usage reads are best effort. Clock and deadline enforcement never depends on them.
     let usage: Awaited<ReturnType<typeof runtime.launcher.usage>>;
@@ -251,7 +251,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     await deliverAnswers(db, id, reference, host, runtime.launcher);
     stoppedAt ??= Date.now();
     // Record elapsed worker time even if the provider usage call is still unavailable.
-    const session = db.events().find(e => e.kind === 'session.registered' && e.attemptId === id)!;
+    const session = db.events({ attemptId: id, kinds: ['session.registered'] })[0]!;
     await db.recordUsage({ sessionId: String(session.payload.sessionId), sourceSequence: ++usageSequence, observedAt: new Date().toISOString(),
       ...lastUsage,
       workerTimeMs: { availability: 'reported', value: Math.max(0, stoppedAt - Date.parse(String(session.payload.registeredAt))) } }, host);
@@ -296,7 +296,7 @@ export async function dispatch(db: Database, args: { taskId: string | null; prof
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
     // A failed preparation can still own a non-acting child. Stop it using its
     // exact returned hints, but preserve the uncertain preparation for inspection.
-    const preparation = db.requests().find(r => r.attemptId === id && r.operation === 'worker.prepare');
+    const preparation = db.requests({ attemptId: id, operation: 'worker.prepare' })[0];
     reference ??= preparation?.result?.referenceHints as WorkerReference | undefined;
     if (reference && !terminal) {
       const owner = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner' && !c.releasedAt);

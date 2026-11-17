@@ -25,15 +25,15 @@ export async function continuationEvidence(db: Database, sourceId: string, taskI
 
 export function continuationHandover(db: Database, sourceId: string, startingCommit: string, chosen: boolean, note: string | null): JsonObject {
   const source = db.attempt(sourceId);
-  const preparation = db.requests().find(r => r.attemptId === sourceId && r.operation === 'worker.prepare');
+  const preparation = db.requests({ attemptId: sourceId, operation: 'worker.prepare' })[0];
   const handover: JsonObject = {
     identity: { databaseId: source.specification.databaseId!, contextId: source.specification.contextId!, taskId: source.taskId,
       attemptId: source.id, leaseId: source.allocation?.leaseId ?? null, sessionId: preparation?.input.sessionId ?? null },
     sourceRevision: source.revision, candidate: source.candidate, startingCommit, personChoseCommit: chosen, outcome: source.outcome,
     failure: db.validatedWorkerResult(sourceId)?.content.reason
-      ?? db.events().findLast(e => e.attemptId === sourceId && e.kind === 'attempt.completed')?.payload ?? null,
+      ?? db.events({ attemptId: sourceId, kinds: ['attempt.completed'] }).at(-1)?.payload ?? null,
     criteria: source.specification.criteria!,
-    checks: db.requests().filter(r => r.attemptId === sourceId && r.operation === 'checks.run').map(r => ({ requestId: r.id, state: r.state, result: r.result })),
+    checks: db.requests({ attemptId: sourceId, operation: 'checks.run' }).map(r => ({ requestId: r.id, state: r.state, result: r.result })),
     reviewFindings: db.reviewEvidence(sourceId).findings.map(event => event.payload),
     openQuestions: db.questions().filter(q => q.scope.taskId === source.taskId && !q.answer),
     answeredQuestions: db.questions().filter(q => q.scope.taskId === source.taskId && q.answer !== null), note };

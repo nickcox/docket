@@ -89,13 +89,13 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
   const bb = new BbLauncher({ repository: config.repository, profiles: profiles.bb ?? {}, admission: effectId => db.request(effectId).state === 'claimed'
       || db.request(effectId).state === 'succeeded',
     observe: async (reference, events) => {
-      const preparation = db.requests().find(r => r.operation === 'worker.prepare' && r.result?.reference
+      const preparation = db.requests({ operation: 'worker.prepare' }).find(r => r.result?.reference
         && canonicalJson(r.result.reference) === canonicalJson(reference));
       if (!preparation?.attemptId) return;
       const attemptId = preparation.attemptId;
       const claim = db.claims().find(c => c.attemptId === attemptId && c.role === 'worker_owner');
       if (!claim) return;
-      const history = db.events();
+      const history = db.events({ attemptId, kinds: ['worker.observed'] });
       const terminalIndex = history.findIndex(e => e.attemptId === attemptId && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
       const boundary = Math.max(-1, ...history.slice(0, terminalIndex).filter(e => e.attemptId === attemptId
         && e.kind === 'worker.observed' && e.payload.sourceId === `bb:${reference.threadId}`).map(e => Number(e.payload.sourceSequence)));
@@ -120,7 +120,7 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
     usage: ref => select(ref).usage(ref), result: ref => select(ref).result(ref),
   };
   Object.assign(repository, { inspectWorkerOutput: async (attemptId: string) => {
-    const preparation = db.requests().find(r => r.attemptId === attemptId && r.operation === 'worker.prepare');
+    const preparation = db.requests({ attemptId, operation: 'worker.prepare' })[0];
     const reference = preparation?.result?.reference as import('./storage/launch.ts').WorkerReference | undefined;
     if (reference?.launcher !== 'bb') return true;
     return (await bb.inspect(reference)).status === 'known';

@@ -51,7 +51,7 @@ export async function retainedOutput(db: Database, attemptId: string, services: 
   if (attempt.allocation && attempt.leaseState !== 'returned'
     && known(await services.repository.identity(attempt.allocation.path)) !== repository) refuse('Allocation belongs to a different repository');
   const recorded = db.validatedWorkerResult(attemptId);
-  if (!recorded && db.events().some(e => e.attemptId === attemptId && e.kind === 'attempt.completed' && ['provider_limit', 'model_error'].includes(String(e.payload.failureKind)))) {
+  if (!recorded && db.events({ attemptId, kinds: ['attempt.completed'] }).some(e => ['provider_limit', 'model_error'].includes(String(e.payload.failureKind)))) {
     const ref = String(attempt.specification.outputRef);
     const output = known(await services.repository.inspectRef(ref));
     if (output.state !== 'present') refuse('Failed worker output reference is missing');
@@ -264,18 +264,18 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
   taskActor(input.caller);
   db.checkAuthority(input.caller, input.discard ? 'attempt.discard' : 'attempt.return', JSON.parse(JSON.stringify(input)) as JsonObject);
   const attempt = db.attempt(input.attemptId), allocation = attempt.allocation;
-  if (!allocation || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) throw new StorageError('conflict', 'Return requires a stopped terminal worker and allocation');
+  if (!allocation || !db.events({ attemptId: attempt.id, kinds: ['worker.observed'] }).some(e => e.payload.kind === 'terminal')) throw new StorageError('conflict', 'Return requires a stopped terminal worker and allocation');
   if (input.discard && (input.discard.leaseId !== allocation.leaseId || input.discard.confirmed !== true || !input.discard.reason.trim())) refuse('Person discard confirmations must name the exact lease');
-  if (!input.discard && !db.events().some(e => e.attemptId === attempt.id && e.kind === 'return.authorised' && e.payload.discard)) {
+  if (!input.discard && !db.events({ attemptId: attempt.id, kinds: ['return.authorised'] }).some(e => e.payload.discard)) {
     db.requireNoLaterTurnDiscrepancy(attempt.id);
   }
   if (attempt.leaseState === 'returned') return { steps: [] };
-  const bound = db.requests().some(r => r.attemptId === attempt.id && r.operation === 'worker.prepare' && r.result?.reference);
+  const bound = db.requests({ attemptId: attempt.id, operation: 'worker.prepare' }).some(r => r.result?.reference);
   if (!bound && db.claims().some(c => c.attemptId === attempt.id && c.role === 'worker_owner' && !c.releasedAt)) refuse('Worker owner claim is unresolved');
   if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
-  const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
-  const authorisation = db.events().find(e => e.sourceKey === `return.authorised:${attempt.id}`);
-  const previous = db.requests().find(r => r.requestKey === `return:${attempt.id}`);
+  const unresolved = db.requests({ attemptId: attempt.id }).find(r => (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
+  const authorisation = db.events({ sourceKey: `return.authorised:${attempt.id}` })[0];
+  const previous = db.requests({ requestKey: `return:${attempt.id}` })[0];
   if (unresolved && unresolved.id !== previous?.id) refuse('Attempt has an unresolved effect');
   if (previous && ['claimed', 'uncertain', 'succeeded'].includes(previous.state)) {
     if (known(await services.workspace.inspect(allocation)).state !== 'absent') refuse('Interrupted effect remains unresolved; it will not be repeated');
@@ -362,7 +362,7 @@ async function cleanupOutput(db: Database, authorisation: StoredEvent, services:
   const plan = accepted?.payload.plan as FinalisationPlan | undefined;
   const integrated = plan?.kind === 'local-merge' && db.requests().some(request => request.requestKey === `integrate:${attemptId}:${String(candidate.id)}` && request.state === 'succeeded');
   if (!authorisation.payload.discard && !integrated) return;
-  const pins = db.events().filter(e => e.attemptId === attemptId && e.kind === 'output.rebased');
+  const pins = db.events({ attemptId, kinds: ['output.rebased'] });
   const references = [{ operation: 'cleanup' as const, ref: String(candidate.outputRef), commit: String(candidate.commit) },
     ...(pins.length ? [{ operation: 'cleanup-pin' as const, ref: String(pins[0]!.payload.pinnedRef), commit: String(pins[0]!.payload.pinnedCommit) }] : [])];
   for (const { operation, ref, commit } of references) {

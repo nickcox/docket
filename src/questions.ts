@@ -7,15 +7,15 @@ import { canonicalJson } from './configuration.ts';
 import { CommandFailure } from './response.ts';
 
 export async function consumeQuestionFiles(db: Database, attemptId: string): Promise<void> {
-  const preparation = db.requests().find(r => r.attemptId === attemptId && r.operation === 'worker.prepare');
+  const preparation = db.requests({ attemptId, operation: 'worker.prepare' })[0];
   if (!preparation || typeof preparation.input.resultPath !== 'string') return;
   const reference = preparation.result?.reference as WorkerReference | undefined;
   if (reference?.launcher !== 'pi') return;
   const prefix = `question.file:${attemptId}:`;
-  const consumed = new Set(db.events().filter(e => e.sourceKey.startsWith(prefix)).map(e => e.sourceKey.slice(prefix.length)));
+  const consumed = new Set(db.events({ attemptId, kinds: ['question.asked', 'question.invalid'] }).filter(e => e.sourceKey.startsWith(prefix)).map(e => e.sourceKey.slice(prefix.length)));
   for (const file of await questionFiles(preparation.input.resultPath, consumed)) {
     const sourceKey = `${prefix}${file.name}`;
-    if (db.events().some(e => e.sourceKey === sourceKey)) continue;
+    if (db.events({ sourceKey }).length > 0) continue;
     try { if (file.invalid) throw new TypeError('Invalid file'); questionInput(file.value); }
     catch { await db.questionDiagnostic(attemptId, sourceKey); continue; }
     await db.askQuestion(file.value, { kind: 'worker', attemptId }, sourceKey);
@@ -27,7 +27,7 @@ export async function deliverAnswers(db: Database, attemptId: string, reference:
   const owner = db.claims().find(c => c.attemptId === attemptId && c.role === 'worker_owner' && !c.releasedAt);
   if (!owner || canonicalJson(owner.ownerRef) !== canonicalJson(host)) throw new CommandFailure('owner_unresolved');
   const executor = { claimId: owner.id, generation: host.generation };
-  for (const effect of db.requests().filter(r => r.attemptId === attemptId && r.operation.startsWith('question.deliver.'))) {
+  for (const effect of db.requests({ attemptId }).filter(r => r.operation.startsWith('question.deliver.'))) {
     if (effect.state !== 'pending') continue;
     const observation = await launcher.inspect(reference);
     if (observation.status !== 'known') continue;

@@ -25,7 +25,7 @@ export async function observeWorker(db: Database, observation: WorkerObservation
   if (observation.kind === 'result_available') await db.validateWorkerResult(observation.attemptId, host, repository);
   // Turn-end and idle are not completion evidence. They may reconcile facts already recorded.
   if (db.validatedWorkerResult(observation.attemptId) || observation.kind === 'terminal'
-    && db.events().some(event => event.attemptId === observation.attemptId && event.kind === 'worker.observed' && event.payload.kind === 'result_available')) {
+    && db.events({ attemptId: observation.attemptId, kinds: ['worker.observed'] }).some(event => event.payload.kind === 'result_available')) {
     const attempt = await db.completeWorker(observation.attemptId, host, repository);
     if (attempt.candidate && checks) {
       await runCandidateChecks(db, attempt.id, checks.caller, checks.services);
@@ -47,11 +47,11 @@ export async function controlWorker(db: Database, attemptId: string, reference: 
   const owner = db.claims().find(c => c.attemptId === attemptId && c.role === 'worker_owner' && !c.releasedAt);
   if (!owner || canonicalJson(owner.ownerRef) !== canonicalJson(host)) throw new CommandFailure('owner_unresolved');
   const executor = { claimId: owner.id, generation: host.generation };
-  for (const command of db.requests().filter(r => r.category === 'command' && r.attemptId === attemptId
+  for (const command of db.requests({ attemptId }).filter(r => r.category === 'command'
     && ['attempt.stop', 'attempt.steer'].includes(r.operation))) {
     const stop = command.operation === 'attempt.stop';
     const operation = stop ? 'worker.stop' : 'worker.deliver';
-    const existing = db.requests().find(r => r.parentId === command.id && r.operation === operation);
+    const existing = db.requests({ parentId: command.id, operation })[0];
     if (existing) {
       if (existing.state === 'succeeded' || existing.state === 'rejected') continue;
       throw new CommandFailure('effect_uncertain', { effectId: existing.id });
@@ -121,7 +121,7 @@ export async function prepareWorker(db: Database, attemptId: string, host: Worke
 /** bb re-evaluates the queue once; only the hook may claim its activation effect. */
 async function activateBbWorker(db: Database, attemptId: string, reference: WorkerReference,
   host: WorkerHost, launcher: Launcher): Promise<StoredRequest | null> {
-  if (db.requests().some(r => r.attemptId === attemptId && r.operation === 'worker.recheck')) return null;
+  if (db.requests({ attemptId, operation: 'worker.recheck' }).length > 0) return null;
   const activation = db.pendingBbActivation(attemptId, reference, host);
   if (!activation) return null;
   const executor = { claimId: activation.claimId!, generation: host.generation };

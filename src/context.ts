@@ -194,9 +194,8 @@ export async function openContext(selector: ContextSelector, options: ContextOpt
   const database = await Database.open(config.databasePath, { readOnly: options.readOnly ?? true,
     location: { retainedRoot: dirname(config.databasePath), recyclableRoots: options.recyclableRoots ?? [] } });
   try {
-    const events = database.events();
-    const genesis = events.find(event => event.kind === 'database.initialised');
-    const recorded = events.findLast(event => event.kind === 'context.configured');
+    const genesis = database.events({ sourceKey: 'database.initialised' })[0];
+    const recorded = database.events({ kinds: ['context.configured'] }).at(-1);
     const currentRevision = options.expectedRevision ?? Number(recorded?.payload.revision);
     if (!recorded || recorded.payloadVersion !== 1 || recorded.payload.digest !== configuration.digest || recorded.payload.revision !== currentRevision) {
       throw new ContextError('config_changed', 'Configuration differs from the latest context.configured event', {

@@ -613,7 +613,7 @@ export class Database {
 
   questions(): Question[] {
     return this.snapshot(() => {
-      const events = this.events();
+      const events = this.events({ kinds: ['question.asked', 'question.answered'] });
       const answers = new Map(events.filter(e => e.kind === 'question.answered').map(e => [e.payload.questionId, e.payload]));
       return events.filter(e => e.kind === 'question.asked').map(e => ({ ...e.payload, answer: answers.get(e.payload.id) ?? null } as Question));
     });
@@ -625,7 +625,7 @@ export class Database {
     const value = structuredClone(input), actor = structuredClone(caller);
     return this.write(() => {
       if (command) this.duplicateRequest(command, 'command');
-      const previous = this.events().find(e => e.sourceKey === sourceKey);
+      const previous = this.events({ sourceKey })[0];
       if (previous) return this.questions().find(q => q.id === previous.payload.id)!;
       if (actor.kind !== 'worker' && actor.kind !== 'supervisor') throw new CommandFailure('person_required');
       if (actor.kind === 'supervisor') this.checkAuthority(actor, 'question.ask');
@@ -650,7 +650,7 @@ export class Database {
 
   async questionDiagnostic(attemptId: string, sourceKey: string): Promise<void> {
     await this.write(() => {
-      if (this.events().some(e => e.sourceKey === sourceKey)) return;
+      if (this.events({ sourceKey }).length) return;
       const attempt = this.attempt(attemptId);
       this.insertEvent({ sourceKey, kind: 'question.invalid', payloadVersion: 1, correlationId: attemptId,
         attemptId, taskId: attempt.taskId, actor: { kind: 'worker', attemptId }, occurredAt: new Date().toISOString(),
@@ -687,10 +687,10 @@ export class Database {
         ...(q.scope.objectiveId ? { objectiveId: q.scope.objectiveId } : {}) });
       if (q.scope.attemptId) {
         const attempt = this.attempt(q.scope.attemptId);
-        const preparation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.prepare');
+        const preparation = this.requests({ attemptId: attempt.id, operation: 'worker.prepare' })[0];
         const reference = preparation?.result?.reference as JsonObject | undefined;
         const owner = this.claims().find(c => c.attemptId === attempt.id && c.role === 'worker_owner' && !c.releasedAt);
-        const terminal = !attempt.executionOpen || this.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
+        const terminal = !attempt.executionOpen || this.events({ attemptId: attempt.id, kinds: ['worker.observed'] }).some(e => e.payload.kind === 'terminal');
         for (const channel of (reference?.launcher === 'pi' ? ['file', 'message'] : ['message'])) {
           const effectId = randomUUID();
           const input = { ...answer, question: { text: q.text, source: q.source }, resultPath: preparation?.input.resultPath ?? null };
@@ -736,7 +736,7 @@ export class Database {
     if (question?.answer) return [];
     return [...ids].map(objectiveId => {
       const row = this.db.prepare('SELECT state FROM objectives WHERE id = ?').get(objectiveId);
-      const registered = this.events().some(e => e.kind === 'session.registered' && e.payload.kind === 'supervisor' && e.payload.objectiveId === objectiveId);
+      const registered = this.events({ kinds: ['session.registered'] }).some(e => e.payload.kind === 'supervisor' && e.payload.objectiveId === objectiveId);
       const classification = question?.recipient.kind === 'person' ? 'intervention'
         : row && row.state !== 'open' ? 'clean-up' : !registered ? 'setup'
         : command.operation === 'attempt.return' ? 'clean-up' : 'intervention';
@@ -753,7 +753,7 @@ export class Database {
   }
 
   activeSupervisor() {
-    const events = this.events();
+    const events = this.events({ kinds: ['session.registered', 'supervisor.stopped', 'session.finished'] });
     return events.findLast(e => e.kind === 'session.registered' && e.payload.kind === 'supervisor'
       && !events.some(end => ['supervisor.stopped', 'session.finished'].includes(end.kind) && end.payload.sessionId === e.payload.sessionId)) ?? null;
   }
@@ -782,7 +782,7 @@ export class Database {
   async supervisorIntent(sessionId: string, key: string): Promise<boolean> {
     return this.write(() => {
       const sourceKey = `supervisor.intent:${sessionId}:${key}`;
-      if (this.events().some(e => e.sourceKey === sourceKey)) return false;
+      if (this.events({ sourceKey }).length) return false;
       const active = this.activeSupervisor();
       if (active?.payload.sessionId !== sessionId) throw new CommandFailure('owner_unresolved');
       this.insertEvent({ sourceKey, kind: 'supervisor.intent', payloadVersion: 1, notification: false,
@@ -798,7 +798,7 @@ export class Database {
 
   personActions(objectiveId: string) {
     return this.snapshot(() => {
-      const items: StoredEvent[] = this.events().filter(e => e.kind === 'person.action').flatMap(e => {
+      const items: StoredEvent[] = this.events({ kinds: ['person.action'] }).flatMap(e => {
         const scope = (e.payload.scopes as JsonObject[]).find(s => s.objectiveId === objectiveId);
         return scope ? [{ ...e, objectiveId, payload: { ...scope, operation: e.payload.operation!, requestKey: e.payload.requestKey! } }] : [];
       });
@@ -977,7 +977,7 @@ export class Database {
   }
 
   private usageEvents(): StoredEvent[] {
-    return this.db.prepare('SELECT * FROM events ORDER BY seq').all().map(row => this.decodeEvent(row));
+    return this.events({ kinds: ['session.registered', 'session.finished', 'usage.observed', 'objective.usage-confirmed', 'supervisor.stopped', 'worker.observed'] });
   }
 
   objectiveUsage(id: string) {
@@ -1956,7 +1956,7 @@ export class Database {
     return this.snapshot(() => {
       const attempt = this.attemptRow(attemptId);
       if (attempt.launch_state !== 'permitted' || this.workerStopRequested(attemptId)) return null;
-      const effect = this.requests().find(r => r.attemptId === attemptId && r.operation === 'worker.activate');
+      const effect = this.requests({ attemptId, operation: 'worker.activate' })[0];
       if (!effect || effect.state !== 'pending' || json(effect.target!.reference) !== json(reference)) return null;
       this.workerClaim(attemptId, String(attempt.owner_claim_id), host);
       this.checkWorkerEffectInTransaction(effect, { claimId: effect.claimId!, generation: host.generation });
@@ -1973,8 +1973,7 @@ export class Database {
       if (!rows.length) {
         // Thread creation can reach the hook before prepare returns its reference.
         // Only hold an exact pending first prompt; unrelated threads pass unchanged.
-        const pending = this.requests().some(r => r.operation === 'worker.prepare'
-          && ['pending', 'claimed', 'uncertain'].includes(r.state)
+        const pending = this.requests({ operation: 'worker.prepare' }).some(r => ['pending', 'claimed', 'uncertain'].includes(r.state)
           && this.attemptRow(r.attemptId!).runtime_ref === null
           && (r.input.specification as JsonObject)?.profile !== null
           && ((r.input.specification as JsonObject)?.profile as JsonObject)?.launcher === 'bb'
@@ -1987,7 +1986,7 @@ export class Database {
         || this.workerStopRequested(String(attempt.id)) || this.db.prepare(`SELECT 1 FROM events WHERE attempt_id = ?
           AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'terminal'`).get(String(attempt.id))) return { decision: 'refuse' };
       const reference = JSON.parse(String(attempt.runtime_ref)) as WorkerReference;
-      const preparation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.prepare');
+      const preparation = this.requests({ attemptId: String(attempt.id), operation: 'worker.prepare' })[0];
       // bb generates queue IDs and exposes no sender-chosen ID to the hook.
       // Keep correlation here so a future host identifier can replace exact content.
       // An identical copy arriving first consumes the send in its place: the worker
@@ -1997,7 +1996,7 @@ export class Database {
       if (attempt.launch_state === 'pending') {
         return { decision: queued.length === 1 && matches(queued[0]!, preparation?.input.initialInput) ? 'hold' : 'refuse' };
       }
-      const activation = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.activate');
+      const activation = this.requests({ attemptId: String(attempt.id), operation: 'worker.activate' })[0];
       const claim = this.claims().find(c => c.id === attempt.owner_claim_id && !c.releasedAt);
       if (!claim || !activation) return { decision: 'refuse' };
       const owner = claim.ownerRef as WorkerHost;
@@ -2008,10 +2007,9 @@ export class Database {
           initial = true;
           continue;
         }
-        const delivery = this.requests().find(r => r.attemptId === attempt.id && r.operation === 'worker.deliver'
-          && r.state === 'claimed' && matches(member, r.input.message) && json(r.target?.reference) === json(reference)
+        const delivery = this.requests({ attemptId: String(attempt.id), operation: 'worker.deliver' }).find(r => r.state === 'claimed' && matches(member, r.input.message) && json(r.target?.reference) === json(reference)
           && !deliveries.some(selected => selected.id === r.id)
-          && !this.events().some(e => e.kind === 'worker.delivery_admitted' && e.payload.effectId === r.id));
+          && !this.events({ attemptId: String(attempt.id), kinds: ['worker.delivery_admitted'] }).some(e => e.payload.effectId === r.id));
         if (!delivery) return { decision: 'refuse' };
         deliveries.push(delivery);
       }
@@ -2192,7 +2190,7 @@ export class Database {
 
   /** Resolution follows durable event order; replaying an old observation cannot undo a selection. */
   laterTurnDiscrepancy(attemptId: string) {
-    const events = this.events().filter(event => event.attemptId === attemptId);
+    const events = this.events({ attemptId, kinds: ['worker.observed', 'candidate.selected', 'return.authorised'] });
     const later = events.findLast(event => event.kind === 'worker.observed' && event.payload.kind === 'later_turn');
     if (!later || events.some(event => event.seq > later.seq
       && (event.kind === 'candidate.selected' || event.kind === 'return.authorised' && event.payload.discard === true))) return null;
@@ -2235,8 +2233,8 @@ export class Database {
       if (value.kind === 'terminal') {
         // Serialise shutdown with answers: a late answer must not leave an ownerless
         // pending delivery blocking continuation. Claimed/uncertain sends stay unresolved.
-        for (const request of this.requests().filter(r => r.attemptId === value.attemptId
-          && r.operation.startsWith('question.deliver.') && r.state === 'pending')) {
+        for (const request of this.requests({ attemptId: value.attemptId }).filter(r =>
+          r.operation.startsWith('question.deliver.') && r.state === 'pending')) {
           const result = { reason: 'Worker is terminal; answer retained for continuation.' };
           this.db.prepare("UPDATE requests SET state = 'withdrawn', result = ?, revision = revision + 1 WHERE id = ? AND state = 'pending'")
             .run(json(result), request.id);
@@ -3139,7 +3137,7 @@ export class Database {
       WHERE id = ? AND generation = ? AND revision = ? AND released_at IS NULL`)
       .run(heartbeatAt, expected.claimId, expected.generation, before.revision));
     const claim = this.decodeClaim(this.claimRow(expected.claimId));
-    this.storageEvent('claim.refreshed', owner, { claim: object(claim) });
+    // The claims row is the current heartbeat evidence; refreshes are not domain events.
     return claim;
   }
 
@@ -3219,8 +3217,18 @@ export class Database {
     });
   }
 
-  requests(): StoredRequest[] {
-    return this.snapshot(() => this.db.prepare('SELECT * FROM requests ORDER BY created_at, id').all().map(row => this.decodeRequest(row)));
+  requests(filter: { attemptId?: string; requestKey?: string; parentId?: string; operation?: string } = {}): StoredRequest[] {
+    const columns = { attemptId: 'attempt_id', requestKey: 'request_key', parentId: 'parent_id', operation: 'operation' };
+    const entries = Object.entries(filter) as [keyof typeof columns, string][];
+    const where = entries.length ? ` WHERE ${entries.map(([key]) => `${columns[key]} = ?`).join(' AND ')}` : '';
+    return this.snapshot(() => this.db.prepare(`SELECT * FROM requests${where} ORDER BY created_at, id`)
+      .all(...entries.map(([, value]) => value)).map(row => this.decodeRequest(row)));
+  }
+
+  statusRequests(): StoredRequest[] {
+    return this.snapshot(() => this.db.prepare(`SELECT * FROM requests WHERE operation = 'checks.run'
+      OR category = 'effect' AND (state IN ('claimed', 'uncertain') OR state = 'pending' AND operation LIKE 'question.deliver.%')
+      ORDER BY created_at, id`).all().map(row => this.decodeRequest(row)));
   }
 
   private duplicateRequest(value: CommandInput, category: 'command' | 'effect'): StoredRequest | undefined {
@@ -3457,8 +3465,16 @@ export class Database {
       fullfsync: Number(pragma('fullfsync')), checkpointFullfsync: Number(pragma('checkpoint_fullfsync')) };
   }
 
-  events(): StoredEvent[] {
-    return this.snapshot(() => this.db.prepare('SELECT * FROM events ORDER BY seq').all().map(row => this.decodeEvent(row)));
+  events(filter: { attemptId?: string; kinds?: readonly string[]; sourceKey?: string } = {}): StoredEvent[] {
+    const clauses: string[] = [], values: string[] = [];
+    if (filter.attemptId !== undefined) { clauses.push('attempt_id = ?'); values.push(filter.attemptId); }
+    if (filter.sourceKey !== undefined) { clauses.push('source_key = ?'); values.push(filter.sourceKey); }
+    if (filter.kinds !== undefined) {
+      if (!filter.kinds.length) return [];
+      clauses.push(`kind IN (${filter.kinds.map(() => '?').join(',')})`); values.push(...filter.kinds);
+    }
+    return this.snapshot(() => this.db.prepare(`SELECT * FROM events${filter.kinds && filter.sourceKey === undefined ? ' INDEXED BY events_by_kind' : ''}${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} ORDER BY seq`)
+      .all(...values).map(row => this.decodeEvent(row)));
   }
 
   close(): void { if (this.db.isOpen) this.db.close(); }
