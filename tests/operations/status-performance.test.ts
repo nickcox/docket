@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { initialiseContext, openContext } from '../../src/context.ts';
 import { createBinding } from '../../src/binding.ts';
 import { Database } from '../../src/storage/database.ts';
@@ -59,4 +60,20 @@ for (const withObjective of [false, true]) test(`R08/A16/A17: status.show and at
   assert.deepEqual(large.attempt, small.attempt);
   assert.equal(large.statusRows, small.statusRows);
   assert.equal(large.attemptRows, small.attemptRows);
+
+  // R10: returned and discarded leases never need a return plan or external reads.
+  const sql = new DatabaseSync(config.databasePath);
+  defer(t, () => sql.close());
+  for (const [i, id] of ids.entries()) {
+    const allocation = { leaseId: `lease-${i}`, path: join(home, `workspace-${i}`) };
+    sql.prepare('UPDATE attempts SET allocation = ?, lease_id = ?, lease_state = ? WHERE id = ?')
+      .run(JSON.stringify(allocation), allocation.leaseId, i % 2 === 0 ? 'returned' : 'held', id);
+    if (i % 2 !== 0) await db.appendEvents([{ sourceKey: `return.authorised:${id}`, kind: 'return.authorised',
+      payloadVersion: 1, attemptId: id, correlationId: id, actor: person, occurredAt: new Date(0).toISOString(),
+      payload: { discard: true }, notification: false }]);
+  }
+  const withoutRuntime = createBinding(person, { config: file }, { home, runtime: async () => {
+    assert.fail('R10: resolved leases must not initialise return-planning services');
+  } });
+  await withoutRuntime.execute('status.show', { attentionOnly: false, page: { after: null, limit: 100 } });
 });

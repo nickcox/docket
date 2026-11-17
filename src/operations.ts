@@ -218,9 +218,10 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             && ['claimed', 'uncertain'].includes(r.state));
           const checksState = checks?.state === 'withdrawn' ? 'interrupted' : String(checks?.result?.status ?? checks?.state ?? 'missing');
           const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
-          const resolved = a.leaseState === 'returned' || db.task(a.taskId).state === 'done'
+          const returnedOrDiscarded = a.leaseState === 'returned'
             || db.events({ attemptId: a.id, kinds: ['return.authorised'] }).some(e => e.payload.discard);
-          const currentReturnReason = a.allocation && !resolved
+          const resolved = returnedOrDiscarded || db.task(a.taskId).state === 'done';
+          const currentReturnReason = a.allocation && !returnedOrDiscarded
             ? await leaseReturnReason(db, a.id, caller, (await services()).completion) : null;
           const returnReason = currentReturnReason === 'Lease is ready to return.' && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;
