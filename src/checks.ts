@@ -162,7 +162,7 @@ async function planChecks(db: Database, input: RunChecksInput, services: CheckSe
     throw new CommandFailure('candidate_missing', { attemptId: input.attemptId, commit: input.commit });
   }
   if (attempt.executionOpen || !attempt.allocation || !db.validatedWorkerResult(attempt.id)
-    || !db.events().some(event => event.attemptId === attempt.id && event.kind === 'worker.observed' && event.payload.kind === 'terminal')) {
+    || !db.events({ attemptId: attempt.id, kinds: ['worker.observed'] }).some(event => event.payload.kind === 'terminal')) {
     throw new CommandFailure('not_ready', { attemptId: attempt.id });
   }
   const config = db.checkConfiguration();

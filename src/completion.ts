@@ -107,8 +107,8 @@ export async function inspectCandidateSelection(db: Database, input: { attemptId
   taskActor(input.caller);
   const attempt = db.attempt(input.attemptId), ref = String(attempt.specification.outputRef);
   if (attempt.executionOpen || !attempt.outcome || (attempt.specification.delivery as JsonObject).kind !== 'code'
-    || input.commit === attempt.specification.startingCommit || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) refuse('Candidate requires a terminal, settled code attempt and must move beyond the start');
-  if (db.events().some(e => e.attemptId === attempt.id && e.kind === 'candidate.accepted')) refuse('An accepted candidate cannot be replaced');
+    || input.commit === attempt.specification.startingCommit || !db.events({ attemptId: attempt.id, kinds: ['worker.observed'] }).some(e => e.payload.kind === 'terminal')) refuse('Candidate requires a terminal, settled code attempt and must move beyond the start');
+  if (db.events({ attemptId: attempt.id, kinds: ['candidate.accepted'] }).length > 0) refuse('An accepted candidate cannot be replaced');
   const state = known(await services.repository.inspectRef(ref));
   if (state.state !== 'present' || state.commit !== input.commit) refuse('Selected branch is not at the exact candidate');
   await retainedOutput(db, input.attemptId, services);
@@ -163,9 +163,9 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
   const attempt = db.attempt(input.attemptId);
   if (selecting) await inspectCandidateSelection(db, input, services);
   else exactCandidate(db, input);
-  if (attempt.executionOpen || !attempt.outcome || !db.events().some(e => e.attemptId === attempt.id && e.kind === 'worker.observed' && e.payload.kind === 'terminal')) refuse('Acceptance requires a stopped terminal worker and recorded outcome');
+  if (attempt.executionOpen || !attempt.outcome || !db.events({ attemptId: attempt.id, kinds: ['worker.observed'] }).some(e => e.payload.kind === 'terminal')) refuse('Acceptance requires a stopped terminal worker and recorded outcome');
   const accepted = selecting ? null : db.acceptance(attempt.id, input.candidateId);
-  const finished = accepted && db.events().some(e => e.sourceKey === `acceptance.finished:${accepted.id}`);
+  const finished = accepted && db.events({ sourceKey: `acceptance.finished:${accepted.id}` }).length > 0;
   if (finished) return { steps: [] };
   if (input.overrideReason !== undefined && !input.overrideReason.trim()) throw new TypeError('Expected nonblank override reason');
   await requireOutputIntegrity(db, attempt.id, services.repository,
@@ -173,7 +173,8 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
   await retainedOutput(db, attempt.id, services);
   const policy = await planAcceptance(db, input, services);
   if (policy.kind === 'local-merge') db.checkIntegrationAuthority(input.caller, input.attemptId);
-  const unresolved = db.requests().find(r => r.attemptId === attempt.id && (r.category === 'effect' || r.operation === 'checks.run') && ['claimed', 'uncertain'].includes(r.state));
+  const requests = db.requests({ attemptId: attempt.id });
+  const unresolved = requests.find(r => (r.category === 'effect' || r.operation === 'checks.run') && ['claimed', 'uncertain'].includes(r.state));
   // Interrupted integration is reconciled by the executor, not reissued by a plan.
   if (unresolved?.operation === 'checks.run') throw acceptanceCheckFailure(attempt.id, input.commit, unresolved, db.claims(), db.requests());
   if (unresolved && !unresolved.operation.startsWith('completion.')) refuse('Attempt has an unresolved effect');
@@ -185,7 +186,7 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
       const checks = mandatoryChecks(attempt.specification.checks as TrustedChecks, current);
       const key = checkEvidenceKey(attempt.specification.repository as JsonObject, input.commit,
         attempt.specification.criteria as string[], checks, services.profile);
-      const result = db.requests().findLast(r => r.operation === 'checks.run' && r.attemptId === attempt.id && r.input.evidenceKey === key);
+      const result = requests.findLast(r => r.operation === 'checks.run' && r.input.evidenceKey === key);
       if (result && result.state === 'succeeded' && result.result?.status === 'passed') { /* Reuse exact evidence. */ }
       else if (result && result.state !== 'pending') throw acceptanceCheckFailure(attempt.id, input.commit, result, db.claims(), db.requests());
       else {
@@ -196,7 +197,7 @@ export async function planCandidateAcceptance(db: Database, input: AcceptInput, 
     }
     steps.push(step('candidate.accept', attempt.id, ['retained_output', ...(input.overrideReason === undefined ? ['checks_passed'] : ['person_override'])], input.overrideReason === undefined));
   }
-  if (policy.kind === 'local-merge' && !db.requests().some(r => r.requestKey === `integrate:${attempt.id}:${input.candidateId}` && r.state === 'succeeded')) {
+  if (policy.kind === 'local-merge' && !db.requests({ requestKey: `integrate:${attempt.id}:${input.candidateId}` }).some(r => r.state === 'succeeded')) {
     steps.push(step(unresolved ? 'integration.reconcile' : 'repository.integrate', policy.target, ['exact_candidate', 'policy_allows'], !accepted));
   }
   steps.push(step('task.complete', attempt.taskId, ['acceptance', 'unchanged_decision'], true));
@@ -220,8 +221,7 @@ export async function acceptCandidate(db: Database, input: AcceptInput, services
     const config = db.finalisationConfiguration();
     let checks = input.overrideReason === undefined ? await runCandidateChecks(db, input.attemptId, input.caller, services) : null;
     if (checks && ['rejected', 'withdrawn'].includes(checks.state)) {
-      checks = db.requests().findLast(request => request.operation === 'checks.run' && request.attemptId === input.attemptId
-        && request.input.evidenceKey === checks!.input.evidenceKey && request.state === 'succeeded'
+      checks = db.requests({ attemptId: input.attemptId, operation: 'checks.run' }).findLast(request => request.input.evidenceKey === checks!.input.evidenceKey && request.state === 'succeeded'
         && request.result?.status === 'passed') ?? checks;
     }
     const plan = await planAcceptance(db, input, services);
@@ -300,7 +300,7 @@ export async function returnAttempt(db: Database, input: ReturnInput, services: 
   const allocation = authorisation.payload.allocation as Allocation;
   // Once returned, the workspace is recyclable and must not be read again.
   if (db.attempt(input.attemptId).leaseState !== 'returned') {
-    const previous = db.requests().find(request => request.requestKey === `return:${input.attemptId}`);
+    const previous = db.requests({ requestKey: `return:${input.attemptId}` })[0];
     let retention: RetentionRequest | undefined;
     if (!previous || previous.state === 'pending') {
       retention = authorisation.payload.discard
@@ -360,7 +360,7 @@ async function cleanupOutput(db: Database, authorisation: StoredEvent, services:
   if (!candidate) return;
   const accepted = attempt.candidate ? db.acceptance(attemptId, String(candidate.id)) : null;
   const plan = accepted?.payload.plan as FinalisationPlan | undefined;
-  const integrated = plan?.kind === 'local-merge' && db.requests().some(request => request.requestKey === `integrate:${attemptId}:${String(candidate.id)}` && request.state === 'succeeded');
+  const integrated = plan?.kind === 'local-merge' && db.requests({ requestKey: `integrate:${attemptId}:${String(candidate.id)}` }).some(request => request.state === 'succeeded');
   if (!authorisation.payload.discard && !integrated) return;
   const pins = db.events({ attemptId, kinds: ['output.rebased'] });
   const references = [{ operation: 'cleanup' as const, ref: String(candidate.outputRef), commit: String(candidate.commit) },

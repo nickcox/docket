@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { initialiseContext, openContext } from '../../src/context.ts';
 import { createBinding } from '../../src/binding.ts';
 import { Database } from '../../src/storage/database.ts';
+import type { Runtime } from '../../src/runtime.ts';
 import { parseCheckPolicy } from '../../src/check-policy.ts';
 import { configuration } from '../fixtures/configuration.ts';
 
@@ -33,7 +34,12 @@ for (const withObjective of [false, true]) test(`R08/A16/A17: status.show and at
       delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
     ids.push(reservation.attempt.id);
   }
-  const binding = createBinding(person, { config: file }, { home });
+  const sql = new DatabaseSync(config.databasePath);
+  defer(t, () => sql.close());
+  sql.prepare('UPDATE attempts SET allocation = ?, lease_id = ?, lease_state = ? WHERE id = ?')
+    .run(JSON.stringify({ leaseId: 'held-lease', path: join(home, 'held-workspace') }), 'held-lease', 'held', ids[0]!);
+  // A held lease without terminal evidence exercises return planning but cannot read an owner.
+  const binding = createBinding(person, { config: file }, { home, runtime: async () => ({ completion: {} }) as Runtime });
   const prototype = Database.prototype as unknown as { decodeEvent(row: unknown): unknown };
   const original = prototype.decodeEvent;
   let decoded = 0;
@@ -62,8 +68,6 @@ for (const withObjective of [false, true]) test(`R08/A16/A17: status.show and at
   assert.equal(large.attemptRows, small.attemptRows);
 
   // R10: returned and discarded leases never need a return plan or external reads.
-  const sql = new DatabaseSync(config.databasePath);
-  defer(t, () => sql.close());
   for (const [i, id] of ids.entries()) {
     const allocation = { leaseId: `lease-${i}`, path: join(home, `workspace-${i}`) };
     sql.prepare('UPDATE attempts SET allocation = ?, lease_id = ?, lease_state = ? WHERE id = ?')
