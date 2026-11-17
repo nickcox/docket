@@ -26,7 +26,14 @@ process.stdin.on('end', () => process.exit(0));
 function receive(line: string) {
   const request = JSON.parse(line);
   log(request);
-  const respond = (data?: unknown) => emit({ type: 'response', command: request.type, id: request.id, success: true, data });
+  const respond = (data?: unknown) => {
+    if ((mode === 'stalled-start' && request.type === 'get_state')
+      || (mode === 'stalled-retry' && request.type === 'set_auto_retry')) return;
+    const delay = mode === 'slow-start' ? 120 : mode === 'slow-preparation' ? 600 : 0;
+    const response = { type: 'response', command: request.type, id: request.id, success: true, data };
+    if (delay) setTimeout(() => emit(response), delay);
+    else emit(response);
+  };
   if (request.type === 'get_state') respond({ model: { provider: mode === 'wrong-provider' ? 'wrong' : arg('--provider'), id: arg('--model') },
     sessionId: arg('--session-id'), sessionFile: join(arg('--session-dir')!, 'session.jsonl'),
     thinkingLevel: arg('--thinking') ?? 'off', isStreaming: active, isCompacting: false, pendingMessageCount: 0 });

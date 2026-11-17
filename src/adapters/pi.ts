@@ -30,6 +30,8 @@ export interface PiLauncherOptions {
   profiles: Record<string, PiExecutionProfile>;
   environment?: NodeJS.ProcessEnv;
   requestMs?: number;
+  /** Whole preparation sequence, from child creation through retry configuration. Defaults to 60 seconds. */
+  startupMs?: number;
   stopMs?: number;
   maxRecordBytes?: number;
   windowsSecurePrivateDirectory?: (path: string) => Promise<void>;
@@ -73,7 +75,7 @@ export class PiLauncher implements Launcher {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || name.startsWith('DOCKET_')) throw new TypeError('Invalid Pi environment reference');
       }
     }
-    for (const value of [options.requestMs ?? 5000, options.stopMs ?? 5000, options.maxRecordBytes ?? 4 * 1024 * 1024]) {
+    for (const value of [options.requestMs ?? 5000, options.startupMs ?? 60_000, options.stopMs ?? 5000, options.maxRecordBytes ?? 4 * 1024 * 1024]) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError('Invalid Pi transport limit');
     }
     this.options = { ...options, profiles: structuredClone(options.profiles), environment: { ...(options.environment ?? process.env) } };
@@ -159,6 +161,13 @@ export class PiLauncher implements Launcher {
       }
       const reference: WorkerReference = { launcher: 'pi', ownerId: randomUUID(), sessionId: binding.sessionId,
         attemptId: binding.attemptId, preparationEffectId: effectId, directory };
+      const startupMs = this.options.startupMs ?? 60_000;
+      const deadline = performance.now() + startupMs;
+      const remaining = () => {
+        const ms = Math.ceil(deadline - performance.now());
+        if (ms <= 0) throw new Error('Pi preparation timeout');
+        return ms;
+      };
       const rpc = new PiRpc({ executable: execution.executable, args, cwd, env: environment,
         maxRecordBytes: this.options.maxRecordBytes ?? 4 * 1024 * 1024 }, record => this.observe(worker!, record));
       worker = { reference, binding, rpc, directory, resultPath: binding.resultPath,
@@ -166,11 +175,17 @@ export class PiLauncher implements Launcher {
       if (rpc.child.pid !== undefined) reference.processId = String(rpc.child.pid);
       this.workers.set(String(reference.ownerId), worker); this.preparations.set(effectId, worker);
       rpc.child.once('exit', () => { worker!.sequence++; });
-      await rpc.started;
-      const state = await rpc.request('get_state', {}, this.requestMs);
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([rpc.started, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Pi preparation timeout')), remaining());
+        })]);
+      } finally { clearTimeout(timer); }
+      const state = await rpc.request('get_state', {}, remaining());
       this.validateState(worker, state);
       reference.sessionFile = (state as JsonObject).sessionFile!;
-      await rpc.request('set_auto_retry', { enabled: false }, this.requestMs);
+      await rpc.request('set_auto_retry', { enabled: false }, remaining());
+      remaining();
       worker.prepared = true;
       return confirmed(structuredClone(reference));
     } catch {

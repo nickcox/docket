@@ -6,14 +6,15 @@ import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { PiLauncher } from '../../src/adapters/pi.ts';
+import { PiLauncher, type PiLauncherOptions } from '../../src/adapters/pi.ts';
 import { windowsPowerShellEnvironment } from '../../src/adapters/host-files.ts';
 import { PiFrames } from '../../src/adapters/pi-rpc.ts';
 import type { WorkerBinding } from '../../src/adapters/launcher.ts';
 import type { WorkerReference } from '../../src/storage/launch.ts';
 import type { JsonObject } from '../../src/storage/database.ts';
 
-async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '', sdk = false) {
+async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '', sdk = false,
+  timeouts: Pick<PiLauncherOptions, 'requestMs' | 'startupMs'> = {}) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'docket-pi-'));
   const cwd = join(root, 'lease'); await mkdir(cwd);
   const record = join(root, 'peer.jsonl');
@@ -31,7 +32,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
     specification: { version: 1, resultPath: join(root, 'attempt', 'result.json'), profile, task: { instructions: 'Write the assigned task\nwith Unicode \u2028 intact.' }, criteria: ['Do it'],
       delivery: { kind: 'code', requiredEvidence: ['tests'], requiredDeliverables: [] } },
     allocation: { leaseId: 'lease', holder: {}, path: cwd, pool: root, repository: {}, outputRef: 'refs/heads/output', startingCommit: 'a'.repeat(40) } };
-  const launcher = new PiLauncher({ stateDirectory: join(root, 'state'), requestMs: 2000, stopMs: 1000, maxRecordBytes: 4096,
+  const launcher = new PiLauncher({ stateDirectory: join(root, 'state'), requestMs: 2000, stopMs: 1000, maxRecordBytes: 4096, ...timeouts,
     profiles: { isolated: { executable: process.execPath,
       ...(sdk ? { sdkModule: resolve('tests/fixtures/pi-sdk-peer.ts'), agentFiles: { auth: join(root, 'auth-link.json'), models } }
         : { entrypoint: resolve('tests/fixtures/pi-peer.ts'), credentialVariable: 'PROVIDER_KEY' }),
@@ -54,6 +55,39 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, mode = '
   return { launcher, binding, prepared, reference: reference!, records, root, permit: () => { permitted = true; },
     pauseAdmission: (hook: () => Promise<void>) => { admissionHook = hook; } };
 }
+
+test('R06: slow readiness and retry configuration use startupMs, while later RPCs keep requestMs', async t => {
+  const f = await fixture(t, 'slow-start', false, { requestMs: 40, startupMs: 2000 });
+  assert.equal(f.prepared.status, 'confirmed');
+  const records = await f.records();
+  assert.equal(records.filter(record => record.type === 'get_state').length, 1);
+  assert.equal(records.filter(record => record.type === 'set_auto_retry').length, 1);
+  assert.equal(records.filter(record => record.type === 'prompt').length, 0);
+  assert.equal((await f.launcher.usage(f.reference)).status, 'unknown');
+});
+
+for (const mode of ['stalled-start', 'stalled-retry', 'slow-preparation']) {
+  test(`R06/R08: ${mode} exceeds the shared preparation deadline and remains uncertain until stopped`, async t => {
+    const f = await fixture(t, mode, false, { requestMs: 40, startupMs: 1000 });
+    assert.equal(f.prepared.status, 'uncertain');
+    assert.equal((await f.launcher.inspect(f.reference)).status, 'unknown');
+    assert.equal((await f.launcher.activate(f.reference, f.binding.specification, 'activate', 'generation')).status, 'rejected');
+    assert.equal((await f.launcher.stop(f.reference, 'emergency-stop')).status, 'confirmed');
+    const stopped = await f.launcher.inspect(f.reference);
+    assert.equal(stopped.status, 'known');
+    if (stopped.status === 'known') assert.equal(stopped.terminal, true);
+    const records = await f.records();
+    if (mode !== 'stalled-start') assert.equal(records.filter(record => record.type === 'set_auto_retry').length, 1);
+    assert.equal(records.filter(record => record.type === 'prompt').length, 0);
+    assert.equal((await f.launcher.prepare(f.binding, 'prepare')).status, 'uncertain');
+  });
+}
+
+test('R06: startupMs must be a positive safe integer like the other transport limits', () => {
+  for (const startupMs of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => new PiLauncher({ stateDirectory: tmpdir(), profiles: {}, startupMs, admit: async () => true }), /transport limit/);
+  }
+});
 
 test('R40/A58: Pi preparation records its actual worker directory and session transcript', async t => {
   const f = await fixture(t);
