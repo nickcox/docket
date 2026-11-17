@@ -92,10 +92,6 @@ export class BbLauncher implements Launcher {
     }
     if (!this.once(effectId)) return uncertain('bb preparation already attempted');
     const executionProfile = String(profile.executionProfile);
-    try {
-      const ready = await this.call(executionProfile, ['docket', 'ready']);
-      if (!object(ready) || ready.version !== 1 || ready.ready !== true) throw new Error();
-    } catch { return rejected('Docket bb plugin is not ready', { neverStarted: true }); }
     const execution = this.options.profiles[executionProfile]!;
     let projectId = execution.projectId;
     const nextAction = 'Run bb project create --name <name> --root <repository> --machine <machine>, or set projectId in the bb execution profile';
@@ -120,6 +116,13 @@ export class BbLauncher implements Launcher {
           { neverStarted: true, matches: matches.map(p => p.id), repository: this.options.repository, nextAction });
         projectId = matches[0].id;
       } catch { return rejected('Cannot read bb projects; no thread created', { neverStarted: true, nextAction }); }
+    }
+    try {
+      const ready = await this.call(executionProfile, ['docket', 'ready', projectId!]);
+      if (!object(ready) || ready.version !== 1 || ready.ready !== true) throw new Error();
+    } catch {
+      return rejected('Docket bb plugin is not ready', { neverStarted: true,
+        nextAction: `Add ${projectId} to the Docket plugin's projects setting and check its executable and binding settings` });
     }
     try {
       await mkdir(dirname(binding.resultPath), { recursive: true, mode: 0o700 });

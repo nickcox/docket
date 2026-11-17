@@ -76,7 +76,7 @@ A bb worker runs with the provider's normal resources for the person who runs Do
 
 ## bb host
 
-**R34.** The bb plugin provides only the admission hook (R33). Delivery of Docket events and questions into bb, agent tools, person forms, a status UI and bb supervisor registration are deferred. People and supervisors use the Docket CLI, including from an ordinary bb thread; such a supervisor is unrestricted (R17), and status and briefings say so. Worker questions reach the supervisor through the same core operations as for Pi.
+**R34.** The bb plugin provides only the admission hook (R33). The hook passes through, without calling the core, every message in a bb project not listed in the plugin's settings, and readiness refuses a worker whose project is not listed. Delivery of Docket events and questions into bb, agent tools, person forms, a status UI and bb supervisor registration are deferred. People and supervisors use the Docket CLI, including from an ordinary bb thread; such a supervisor is unrestricted (R17), and status and briefings say so. Worker questions reach the supervisor through the same core operations as for Pi.
 
 The launcher gives bb the leased Treehouse path as an existing workspace, so bb attaches it through its own checkout environment rather than creating a workspace. bb must not own, retire, run set-up or teardown scripts in, or remove that folder; qualification confirms this against the pinned bb version. Archive/delete/cascade/removal retries must never destroy the path or run destructive teardown before the core authorises return. The core keeps sole control of the lease and its return.
 

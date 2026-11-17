@@ -20,6 +20,11 @@ source checkout, as described in `bb/README.md`.
 
 The person configures these plugin settings:
 
+- `projects`: bb project IDs whose threads the hook checks, separated by commas
+  or whitespace, default empty. Each ID must match `^[\w-]+$`, as in the
+  launcher's `projectId`. Add the launcher's project ID before dispatching.
+  All messages in other projects pass through without reading content or calling
+  Docket; unreadable settings or a missing project ID hold.
 - `executable`: Docket executable on the server machine, default `docket`. No
   shell or arguments; use an absolute executable path where PATH is unsuitable.
 - `binding`: absolute path to a private version 1 host-service binding, created
@@ -33,7 +38,8 @@ bb supervisor is unrestricted; use the Docket CLI for domain operations.
 
 ## Launcher commands
 
-- `bb docket ready`: returns exit 0 with
+- `bb docket ready <projectId>`: requires exactly one project ID listed in
+  `projects`, and returns exit 0 with
   `{version:1,ready:true}` when the plugin is registered and
   its executable and binding settings are nonblank. A non-zero exit, missing
   command or invalid response must stop the launcher **before thread creation**.
@@ -50,7 +56,7 @@ bb supervisor is unrestricted; use the Docket CLI for domain operations.
   recheck requests. Never use `thread queue send` to release held work.
 
 The hook is registered before settings or CLI registration, on each normal
-load/reload. It passes every queued member to the core. Unknown replies,
+load/reload. In listed projects it passes every queued member to the core. Unknown replies,
 malformed envelopes, command failures and unsupported message blocks hold.
 Before reference binding, the core holds messages matching a pending first
 prompt's exact text and user author category. Unrelated threads pass through;
@@ -122,7 +128,9 @@ Offline tests exercise this with real temporary SQLite and fake boundaries,
 
 The hook is a best-effort guard only while this plugin is installed, enabled and
 on the ordinary dispatch path. Disable, unload, replacement, Send now,
-`bb thread queue send` and unqualified host recovery can bypass it. Reload and
+`bb thread queue send` and unqualified host recovery can bypass it. A worker
+thread that ends up outside a listed project also bypasses the hook; Docket
+relies on later-turn detection, as with any other bypass. Reload and
 restart re-register the hook, but offline tests do not qualify recovery races.
 The launcher/core must still detect later turns and recheck candidate commit,
 result and workspace before checks, acceptance, integration and return. Idle or

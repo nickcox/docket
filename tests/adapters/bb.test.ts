@@ -65,11 +65,16 @@ test('R31: runtime routes profile launchers and validates bb execution settings 
   await assert.rejects(loadExecutionProfiles(f.root, options), /invalid execution profiles schema/);
 });
 
-test('R31 R33: protected create preserves exact text, profile and cwd; readiness refuses before create', async t => {
+test('R31 R33 R34 A55: protected create preserves exact text, profile and cwd; project readiness refuses before create', async t => {
   const f = await fixture(t);
   f.current.ready = false; await f.save();
-  assert.equal((await f.launcher.prepare(f.binding, 'missing')).status, 'rejected');
-  assert.equal((await f.calls()).length, 1);
+  const refused = await f.launcher.prepare(f.binding, 'missing');
+  assert.equal(refused.status, 'rejected');
+  if (refused.status === 'rejected') {
+    assert.match(JSON.stringify(refused.evidence), /Add proj_local.*projects setting/);
+    assert.match(JSON.stringify(refused.evidence), /"neverStarted":true/);
+  }
+  assert.deepEqual((await f.calls()).map(c => c.args), [['project', 'list', '--json'], ['docket', 'ready', 'proj_local']]);
   f.current.ready = true; await f.save();
   const prepared = await f.launcher.prepare(f.binding, 'prepare');
   assert.equal(prepared.status, 'confirmed');
@@ -120,6 +125,7 @@ test('R31 R33 A15: project lookup refuses absent, ambiguous and foreign-machine 
   const args = (await f.calls()).at(-1).args as string[];
   assert.equal(args[args.indexOf('--project') + 1], 'proj_explicit');
   assert.equal((await f.calls()).filter(c => c.args[0] === 'project').length, 3);
+  assert.deepEqual((await f.calls()).filter(c => c.args[1] === 'ready').map(c => c.args), [['docket', 'ready', 'proj_explicit']]);
 });
 
 test('R31 R33 A15: only proven pre-effect validation is rejected; generic envelopes, malformed replies and timeouts remain uncertain without retry', async t => {

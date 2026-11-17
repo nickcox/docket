@@ -8,18 +8,26 @@ export interface Member {
 }
 export interface Dispatch {
   thread: { id: string };
+  project: { id: string };
   queuedMessages: Member[];
   input: { blocks: Member['content'] };
   initiator: Member['initiator'] | 'mixed';
 }
 export type Decision = { action: 'proceed' } | { action: 'wait'; reason: string } | { action: 'reject'; message: string };
-interface Settings { executable: string; binding: string }
+interface Settings { executable: string; binding: string; projects: string }
+
+function projectIds(config: Settings): string[] {
+  const ids = config.projects.split(/[,\s]+/u).filter(Boolean);
+  if (ids.some(id => !/^[\w-]+$/.test(id))) throw new Error('Invalid bb project ID');
+  return ids;
+}
 export interface Port {
   experimental_hooks: {
     on(name: 'message.dispatch', handler: (context: Dispatch) => Promise<Decision>): unknown;
     recheck(name: 'message.dispatch'): Promise<void>;
   };
   settings: { define(descriptors: {
+    projects: { type: 'string'; label: string; default: string };
     executable: { type: 'string'; label: string; default: string };
     binding: { type: 'string'; label: string; default: string; secret: true };
   }): { get(): Promise<Settings> } };
@@ -34,13 +42,16 @@ const held: Decision = { action: 'wait', reason: 'Docket admission unavailable o
 /** The first registration must be the hook, including on reload. */
 export function register(bb: Port, execute?: Run): void {
   let settings: { get(): Promise<Settings> } | undefined;
-  const call = async (operation: string, input: Record<string, unknown>) => {
-    if (!settings) throw new Error('Docket is not ready');
-    const config = await settings.get();
+  const call = async (config: Settings, operation: string, input: Record<string, unknown>) => {
     return invoke(config.executable, config.binding, operation, input, execute);
   };
   bb.experimental_hooks.on('message.dispatch', async context => {
     try {
+      if (!settings) return held;
+      const config = await settings.get();
+      const projects = projectIds(config);
+      if (!context.project?.id) return held;
+      if (!projects.includes(context.project.id)) return { action: 'proceed' };
       // Inline sends have no queue row. The local label is only for duplicate
       // member detection, never correlation; the core matches recorded content.
       const messages = context.queuedMessages.length ? context.queuedMessages : [
@@ -54,7 +65,7 @@ export function register(bb: Port, execute?: Run): void {
           return block.text;
         }).join('\n'),
       }));
-      const result = await call('host.bb-admit', { threadId: context.thread.id, members });
+      const result = await call(config, 'host.bb-admit', { threadId: context.thread.id, members });
       if (result.decision === 'admit') return { action: 'proceed' };
       if (result.decision === 'refuse') return { action: 'reject', message: 'Docket refused this worker turn' };
       if (result.decision === 'pass-through') return { action: 'proceed' };
@@ -62,21 +73,23 @@ export function register(bb: Port, execute?: Run): void {
     } catch { return held; }
   });
   settings = bb.settings.define({
+    projects: { type: 'string', label: 'bb project IDs (commas or whitespace)', default: '' },
     executable: { type: 'string', label: 'Docket executable (no arguments)', default: 'docket' },
     binding: { type: 'string', label: 'Private host-service binding path', secret: true, default: '' },
   });
   bb.cli.register({
     name: 'docket', summary: 'Docket launcher admission controls (not domain operations)',
     commands: [
-      { name: 'ready', summary: 'Check plugin registration and binding transport', usage: 'bb docket ready' },
+      { name: 'ready', summary: 'Check plugin registration and binding transport', usage: 'bb docket ready <projectId>' },
       { name: 'recheck', summary: 'Re-evaluate held dispatches for a thread', usage: 'bb docket recheck <threadId>' },
     ],
     async run(argv) {
       try {
-        if (argv.length === 1 && argv[0] === 'ready') {
+        if (argv.length === 2 && argv[0] === 'ready') {
           const config = await settings!.get();
+          if (!/^[\w-]+$/.test(argv[1]!) || !projectIds(config).includes(argv[1]!)) throw new Error('Project not listed');
           if (!config.executable.trim() || !config.binding.trim()) throw new Error('Missing settings');
-          const catalog = await call('catalog.show', {});
+          const catalog = await call(config, 'catalog.show', {});
           const operations = catalog.operations;
           if (!Array.isArray(operations) || !operations.some((operation: { name?: string }) =>
             operation?.name === 'host.bb-admit')) throw new Error('Incomplete binding');
@@ -87,7 +100,7 @@ export function register(bb: Port, execute?: Run): void {
           await bb.experimental_hooks.recheck('message.dispatch');
           return { exitCode: 0, stdout: JSON.stringify({ version: 1, requested: true, threadId: argv[1], scope: 'all-plugin-held' }) };
         }
-        return { exitCode: 2, stderr: 'Usage: bb docket ready | bb docket recheck <threadId>' };
+        return { exitCode: 2, stderr: 'Usage: bb docket ready <projectId> | bb docket recheck <threadId>' };
       } catch { return { exitCode: 1, stderr: 'Docket readiness/recheck failed; do not create or activate a worker' }; }
     },
   });

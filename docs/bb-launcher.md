@@ -43,6 +43,19 @@ a checkout on this machine. `machineId`, when supplied, is also passed as
 `--machine`. Without it, an explicit project uses bb's local-machine resolution.
 The personal project cannot accept the leased path environment.
 
+Add this project ID to the Docket plugin's person-controlled `projects` setting
+(a string of IDs separated by commas or whitespace, default empty):
+
+```text
+bb plugin config docket set projects <projectId>
+bb docket ready <projectId>
+```
+
+Preserve any other project IDs already listed. The launcher finds the project
+before calling readiness with that ID. Readiness refuses missing or unlisted
+IDs, as well as binding failures, before any thread is created; its next action
+names the `projects` setting.
+
 ## Workspace attachment and environment records (R34)
 
 The launcher supplies `--environment <leased Treehouse path>`. bb attaches the
@@ -144,7 +157,9 @@ that an already running bb server strips its provider environment. That needs
 live qualification for each supported combination.
 
 The fence is best effort. Plugin disablement, unloading or replacement, Send
-now, queue send, and unqualified recovery paths can bypass it. Docket reads
+now, queue send, and unqualified recovery paths can bypass it. A worker thread
+outside a project listed in the plugin's `projects` setting also bypasses the
+hook without calling Docket, so Docket relies on later-turn detection. Docket reads
 later turn starts as discrepancies and rechecks retained output before checks,
 acceptance, integration and return. A later turn after lease return can still
 change a workspace reused by another attempt; Docket cannot detect every such
