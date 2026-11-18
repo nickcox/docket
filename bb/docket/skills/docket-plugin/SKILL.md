@@ -7,13 +7,16 @@ Use the Docket CLI for domain operations. This plugin adds no agent tools or
 supervisor authority. Its host-service binding is person-controlled; thread
 metadata never grants permission.
 
-Launcher commands: `bb docket ready` before thread creation, then
+Launcher commands: `bb docket ready <projectId>` before thread creation, then
 `bb docket recheck <threadId>` only to request fresh admission evaluation.
 A recheck is global in SDK 0.6.132 and is not evidence of admission. Never use
 Send now or `bb thread queue send` to release Docket work.
 
-Configure `executable` (no shell arguments) and secret `binding` through
-`bb plugin config docket set`. Everything runs on one machine. The launcher
+Configure `projects` (bb project IDs separated by commas or whitespace),
+`executable` (no shell arguments) and secret `binding` through
+`bb plugin config docket set <key> <value>`. Readiness refuses projects not listed
+in `projects`. In unlisted bb projects, the hook passes every message through
+without calling Docket. Everything runs on one machine. The launcher
 passes the leased Treehouse path to bb's checkout environment. Only Docket
 controls the lease and its return; bb's environment record can outlive it.
 
