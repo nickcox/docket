@@ -1,6 +1,7 @@
 import { defer } from '../helpers/cleanup.ts';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, readdir, writeFile, unlink, link } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { dispatch } from '../../src/dispatch.ts';
@@ -670,6 +671,76 @@ for (const state of ['pending', 'claimed', 'uncertain'] as const) {
     await automaticReturn(f.db, a.id, person, f.services, discard, 'discard');
     assert.equal(f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] }).length, withdrawn.length, 'Replay does not withdraw twice');
   });
+}
+
+for (const state of ['pending', 'claimed', 'uncertain'] as const) {
+  for (const recordedDiscard of state === 'pending' ? [true, false] : [true]) {
+    test(`R07/R10: new discard reconciles an older recorded return (discard=${recordedDiscard}, activation=${state})`, async t => {
+      const f = await fixture(t);
+      const a = await f.attempt(`recorded-${state}`, ['Criterion'], undefined, head, start, policyContent, 'prepared');
+      const activation = f.db.requests({ attemptId: a.id, operation: 'worker.activate' })[0]!;
+      const preparation = f.db.requests({ attemptId: a.id, operation: 'worker.prepare' })[0]!;
+      const reference = preparation.result!.reference as import('../../src/storage/launch.ts').WorkerReference;
+      const executor = { claimId: activation.claimId!, generation: host.generation };
+      if (state !== 'pending') {
+        await f.db.claimEffect(activation.id, executor);
+        if (state === 'uncertain') await f.db.recordEffectOutcome(activation.id, executor, 'uncertain', { reason: 'Interrupted activation' });
+      }
+      const recovery = { claimId: executor.claimId, confirmStopped: true,
+        evidence: 'Inspected this exact bb thread; its worker is stopped.', dryRun: false };
+      await f.db.resolveClaimByPerson(executor.claimId, recovery.evidence, person,
+        { requestKey: 'recover-recorded', operation: 'claim.resolve', caller: person, input: recovery, fingerprint: canonicalJson(recovery) });
+      // Recreate the pre-a42ae70 state: a settled discard decision with no effect withdrawal.
+      const sql = new DatabaseSync(f.db.path);
+      defer(t, () => sql.close());
+      sql.prepare("UPDATE attempts SET outcome = 'failed', execution_open = 0, phase = 'settled' WHERE id = ?").run(a.id);
+      const oldInput = { attemptId: a.id, reason: 'Original decision' };
+      const oldCommand = await f.db.recordCommand({ requestKey: 'old-return', operation: recordedDiscard ? 'attempt.discard' : 'attempt.return',
+        caller: person, input: oldInput, fingerprint: canonicalJson(oldInput) });
+      await f.db.appendEvents([{ sourceKey: `return.authorised:${a.id}`, kind: 'return.authorised', payloadVersion: 1,
+        attemptId: a.id, requestId: oldCommand.id, correlationId: oldCommand.id, actor: person, occurredAt: new Date().toISOString(),
+        payload: { allocation: a.allocation, discard: recordedDiscard, automatic: false, abandonedWithoutOutcome: true,
+          discardReason: recordedDiscard ? 'Original decision' : null, decisionRevision: f.db.task('recorded-' + state).decisionRevision } }]);
+      const decision = f.db.events({ sourceKey: `return.authorised:${a.id}` })[0]!;
+      const before = f.db.request(activation.id);
+      const discard = { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Retry older discard' };
+      if (!recordedDiscard) {
+        const attemptBefore = f.db.attempt(a.id);
+        const withdrawals = f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] });
+        await assert.rejects(automaticReturn(f.db, a.id, person, f.services, discard, 'new-discard'), /Return and discard decisions differ/);
+        assert.deepEqual(f.db.request(activation.id), before);
+        assert.deepEqual(f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] }), withdrawals);
+        assert.deepEqual(f.db.events({ sourceKey: decision.sourceKey }), [decision]);
+        assert.deepEqual(f.db.attempt(a.id), attemptBefore);
+        assert.equal(f.calls.includes('return'), false);
+        return;
+      }
+      const result = await automaticReturn(f.db, a.id, person, f.services, discard, 'new-discard');
+      assert.equal(result.state, state === 'pending' ? 'returned' : 'kept', result.reason ?? 'Lease returned');
+      assert.equal(f.db.attempt(a.id).leaseState, state === 'pending' ? 'returned' : 'held');
+      if (state === 'pending') {
+        const withdrawn = f.db.request(activation.id);
+        assert.equal(withdrawn.state, 'withdrawn');
+        assert.equal(withdrawn.revision, before.revision + 1);
+        assert.deepEqual(withdrawn.result, { reason: 'Person discarded terminal attempt; worker effect withdrawn before claim.' });
+        assert.equal(reference.launcher, 'bb');
+        if (reference.launcher === 'bb') assert.deepEqual(await f.db.admitBbDispatch(String(reference.threadId),
+          [{ id: 'older-prompt', author: 'user', content: String(preparation.input.initialInput) }]), { decision: 'refuse' });
+      } else {
+        assert.match(result.reason!, /unresolved effect/);
+        assert.deepEqual(f.db.request(activation.id), before, 'Claimed and uncertain effects are unchanged');
+      }
+      assert.deepEqual(f.db.events({ sourceKey: decision.sourceKey }), [decision], 'The original decision is retained');
+      const withdrawals = f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] });
+      assert.equal(withdrawals.filter(e => e.requestId === activation.id).length, state === 'pending' ? 1 : 0);
+      const after = f.db.request(activation.id);
+      const calls = [...f.calls];
+      await automaticReturn(f.db, a.id, person, f.services, discard, 'repeat-discard');
+      assert.deepEqual(f.db.request(activation.id), after);
+      assert.deepEqual(f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] }), withdrawals);
+      assert.deepEqual(f.calls, calls, 'Repeating never calls lease return again');
+    });
+  }
 }
 
 test('R11: discard keeps an unresolved effect without losing the person decision', async t => {

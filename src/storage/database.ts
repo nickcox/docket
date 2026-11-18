@@ -2665,11 +2665,8 @@ export class Database {
       }
       const key = `return.authorised:${value.attemptId}`;
       const previous = this.db.prepare('SELECT * FROM events WHERE source_key = ?').get(key);
-      if (previous) {
-        const recorded = this.decodeEvent(previous);
-        if (value.discard && !recorded.payload.discard) throw new StorageError('conflict', 'Return and discard decisions differ');
-        return recorded;
-      }
+      const recorded = previous ? this.decodeEvent(previous) : null;
+      if (value.discard && recorded && !recorded.payload.discard) throw new StorageError('conflict', 'Return and discard decisions differ');
       if (value.discard && terminal) {
         // Only never-claimed worker effects can be cancelled by the discard decision.
         // Claimed and uncertain effects still require exact scoped reconciliation.
@@ -2681,6 +2678,7 @@ export class Database {
           this.storageEvent('request.withdrawn', value.caller, { request: object(this.request(request.id)) }, request.id);
         }
       }
+      if (recorded) return recorded;
       if (!value.discard && this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');
       if (abandonedWithoutOutcome) {
