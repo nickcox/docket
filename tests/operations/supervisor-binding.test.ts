@@ -71,6 +71,42 @@ test('R07/R08/A16/A17: person claim recovery still refuses a known non-terminal 
   }
 });
 
+test('R07/R08/A16/A55: person claim recovery accepts a stopped worker without terminal proof, but not a running one', async t => {
+  const f = await fixture(t), db = f.db, launcher = new FakeLauncher();
+  await db.addTask({ id: 'worker', title: 'Worker', kind: 'code', criteria: ['Works'] }, person);
+  const reservation = await db.reserveAttempt({ requestKey: 'dispatch', taskId: 'worker', caller: person, startingCommit: 'a'.repeat(40),
+    checks: parseCheckPolicy('a'.repeat(40), null, { executionProfile: 'test', fast: [], full: [] }),
+    delivery: { kind: 'code', acceptance: 'review_or_integration', requiredEvidence: [], requiredDeliverables: [] } });
+  const id = reservation.attempt.id;
+  const [owner] = await db.registerClaims([{ resourceKey: 'dispatch', role: 'maintenance', generation: 'dispatch', ownerRef: person,
+    schemaFamily: applicationId, schemaVersion: 1, configRevision: 1, heartbeatAt: new Date().toISOString() }], person);
+  const executor = { claimId: owner!.id, generation: owner!.generation };
+  const acquisition = await db.beginWorkspaceAcquisition(id, reservation.requestId, executor, person);
+  const input = acquisition.effect.input, workspace = input.workspace as Record<string, any>;
+  await db.recordAllocation(id, acquisition.effect.id, executor, { leaseId: 'lease', holder: workspace.holder,
+    path: join(String(workspace.pool), 'worker'), pool: String(workspace.pool), repository: input.repository as Record<string, any>,
+    outputRef: String(input.outputRef), startingCommit: 'a'.repeat(40) });
+  await db.startAttempt(id, person);
+  const host = { kind: 'host' as const, id: 'host', generation: 'generation' };
+  await prepareWorker(db, id, host, launcher);
+  const claim = db.claims().find(c => c.attemptId === id && c.role === 'worker_owner')!;
+  const args = { claimId: claim.id, confirmStopped: true, evidence: 'bb thread stop; thread idle with its turn interrupted', dryRun: false };
+  // Live Q1a: the owner died after admission; the recovering process has no in-memory fence.
+  let worker: 'active' | 'stopped' = 'active';
+  launcher.inspect = async () => ({ status: 'known', sourceId: 'bb:thr', sequence: 3, worker, turn: worker === 'active' ? 'running' : 'ended',
+    terminal: false, capabilities: launcher.capabilities({}) });
+  const runtime = async () => ({ launcher }) as unknown as Runtime;
+  const resolve = (key: string) => executeCoreOperation(findOperation('claim.resolve')!, args, () => {}, { config: f.file }, key,
+    { home: f.home, caller: person, runtime });
+  await assert.rejects(resolve('resolve-running'), code('owner_unresolved'));
+  worker = 'stopped';
+  await resolve('resolve-stopped');
+  assert.ok(db.claims().find(c => c.id === claim.id)!.releasedAt);
+  const terminal = db.events({ attemptId: id, kinds: ['worker.observed'] }).filter(e => e.payload.kind === 'terminal');
+  assert.equal(terminal.length, 1);
+  assert.equal((terminal[0]!.payload.payload as Record<string, unknown>).personConfirmedStopped, true);
+});
+
 test('R17/R28/A37/A52: generated role catalogues and strict bound schemas expose no caller or approval override', async t => {
   const f = await fixture(t);
   for (const role of ['person', 'supervisor', 'worker', 'host'] as const) {

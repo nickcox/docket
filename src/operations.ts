@@ -116,6 +116,13 @@ function mapStorage(error: unknown, db: Database, requestKey: string): never {
   throw failure;
 }
 
+/** A person's confirmed stop needs no terminal proof, but must not contradict a live owner read.
+ * A worker the launcher sees as stopped (for bb, no running turn and an idle or archived
+ * thread) agrees with it; a running or still-startable worker does not. */
+function contradictsStop(observation: import('./adapters/launcher.ts').WorkerObservation): boolean {
+  return observation.status === 'known' && !observation.terminal && observation.worker !== 'stopped';
+}
+
 export async function executeCoreOperation(operation: OperationDefinition, args: Record<string, unknown>, progress: (message: string) => void,
   selector: ContextSelector, requestKey: string = randomUUID(), options: OperationOptions = {}): Promise<Record<string, unknown>> {
   if (validateSchema(operation.inputSchema, args)) throw new CommandFailure('invalid_input');
@@ -390,7 +397,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           const reference = db.requests().find(r => r.attemptId === claim.attemptId && r.operation === 'worker.prepare')?.result?.reference;
           if (reference) {
             const observation = await (await services()).launcher.inspect(reference as import('./storage/launch.ts').WorkerReference);
-            if (observation.status === 'known' && !observation.terminal) throw new CommandFailure('owner_unresolved', { claimId: claim.id });
+            if (contradictsStop(observation)) throw new CommandFailure('owner_unresolved', { claimId: claim.id });
           }
         }
         const needsTerminal = claim.role === 'worker_owner' && claim.attemptId !== undefined
@@ -438,7 +445,7 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
         } else if (request.target?.kind === 'worker') {
           const reference = db.requests().find(r => r.attemptId === request.attemptId && r.operation === 'worker.prepare')?.result?.reference ?? request.target.reference;
           const observation = await runtime.launcher.inspect(reference as import('./storage/launch.ts').WorkerReference);
-          if (observation.status === 'known' && !observation.terminal) throw new CommandFailure('owner_unresolved', { effectId: request.id });
+          if (contradictsStop(observation)) throw new CommandFailure('owner_unresolved', { effectId: request.id });
         }
         if (ownerHappened !== null && ownerHappened !== (args.outcome === 'happened')) throw new CommandFailure('owner_unresolved');
         if (request.category !== 'effect' || !['claimed', 'uncertain'].includes(request.state)) {

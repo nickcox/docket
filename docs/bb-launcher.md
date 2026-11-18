@@ -16,6 +16,11 @@ Readiness refuses before thread creation if that check fails. Thread creation
 uses the exact leased environment path. Before rechecking the held prompt, the
 launcher verifies the thread, provider, project (when returned) and held queue
 row's model. It verifies the path if bb has already attached an environment.
+The core admits a held first prompt only while the worker owner's heartbeat is
+fresh (R08). For up to 30 seconds after an owner process dies, a later recheck,
+including one another dispatch requests, can still admit its prompt. That worker
+then runs with no Docket owner until the claim goes stale and a person stops it
+and resolves the claim.
 A successful recheck reply is not admission: the owner waits for the core's
 activation claim. Lost or malformed effect replies are uncertain, never retried.
 

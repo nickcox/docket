@@ -31,7 +31,7 @@ if (args[0] === 'docket') {
 }
 else if (args[0] === 'project') value = state.projects;
 else if (args[1] === 'spawn') value = {id:'thr_worker'};
-else if (args[1] === 'show') value = {thread:{id:state.threadId,providerId:state.provider,projectId:state.projectId,status:state.status,environmentId:state.status === 'pending' ? null : 'env_worker'},environment:state.status === 'pending' ? null : {path:state.path}};
+else if (args[1] === 'show') value = {thread:{id:state.threadId,providerId:state.provider,projectId:state.projectId,status:state.status,archivedAt:state.archivedAt ?? null,environmentId:state.status === 'pending' ? null : 'env_worker'},environment:state.status === 'pending' ? null : {path:state.path}};
 else if (args[1] === 'queue') value = [{model:state.model}];
 else if (args[1] === 'log') value = state.events;
 else if (args[1] === 'stop') value = {ok:true,threadId:'thr_worker'};
@@ -68,6 +68,31 @@ test('R06 R33 R34 A55: pending activation checks identity and held model without
       assert.equal((await f.launcher.inspect(prepared.value)).status, 'known');
     }
   }
+});
+
+test('R07 R08 A16 A55: a recovering process sees whether bb holds a running turn, without terminal proof', async t => {
+  const f = await fixture(t), prepared = await f.launcher.prepare(f.binding, 'prepare');
+  assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
+  const ref = prepared.value;
+  // The live Q1a owner died; recovery runs in a new process with no in-memory stop or fence.
+  const recovering = new BbLauncher({ repository: f.root, profiles: { local: f.execution }, admission: () => false,
+    run: (_file, args, cwd) => commandRunner({ timeoutMs: 60000, environment: { PATH: process.env.PATH } })(process.execPath,
+      [join(f.root, 'bb.cjs'), join(f.root, 'state.json'), join(f.root, 'calls.jsonl'), ...args], cwd) });
+  const read = async (status: string, events: unknown[], archivedAt: number | null = null) => {
+    Object.assign(f.current, { status, events, archivedAt }); await f.save();
+    const observed = await recovering.inspect(ref);
+    assert.equal(observed.status, 'known'); if (observed.status !== 'known') throw new Error();
+    assert.equal(observed.terminal, false);
+    return observed.worker;
+  };
+  const started = { threadId: 'thr_worker', seq: 1, type: 'turn/started', data: {} };
+  const interrupted = { threadId: 'thr_worker', seq: 2, type: 'system/thread/interrupted', data: {} };
+  assert.equal(await read('active', [started]), 'active');
+  assert.equal(await read('idle', [started]), 'active');
+  assert.equal(await read('idle', [started, interrupted]), 'stopped');
+  assert.equal(await read('pending', []), 'prepared');
+  assert.equal(await read('pending', [], 1), 'stopped');
+  assert.equal(await read('active', [started], 1), 'active');
 });
 
 test('R06 R33 R34 A55: inspect accepts pending and matching attached paths; mismatch records discrepancy and fences once', async t => {

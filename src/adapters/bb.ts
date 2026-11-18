@@ -203,13 +203,18 @@ export class BbLauncher implements Launcher {
       const startSequence = start?.seq ?? -1;
       this.lastStart.set(String(reference.threadId), startSequence);
       const stopped = this.stopped.get(String(reference.threadId)) === startSequence && ['idle', 'error'].includes(String(thread.status));
+      // Terminal proof needs this process's own stop and fence. A recovering process
+      // can still see that bb holds no running turn: an idle thread, or an archived
+      // one whose held input can no longer run.
+      const running = !!start && !ended;
+      const idle = !running && (['idle', 'error'].includes(String(thread.status)) || thread.archivedAt != null);
       const failure = object(end?.data.error) && typeof end.data.error.message === 'string' ? end.data.error.message : 'bb provider turn failed';
       const execution = this.options.profiles[String(reference.executionProfile)];
       const host = this.options.environment ?? process.env;
       const secret = execution?.credentialVariable ? host[execution.credentialVariable] : undefined;
       return { status: 'known', sourceId: `bb:${reference.threadId}`, sequence: events.at(-1)?.seq ?? 0,
         ...(discrepancy === 'later_turn' ? { laterTurn: true } : {}),
-        worker: stopped ? 'stopped' : thread.status === 'pending' ? 'prepared' : 'active',
+        worker: stopped || idle ? 'stopped' : thread.status === 'pending' ? 'prepared' : 'active',
         turn: ended ? 'ended' : start ? 'running' : 'idle', terminal: ended && stopped && this.fenced.has(String(reference.threadId)),
         capabilities: structuredClone(capabilities),
         ...(end?.data.status === 'failed' ? { turnFailure: {
