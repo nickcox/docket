@@ -21,7 +21,7 @@ export interface BbOptions {
   environment?: NodeJS.ProcessEnv;
   run?: Runner;
   admission: (effectId: string) => boolean;
-  observe?: (reference: WorkerReference, events: BbEvent[]) => Promise<void>;
+  observe?: (reference: WorkerReference, events: BbEvent[]) => Promise<void | 'later_turn'>;
   discrepancy?: (reference: WorkerReference) => Promise<void>;
   admissionMs?: number;
 }
@@ -196,7 +196,7 @@ export class BbLauncher implements Launcher {
       }
       if (thread.providerId !== reference.provider) throw new Error();
       const events = await this.events(reference);
-      await this.options.observe?.(reference, events);
+      const discrepancy = await this.options.observe?.(reference, events);
       const start = events.findLast(e => e.type === 'turn/started');
       const end = events.findLast(e => e.type === 'turn/completed' || e.type === 'system/thread/interrupted');
       const ended = !!end && (!start || end.seq > start.seq);
@@ -208,6 +208,7 @@ export class BbLauncher implements Launcher {
       const host = this.options.environment ?? process.env;
       const secret = execution?.credentialVariable ? host[execution.credentialVariable] : undefined;
       return { status: 'known', sourceId: `bb:${reference.threadId}`, sequence: events.at(-1)?.seq ?? 0,
+        ...(discrepancy === 'later_turn' ? { laterTurn: true } : {}),
         worker: stopped ? 'stopped' : thread.status === 'pending' ? 'prepared' : 'active',
         turn: ended ? 'ended' : start ? 'running' : 'idle', terminal: ended && stopped && this.fenced.has(String(reference.threadId)),
         capabilities: structuredClone(capabilities),

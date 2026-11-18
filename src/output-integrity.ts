@@ -5,16 +5,16 @@ import type { Database } from './storage/database.ts';
 import type { GitRepository } from './adapters/repository.ts';
 
 export type OutputRepository = Pick<GitRepository, 'inspectRef' | 'inspectWorkspace'> & {
-  inspectWorkerOutput?: (attemptId: string) => Promise<boolean>;
+  inspectWorkerOutput?: (attemptId: string) => Promise<boolean | 'later_turn'>;
 };
 
 /** Re-read mutable output immediately before using the recorded evidence. */
 export async function requireOutputIntegrity(db: Database, attemptId: string, repository: OutputRepository,
   selected?: { outputRef: string; commit: string }) {
-  if (repository.inspectWorkerOutput && !await repository.inspectWorkerOutput(attemptId)) {
-    throw new CommandFailure('owner_unknown', { attemptId });
-  }
-  if (db.laterTurnDiscrepancy(attemptId)) throw new CommandFailure('result_discrepancy', { attemptId });
+  const observation = await repository.inspectWorkerOutput?.(attemptId);
+  if (observation === false) throw new CommandFailure('owner_unknown', { attemptId });
+  const discrepancy = db.laterTurnDiscrepancy(attemptId, observation === 'later_turn');
+  if (discrepancy) throw new CommandFailure('result_discrepancy', { attemptId }, discrepancy.nextAction);
   const attempt = db.attempt(attemptId), candidate = selected ?? attempt.candidate;
   if (candidate) {
     const output = await repository.inspectRef(String(candidate.outputRef));

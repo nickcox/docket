@@ -28,7 +28,7 @@ export interface LauncherCapabilities {
 }
 export interface TurnFailure { kind: 'provider_limit' | 'model_error'; message: string }
 export type WorkerObservation =
-  | { status: 'known'; sourceId: string; sequence: number; worker: 'prepared' | 'active' | 'stopped'; turn: 'idle' | 'running' | 'ended'; terminal: boolean; capabilities: LauncherCapabilities; exit?: { code: number | null; signal: string | null }; failure?: string; turnFailure?: TurnFailure }
+  | { status: 'known'; sourceId: string; sequence: number; worker: 'prepared' | 'active' | 'stopped'; turn: 'idle' | 'running' | 'ended'; terminal: boolean; capabilities: LauncherCapabilities; exit?: { code: number | null; signal: string | null }; failure?: string; turnFailure?: TurnFailure; laterTurn?: boolean }
   | { status: 'absent' }
   | { status: 'unknown'; reason: string };
 export type Usage = { status: 'reported'; sourceId: string; sequence: number; metrics: Record<string, number>; currency?: string }

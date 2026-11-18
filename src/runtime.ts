@@ -2,6 +2,7 @@ import { readFile, lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { windowsSettingsWritableOnlyByOwner, windowsSecurePrivateDirectory } from './adapters/host-files.ts';
+import type { Runner } from './adapters/command.ts';
 import { PiLauncher } from './adapters/pi.ts';
 import { BbLauncher, type BbExecutionProfile } from './adapters/bb.ts';
 import type { WorkerHost } from './storage/launch.ts';
@@ -13,7 +14,7 @@ import { checkCommandRunner } from './adapters/checks.ts';
 import type { ExecutionProfile } from './check-policy.ts';
 import type { CompletionServices } from './completion.ts';
 import type { Launcher } from './adapters/launcher.ts';
-import type { Database, JsonObject } from './storage/database.ts';
+import { StorageError, type Database, type JsonObject } from './storage/database.ts';
 import type { Configuration } from './configuration.ts';
 import { ConfigurationError, strictJson, canonicalJson } from './configuration.ts';
 
@@ -24,6 +25,7 @@ export interface Runtime {
   launcher: Launcher;
 }
 export interface RuntimeOptions {
+  bbRun?: Runner;
   windowsSettingsWritableOnlyByOwner?: (path: string) => Promise<boolean>;
   windowsSecurePrivateDirectory?: (path: string) => Promise<void>;
 }
@@ -86,7 +88,7 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
       const checked = db.checkWorkerEffect(effectId, { claimId: request.claimId!, generation });
       return JSON.stringify(checked.input.specification) === JSON.stringify(input);
     } });
-  const bb = new BbLauncher({ repository: config.repository, profiles: profiles.bb ?? {}, admission: effectId => db.request(effectId).state === 'claimed'
+  const bb = new BbLauncher({ repository: config.repository, profiles: profiles.bb ?? {}, ...(options.bbRun ? { run: options.bbRun } : {}), admission: effectId => db.request(effectId).state === 'claimed'
       || db.request(effectId).state === 'succeeded',
     discrepancy: async reference => {
       const preparation = db.requests({ operation: 'worker.prepare' }).find(r => r.result?.reference
@@ -111,15 +113,23 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
       const terminalIndex = history.findIndex(e => e.attemptId === attemptId && e.kind === 'worker.observed' && e.payload.kind === 'terminal');
       const boundary = Math.max(-1, ...history.slice(0, terminalIndex).filter(e => e.attemptId === attemptId
         && e.kind === 'worker.observed' && e.payload.sourceId === `bb:${reference.threadId}`).map(e => Number(e.payload.sourceSequence)));
+      let discrepancy: 'later_turn' | undefined;
       for (const event of events) {
         const later = terminalIndex >= 0 && event.type === 'turn/started' && event.seq > boundary;
         if (terminalIndex >= 0 ? !later : !['turn/completed', 'system/thread/interrupted'].includes(event.type)) continue;
         if (history.some(e => e.attemptId === attemptId && e.kind === 'worker.observed'
           && e.payload.sourceId === `bb:${reference.threadId}` && e.payload.sourceSequence === event.seq)) continue;
-        await db.recordWorkerObservation({ sourceId: `bb:${reference.threadId}`, sourceSequence: event.seq, attemptId,
-          workerRef: reference, observedAt: new Date().toISOString(), kind: later ? 'later_turn' : 'turn_ended',
-          payloadVersion: 1, payload: {} }, claim.ownerRef as WorkerHost);
+        try {
+          await db.recordWorkerObservation({ sourceId: `bb:${reference.threadId}`, sourceSequence: event.seq, attemptId,
+            workerRef: reference, observedAt: new Date().toISOString(), kind: later ? 'later_turn' : 'turn_ended',
+            payloadVersion: 1, payload: {} }, claim.ownerRef as WorkerHost);
+        } catch (error) {
+          // A read-only inspection still detects the discrepancy, without replacing durable evidence.
+          if (!later || !(error instanceof StorageError) || error.code !== 'read_only') throw error;
+          discrepancy = 'later_turn';
+        }
       }
+      return discrepancy;
     } });
   const select = (reference: import('./storage/launch.ts').WorkerReference) => reference.launcher === 'bb' ? bb : pi;
   const launcher: Launcher = {
@@ -135,7 +145,8 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
     const preparation = db.requests({ attemptId, operation: 'worker.prepare' })[0];
     const reference = preparation?.result?.reference as import('./storage/launch.ts').WorkerReference | undefined;
     if (reference?.launcher !== 'bb') return true;
-    return (await bb.inspect(reference)).status === 'known';
+    const observation = await bb.inspect(reference);
+    return observation.status === 'known' ? observation.laterTurn ? 'later_turn' : true : false;
   } });
   const profile = profiles.checks[String((config.checks as JsonObject).executionProfile)];
   if (!profile) throw new ConfigurationError('$executionProfiles.checks', 'Missing check execution profile');

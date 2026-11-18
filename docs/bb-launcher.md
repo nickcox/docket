@@ -172,6 +172,9 @@ now, queue send, and unqualified recovery paths can bypass it. A worker thread
 outside a project listed in the plugin's `projects` setting also bypasses the
 hook without calling Docket, so Docket relies on later-turn detection. Docket reads
 later turn starts as discrepancies and rechecks retained output before checks,
-acceptance, integration and return. A later turn after lease return can still
+acceptance, integration and return. Read-only status and dry-run acceptance also
+report an unrecorded later turn as `result_discrepancy`, without writing; writable
+operations record the observation. An unreadable bb response remains unknown.
+A later turn after lease return can still
 change a workspace reused by another attempt; Docket cannot detect every such
 change. Unknown owner state never authorises a retry or adoption.

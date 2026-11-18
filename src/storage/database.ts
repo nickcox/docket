@@ -2198,7 +2198,7 @@ export class Database {
   }
 
   /** Resolution follows durable event order; replaying an old observation cannot undo a selection. */
-  laterTurnDiscrepancy(attemptId: string) {
+  laterTurnDiscrepancy(attemptId: string, observedLaterTurn = false) {
     const events = this.events({ attemptId, kinds: ['worker.observed', 'candidate.selected', 'return.authorised'] });
     const mismatch = events.findLast(event => event.kind === 'worker.observed' && event.payload.kind === 'environment_mismatch');
     if (mismatch && !events.some(event => event.seq > mismatch.seq && event.kind === 'return.authorised' && event.payload.discard === true)) {
@@ -2207,9 +2207,9 @@ export class Database {
         nextAction: nextAction('attempt.show', { attemptId }, 'Inspect the environment mismatch and ask a person to discard the attempt.') };
     }
     const later = events.findLast(event => event.kind === 'worker.observed' && event.payload.kind === 'later_turn');
-    if (!later || events.some(event => event.seq > later.seq
-      && (event.kind === 'candidate.selected' || event.kind === 'return.authorised' && event.payload.discard === true))) return null;
-    return { code: 'result_discrepancy' as const, eventId: later.id,
+    if (!observedLaterTurn && (!later || events.some(event => event.seq > later.seq
+      && (event.kind === 'candidate.selected' || event.kind === 'return.authorised' && event.payload.discard === true)))) return null;
+    return { code: 'result_discrepancy' as const, eventId: later?.id ?? null,
       message: 'result_discrepancy: A later worker turn was observed. Select a candidate explicitly or ask a person to discard the attempt.',
       nextAction: nextAction('attempt.show', { attemptId }, 'Inspect the later turn, then select a candidate explicitly or ask a person to discard the attempt.') };
   }

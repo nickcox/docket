@@ -1,6 +1,6 @@
 import { join, dirname } from 'node:path';
 import { canonicalJson } from './configuration.ts';
-import { requireOutputIntegrity, requireResultIntegrity } from './output-integrity.ts';
+import { requireOutputIntegrity, requireResultIntegrity, type OutputRepository } from './output-integrity.ts';
 import { runCandidateChecks } from './checks.ts';
 import { checkEvidenceKey, mandatoryChecks } from './check-policy.ts';
 import type { TrustedChecks } from './storage/reservations.ts';
@@ -27,7 +27,7 @@ export interface ReturnWorkspace {
   returnLease(allocation: Allocation, request: { authorised: true; requestId: string; retention: RetentionRequest }): Promise<Result<{ returned: true }>>;
 }
 export interface CompletionServices extends CheckServices {
-  repository: CheckServices['repository'] & Pick<GitRepository, 'inspectRef' | 'compare' | 'verifyRetention' | 'conditionalFastForward' | 'conditionalDeleteRef' | 'command' | 'createPinnedRef' | 'conditionalMoveRef' | 'prepareRebase'>;
+  repository: CheckServices['repository'] & OutputRepository & Pick<GitRepository, 'inspectRef' | 'compare' | 'verifyRetention' | 'conditionalFastForward' | 'conditionalDeleteRef' | 'command' | 'createPinnedRef' | 'conditionalMoveRef' | 'prepareRebase'>;
   workspace: ReturnWorkspace;
   readPolicy?: typeof readFinalisationPolicy;
 }

@@ -225,7 +225,10 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
           const returnReason = currentReturnReason === 'Lease is ready to return.' && !discarded && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;
           const invalidResult = db.invalidWorkerResult(a.id);
-          const discrepancy = db.laterTurnDiscrepancy(a.id);
+          const observation = a.allocation && a.leaseState !== 'returned'
+            && db.events({ attemptId: a.id, kinds: ['worker.observed'] }).some(e => e.payload.kind === 'terminal')
+            ? await (await services()).completion.repository.inspectWorkerOutput?.(a.id) : undefined;
+          const discrepancy = db.laterTurnDiscrepancy(a.id, observation === 'later_turn');
           const reason = discrepancy?.message ?? (!resolved ? invalidResult?.message : null) ?? returnReason ?? (resolved ? null : ['failed', 'uncertain'].includes(checksState) ? `Candidate checks ${checksState}.`
             : a.candidate && !accepted ? 'Candidate is awaiting acceptance.'
             : a.leaseState === 'held' ? 'Lease is held.'
