@@ -23,29 +23,69 @@ if (state.refusal && args[1] === 'spawn') { process.stdout.write(JSON.stringify(
 if (state.timeout && args[1] === 'spawn') { setTimeout(() => {}, 10000); return; }
 if (state.lost === args[1]) { process.stdout.write('{'); process.exit(0); }
 let value;
-if (args[0] === 'docket') value = args[1] === 'ready' ? {version:1,ready:state.ready} : {requested:true,threadId:'thr_worker'};
+if (args[0] === 'docket') {
+  value = args[1] === 'ready' ? {version:1,ready:state.ready} : {requested:true,threadId:'thr_worker'};
+  if (args[1] === 'recheck' && state.admitted) {
+    state.status = 'active'; fs.writeFileSync(process.argv[2], JSON.stringify(state));
+  }
+}
 else if (args[0] === 'project') value = state.projects;
 else if (args[1] === 'spawn') value = {id:'thr_worker'};
-else if (args[1] === 'show') value = {thread:{id:'thr_worker',providerId:'pi',status:state.status},environment:{path:state.path}};
-else if (args[1] === 'queue') value = [{model:'model'}];
+else if (args[1] === 'show') value = {thread:{id:state.threadId,providerId:state.provider,projectId:state.projectId,status:state.status,environmentId:state.status === 'pending' ? null : 'env_worker'},environment:state.status === 'pending' ? null : {path:state.path}};
+else if (args[1] === 'queue') value = [{model:state.model}];
 else if (args[1] === 'log') value = state.events;
 else if (args[1] === 'stop') value = {ok:true,threadId:'thr_worker'};
 else value = {threadId:'thr_worker',delivery:'queued'};
 process.stdout.write(JSON.stringify(value));`);
-  const current = { ready: true, lost: '', refusal: '', timeout: false, status: 'idle', path: workspace, events: [] as unknown[],
+  const current = { ready: true, admitted: true, lost: '', refusal: '', timeout: false, status: 'pending', threadId: 'thr_worker', provider: 'pi', model: 'model', projectId: 'proj_local', path: workspace, events: [] as unknown[],
     projects: [{ id: 'proj_local', kind: 'standard', sources: [{ type: 'local_path', hostId: 'host_local', path: root }] }] };
   const save = () => writeFile(state, JSON.stringify(current));
   await save();
-  let admitted = true;
   const execution: BbExecutionProfile = { executable: process.execPath, passEnvironment: [], machineId: 'host_local' };
+  const discrepancies: unknown[] = [];
   const launcher = new BbLauncher({ repository: root, profiles: { local: execution },
-    admissionMs: 1, admission: () => admitted,
+    discrepancy: async reference => { discrepancies.push(reference); },
+    admissionMs: 1, admission: () => current.admitted,
     run: (_file, args, cwd) => commandRunner({ timeoutMs: current.timeout ? 1000 : 60000, environment: { PATH: process.env.PATH } })(process.execPath, [script, state, log, ...args], cwd) });
   const binding = { specification: { profile: { launcher: 'bb', executionProfile: 'local', provider: 'pi', model: 'model', reasoning: null } },
     initialInput: 'exact\ntext\n', allocation: { path: workspace }, sessionId: 'session', resultPath: join(root, 'retained', 'result.json') } as unknown as WorkerBinding;
   const calls = async () => (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  return { root, launcher, binding, current, execution, save, calls, deny: () => { admitted = false; } };
+  return { root, launcher, binding, current, execution, discrepancies, save, calls, deny: async () => { current.admitted = false; await save(); } };
 }
+
+test('R06 R33 R34 A55: pending activation checks identity and held model without an attached environment', async t => {
+  for (const field of [null, 'provider', 'model', 'projectId', 'threadId'] as const) {
+    const f = await fixture(t), prepared = await f.launcher.prepare(f.binding, 'prepare');
+    assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
+    if (field) f.current[field] = 'wrong';
+    await f.save();
+    const result = await f.launcher.activate(prepared.value, {}, 'activate', 'generation');
+    assert.equal(result.status, field === 'threadId' ? 'uncertain' : field ? 'rejected' : 'confirmed');
+    assert.equal((await f.calls()).filter(c => c.args[1] === 'recheck').length, field ? 0 : 1);
+    if (!field) {
+      const attached = JSON.parse(await readFile(join(f.root, 'state.json'), 'utf8'));
+      assert.equal(attached.status, 'active');
+      assert.equal((await f.launcher.inspect(prepared.value)).status, 'known');
+    }
+  }
+});
+
+test('R06 R33 R34 A55: inspect accepts pending and matching attached paths; mismatch records discrepancy and fences once', async t => {
+  const f = await fixture(t), prepared = await f.launcher.prepare(f.binding, 'prepare');
+  assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
+  const ref = prepared.value;
+  const pending = await f.launcher.inspect(ref);
+  assert.ok(pending.status === 'known' && pending.worker === 'prepared');
+  f.current.status = 'active'; await f.save();
+  assert.equal((await f.launcher.inspect(ref)).status, 'known');
+  f.current.path = join(f.root, 'wrong'); await f.save();
+  assert.equal((await f.launcher.inspect(ref)).status, 'unknown');
+  assert.deepEqual(f.discrepancies, [ref]);
+  assert.equal((await f.calls()).filter(c => c.args[1] === 'stop').length, 1);
+  assert.equal((await f.launcher.deliver(ref, 'no', 'after_turn', 'send')).status, 'rejected');
+  await f.launcher.inspect(ref);
+  assert.equal((await f.calls()).filter(c => c.args[1] === 'stop').length, 1);
+});
 
 test('R31: runtime routes profile launchers and validates bb execution settings without changing Pi capabilities', async t => {
   const f = await fixture(t), directory = join(f.root, '.config', 'docket');
@@ -98,7 +138,7 @@ test('R31 R33 A15: lost create, send and activation replies are uncertain and ne
   const prepared = await f.launcher.prepare(f.binding, 'new');
   assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
   const ref = prepared.value;
-  f.deny();
+  await f.deny();
   assert.equal((await f.launcher.activate(ref, {}, 'activate', 'generation')).status, 'uncertain');
   assert.equal((await f.launcher.activate(ref, {}, 'activate', 'generation')).status, 'uncertain');
   assert.equal((await f.calls()).filter(c => c.args[1] === 'recheck').length, 1);
@@ -151,6 +191,7 @@ test('R31 R33 A17: idle is not terminal, turn-end needs stop and fence; usage om
   const ref = prepared.value;
   assert.equal((await f.launcher.inspect(ref)).status, 'known');
   assert.equal((await f.launcher.usage(ref)).status, 'unknown');
+  f.current.status = 'idle';
   f.current.events = [
     { threadId: 'thr_worker', seq: 1, type: 'turn/started', data: {} },
     { threadId: 'thr_worker', seq: 2, type: 'turn/completed', data: {} },

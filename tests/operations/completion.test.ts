@@ -139,6 +139,48 @@ test('A18 R11: reused passing checks do not waive acceptance workspace integrity
   assert.equal(f.db.acceptance(f.a.id, f.accept.candidateId), null);
 });
 
+test('R06 R33 R34 A55: an environment discrepancy is bounded and requests stop before terminal', async t => {
+  const f = await checkFixture(t);
+  const a = await f.attempt('pending', ['Criterion'], undefined, head, start, policyContent, 'prepared');
+  const mismatch = { ...a.observation('terminal', 3), kind: 'environment_mismatch' as const, payload: {} };
+  await assert.rejects(f.db.recordWorkerObservation({ ...mismatch, payload: { path: 'unbounded' } }, host), { code: 'result_invalid' });
+  await assert.rejects(f.db.recordWorkerObservation(mismatch, { ...host, id: 'wrong' }), { code: 'conflict' });
+  await f.db.recordWorkerObservation(mismatch, host);
+  await f.db.recordWorkerObservation(mismatch, host);
+  assert.equal(f.db.workerStopRequested(a.id), true);
+  assert.equal(f.db.events().filter(e => e.attemptId === a.id && e.payload.kind === 'environment_mismatch').length, 1);
+  assert.equal(f.db.laterTurnDiscrepancy(a.id)?.code, 'result_discrepancy');
+});
+
+test('R33 R34 A55: environment mismatch survives selection and blocks checks, acceptance and return until person discard', async t => {
+  const f = await fixture(t);
+  await f.db.recordWorkerObservation({ ...f.a.observation('terminal', 3), kind: 'environment_mismatch', payload: {} }, host);
+  await selectCandidate(f.db, { attemptId: f.a.id, commit: head, caller: person }, f.services);
+  for (const run of [
+    () => runCandidateChecks(f.db, f.a.id, person, f.services),
+    () => acceptCandidate(f.db, { ...f.accept, overrideReason: 'Cannot waive mismatch' }, f.services),
+    () => returnAttempt(f.db, f.returns, f.services),
+  ]) await assert.rejects(run, { code: 'result_discrepancy' });
+  assert.deepEqual(f.calls, []);
+  await returnAttempt(f.db, { ...f.returns, requestKey: 'discard', discard: {
+    leaseId: f.a.allocation.leaseId, confirmed: true, reason: 'Discard environment mismatch output',
+  } }, f.services);
+  assert.equal(f.db.laterTurnDiscrepancy(f.a.id), null);
+});
+
+test('R33 R34 A55: an environment mismatch observed after acceptance blocks integration', async t => {
+  const f = await fixture(t, true);
+  await runCandidateChecks(f.db, f.a.id, person, f.services);
+  const authorise = f.db.recordAcceptance.bind(f.db);
+  f.db.recordAcceptance = async (...args) => {
+    const accepted = await authorise(...args);
+    await f.db.recordWorkerObservation({ ...f.a.observation('terminal', 3), kind: 'environment_mismatch', payload: {} }, host);
+    return accepted;
+  };
+  await assert.rejects(acceptCandidate(f.db, f.accept, f.services), { code: 'result_discrepancy' });
+  assert.ok(!f.calls.includes('integrate'));
+});
+
 test('A17/A18 R11/R33: a later-turn observation requires terminal evidence and a strict empty payload', async t => {
   const f = await checkFixture(t);
   const a = await f.attempt('not-terminal', ['Criterion'], undefined, head, start, policyContent, 'prepared');

@@ -36,7 +36,7 @@ export interface WorkerObservation extends JsonObject {
   attemptId: string;
   workerRef: WorkerReference;
   observedAt: string;
-  kind: 'turn_ended' | 'terminal' | 'later_turn' | 'result_available' | 'idle';
+  kind: 'turn_ended' | 'terminal' | 'later_turn' | 'environment_mismatch' | 'result_available' | 'idle';
   payloadVersion: 1;
   payload: JsonObject;
 }
@@ -197,6 +197,6 @@ export function workerObservation(value: WorkerObservation): void {
       fields(payload, ['turnEnded', 'threadStopped', 'fenceRecorded']);
       if (payload.turnEnded !== true || payload.threadStopped !== true || payload.fenceRecorded !== true) invalid('bb terminal observation requires turn ended, thread stopped and fence recorded');
     } else invalid('Unknown terminal observation launcher');
-  } else if (['turn_ended', 'later_turn', 'result_available', 'idle'].includes(value.kind)) fields(payload, []);
+  } else if (['turn_ended', 'later_turn', 'environment_mismatch', 'result_available', 'idle'].includes(value.kind)) fields(payload, []);
   else invalid('Unsupported worker observation kind');
 }

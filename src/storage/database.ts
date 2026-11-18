@@ -1826,7 +1826,8 @@ export class Database {
   /** Recorded commands are noticed by the owning dispatch, never executed by another process. */
   workerStopRequested(attemptId: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND category = 'command' AND operation = 'attempt.stop' LIMIT 1").get(attemptId)
-      || !!this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.budget-stop-requested' LIMIT 1").get(attemptId);
+      || !!this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.budget-stop-requested' LIMIT 1").get(attemptId)
+      || !!this.db.prepare("SELECT 1 FROM events WHERE attempt_id = ? AND kind = 'worker.observed' AND json_extract(payload, '$.kind') = 'environment_mismatch' LIMIT 1").get(attemptId);
   }
 
   async requestWorkerControl(command: CommandInput, dryRun = false): Promise<void> {
@@ -2191,6 +2192,12 @@ export class Database {
   /** Resolution follows durable event order; replaying an old observation cannot undo a selection. */
   laterTurnDiscrepancy(attemptId: string) {
     const events = this.events({ attemptId, kinds: ['worker.observed', 'candidate.selected', 'return.authorised'] });
+    const mismatch = events.findLast(event => event.kind === 'worker.observed' && event.payload.kind === 'environment_mismatch');
+    if (mismatch && !events.some(event => event.seq > mismatch.seq && event.kind === 'return.authorised' && event.payload.discard === true)) {
+      return { code: 'result_discrepancy' as const, eventId: mismatch.id,
+        message: 'result_discrepancy: bb attached a different environment. Ask a person to discard the attempt.',
+        nextAction: nextAction('attempt.show', { attemptId }, 'Inspect the environment mismatch and ask a person to discard the attempt.') };
+    }
     const later = events.findLast(event => event.kind === 'worker.observed' && event.payload.kind === 'later_turn');
     if (!later || events.some(event => event.seq > later.seq
       && (event.kind === 'candidate.selected' || event.kind === 'return.authorised' && event.payload.discard === true))) return null;
@@ -2213,7 +2220,7 @@ export class Database {
     const value = object(observation) as WorkerObservation, actor = object(host) as WorkerHost;
     return this.write(() => {
       const attempt = this.attemptRow(value.attemptId);
-      if (value.kind === 'later_turn') {
+      if (value.kind === 'later_turn' || value.kind === 'environment_mismatch') {
         // A finished worker's owner is released, not replaced. Discrepancy evidence
         // cannot grant permission or adopt its worker, and retains that exact owner.
         const claim = this.claims().find(c => c.id === attempt.owner_claim_id);

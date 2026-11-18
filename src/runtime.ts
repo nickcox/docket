@@ -88,6 +88,18 @@ export async function createRuntime(db: Database, config: Configuration, home?: 
     } });
   const bb = new BbLauncher({ repository: config.repository, profiles: profiles.bb ?? {}, admission: effectId => db.request(effectId).state === 'claimed'
       || db.request(effectId).state === 'succeeded',
+    discrepancy: async reference => {
+      const preparation = db.requests({ operation: 'worker.prepare' }).find(r => r.result?.reference
+        && canonicalJson(r.result.reference) === canonicalJson(reference));
+      if (!preparation?.attemptId) throw new Error('Unbound bb environment discrepancy');
+      const attemptId = preparation.attemptId;
+      const claim = db.claims().find(c => c.attemptId === attemptId && c.role === 'worker_owner');
+      if (!claim) throw new Error('Missing bb owner');
+      if (db.events({ attemptId, kinds: ['worker.observed'] }).some(e => e.payload.kind === 'environment_mismatch')) return;
+      await db.recordWorkerObservation({ sourceId: `bb:environment:${reference.threadId}`, sourceSequence: 0,
+        attemptId, workerRef: reference, observedAt: new Date().toISOString(), kind: 'environment_mismatch',
+        payloadVersion: 1, payload: {} }, claim.ownerRef as WorkerHost);
+    },
     observe: async (reference, events) => {
       const preparation = db.requests({ operation: 'worker.prepare' }).find(r => r.result?.reference
         && canonicalJson(r.result.reference) === canonicalJson(reference));

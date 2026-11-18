@@ -22,6 +22,7 @@ export interface BbOptions {
   run?: Runner;
   admission: (effectId: string) => boolean;
   observe?: (reference: WorkerReference, events: BbEvent[]) => Promise<void>;
+  discrepancy?: (reference: WorkerReference) => Promise<void>;
   admissionMs?: number;
 }
 const capabilities: LauncherCapabilities = {
@@ -138,7 +139,7 @@ export class BbLauncher implements Launcher {
       const value = await this.call(executionProfile, args);
       if (!object(value) || typeof value.id !== 'string' || !/^thr_[\w-]+$/.test(value.id)) throw new Error();
       return confirmed({ launcher: 'bb', threadId: value.id, executionProfile, provider: String(profile.provider),
-        model: String(profile.model), path: binding.allocation.path, sessionId: binding.sessionId, resultPath: binding.resultPath });
+        model: String(profile.model), projectId: projectId!, path: binding.allocation.path, sessionId: binding.sessionId, resultPath: binding.resultPath });
     } catch (error) {
       if (error instanceof BbRefusal) return rejected('bb refused creation before creating a thread', error.evidence);
       return uncertain('bb create response lost or unreadable', { effectId, sessionId: binding.sessionId });
@@ -148,7 +149,9 @@ export class BbLauncher implements Launcher {
     if (!this.once(effectId)) return uncertain('bb activation already attempted', reference);
     try {
       const view = await this.view(reference);
-      if (view.thread.providerId !== reference.provider || view.environment.path !== reference.path) return rejected('bb execution identity changed');
+      if (view.thread.providerId !== reference.provider
+        || (view.thread.projectId !== undefined && view.thread.projectId !== reference.projectId)
+        || (view.environment !== null && view.environment.path !== reference.path)) return rejected('bb execution identity changed');
       const queue = await this.call(String(reference.executionProfile), ['thread', 'queue', 'list', String(reference.threadId), '--json']);
       if (!Array.isArray(queue) || queue.length !== 1 || !object(queue[0]) || queue[0].model !== reference.model) {
         return rejected('bb held prompt model could not be verified');
@@ -163,11 +166,13 @@ export class BbLauncher implements Launcher {
       return uncertain('bb admission not recorded', reference);
     } catch { return uncertain('bb activation response lost or unreadable', reference); }
   }
-  private async view(reference: WorkerReference): Promise<{ thread: JsonObject; environment: JsonObject }> {
+  private async view(reference: WorkerReference): Promise<{ thread: JsonObject; environment: JsonObject | null }> {
     const value = await this.call(String(reference.executionProfile), ['thread', 'show', String(reference.threadId), '--json']);
-    if (!object(value) || !object(value.thread) || value.thread.id !== reference.threadId || !object(value.environment)
+    if (!object(value) || !object(value.thread) || value.thread.id !== reference.threadId
+      || !(value.environment === null ? value.thread.environmentId === null
+        : object(value.environment) && typeof value.environment.path === 'string')
       || !['active', 'error', 'idle', 'pending', 'starting', 'stopping'].includes(String(value.thread.status))) throw new Error('Unreadable bb thread');
-    return { thread: value.thread, environment: value.environment };
+    return { thread: value.thread, environment: value.environment as JsonObject | null };
   }
   private async events(reference: WorkerReference): Promise<BbEvent[]> {
     const value = await this.call(String(reference.executionProfile), ['thread', 'log', String(reference.threadId), '--json', '--all']);
@@ -182,8 +187,15 @@ export class BbLauncher implements Launcher {
   }
   async inspect(reference: WorkerReference): Promise<WorkerObservation> {
     try {
-      const { thread, environment } = await this.view(reference), events = await this.events(reference);
-      if (thread.providerId !== reference.provider || environment.path !== reference.path) throw new Error();
+      const { thread, environment } = await this.view(reference);
+      if (environment !== null && environment.path !== reference.path) {
+        // Persist the discrepancy before stopping; repeated reads never retry the stop.
+        try { await this.options.discrepancy?.(reference); }
+        finally { await this.fence(reference, `environment-mismatch:${reference.threadId}`); }
+        return { status: 'unknown', reason: 'bb environment differs from the leased path' };
+      }
+      if (thread.providerId !== reference.provider) throw new Error();
+      const events = await this.events(reference);
       await this.options.observe?.(reference, events);
       const start = events.findLast(e => e.type === 'turn/started');
       const end = events.findLast(e => e.type === 'turn/completed' || e.type === 'system/thread/interrupted');

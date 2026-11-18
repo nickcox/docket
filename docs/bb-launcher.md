@@ -14,7 +14,8 @@ explicit provider and model. The enabled Docket plugin must have a host-service
 binding whose catalogue includes `host.bb-admit`.
 Readiness refuses before thread creation if that check fails. Thread creation
 uses the exact leased environment path. Before rechecking the held prompt, the
-launcher verifies that path and provider, and the held queue row's model.
+launcher verifies the thread, provider, project (when returned) and held queue
+row's model. It verifies the path if bb has already attached an environment.
 A successful recheck reply is not admission: the owner waits for the core's
 activation claim. Lost or malformed effect replies are uncertain, never retried.
 
@@ -63,6 +64,16 @@ existing folder through its own checkout environment; it does not own, retire,
 run set-up or teardown scripts in, or remove the folder. Docket alone controls
 the lease and return. Archive/delete/cascade behaviour still needs pinned A56
 qualification.
+
+bb 0.49.0 leaves a held first prompt's thread pending with `environmentId: null`
+and `environment: null`. It attaches the environment only when that prompt is
+admitted. Neither the CLI nor the hook's environment intent exposes the requested
+path beforehand. Docket therefore verifies the path at the first observation
+after attachment, not before admission. A different attached path records a
+bounded `environment_mismatch` worker observation and fences/stops the worker,
+without retries. This extends the later-turn `result_discrepancy` refusal:
+checks, acceptance, integration and return are blocked, even after candidate
+selection. A person must inspect and discard the attempt; it is not resumed.
 
 bb's environment record outlives the lease. When Treehouse recycles the folder,
 an earlier worker's thread can stay attached and a later bb worker may reuse the
