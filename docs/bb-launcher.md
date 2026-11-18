@@ -21,6 +21,12 @@ fresh (R08). For up to 30 seconds after an owner process dies, a later recheck,
 including one another dispatch requests, can still admit its prompt. That worker
 then runs with no Docket owner until the claim goes stale and a person stops it
 and resolves the claim.
+bb may admit a held prompt by itself once launch permission exists, for example
+when capacity frees, before the launcher requests a recheck. The launcher checks
+the core's recorded admission before reading bb and again if the queue is empty.
+Recorded admission confirms activation without a recheck; an empty queue without
+it remains uncertain, never a definite rejection. Multiple held rows also remain
+uncertain.
 A successful recheck reply is not admission: the owner waits for the core's
 activation claim. Lost or malformed effect replies are uncertain, never retried.
 

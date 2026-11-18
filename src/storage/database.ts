@@ -3447,6 +3447,11 @@ export class Database {
     if (Object.keys(outcome).length === 0) throw new TypeError('Effect outcome requires evidence');
     const before = this.effect(id, 'claimed');
     const claim = this.effectExecutor(before, expected);
+    if (before.operation === 'worker.activate' && state === 'rejected'
+      && this.db.prepare(`SELECT 1 FROM events WHERE kind = 'attempt.prompt_admitted'
+        AND json_extract(payload, '$.effectId') = ?`).get(id)) {
+      throw new StorageError('conflict', 'An admitted activation cannot be rejected');
+    }
     this.changed(this.db.prepare(`UPDATE requests SET state = ?, result = ?, revision = revision + 1
       WHERE id = ? AND state = 'claimed' AND revision = ? AND claim_id = ?`)
       .run(state, json(outcome), id, before.revision, expected.claimId));

@@ -11,7 +11,7 @@ import { createRuntime, loadExecutionProfiles } from '../../src/runtime.ts';
 import type { Database } from '../../src/storage/database.ts';
 import type { Configuration } from '../../src/configuration.ts';
 
-async function fixture(t: Parameters<typeof defer>[0]) {
+async function fixture(t: Parameters<typeof defer>[0], admission?: () => boolean) {
   const root = await mkdtemp(join(tmpdir(), 'docket-bb-'));
   defer(t, () => rm(root, { recursive: true, force: true }));
   const workspace = join(root, 'leased'); await mkdir(workspace);
@@ -32,12 +32,12 @@ if (args[0] === 'docket') {
 else if (args[0] === 'project') value = state.projects;
 else if (args[1] === 'spawn') value = {id:'thr_worker'};
 else if (args[1] === 'show') value = {thread:{id:state.threadId,providerId:state.provider,projectId:state.projectId,status:state.status,archivedAt:state.archivedAt ?? null,environmentId:state.status === 'pending' ? null : 'env_worker'},environment:state.status === 'pending' ? null : {path:state.path}};
-else if (args[1] === 'queue') value = [{model:state.model}];
+else if (args[1] === 'queue') value = state.queue ?? [{model:state.model}];
 else if (args[1] === 'log') value = state.events;
 else if (args[1] === 'stop') value = {ok:true,threadId:'thr_worker'};
 else value = {threadId:'thr_worker',delivery:'queued'};
 process.stdout.write(JSON.stringify(value));`);
-  const current = { ready: true, admitted: true, lost: '', refusal: '', timeout: false, status: 'pending', threadId: 'thr_worker', provider: 'pi', model: 'model', projectId: 'proj_local', path: workspace, events: [] as unknown[],
+  const current = { ready: true, admitted: true, lost: '', refusal: '', timeout: false, status: 'pending', threadId: 'thr_worker', provider: 'pi', model: 'model', projectId: 'proj_local', path: workspace, events: [] as unknown[], queue: null as unknown[] | null,
     projects: [{ id: 'proj_local', kind: 'standard', sources: [{ type: 'local_path', hostId: 'host_local', path: root }] }] };
   const save = () => writeFile(state, JSON.stringify(current));
   await save();
@@ -45,7 +45,7 @@ process.stdout.write(JSON.stringify(value));`);
   const discrepancies: unknown[] = [];
   const launcher = new BbLauncher({ repository: root, profiles: { local: execution },
     discrepancy: async reference => { discrepancies.push(reference); },
-    admissionMs: 1, admission: () => current.admitted,
+    admissionMs: 1, admission: admission ?? (() => current.admitted),
     run: (_file, args, cwd) => commandRunner({ timeoutMs: current.timeout ? 1000 : 60000, environment: { PATH: process.env.PATH } })(process.execPath, [script, state, log, ...args], cwd) });
   const binding = { specification: { profile: { launcher: 'bb', executionProfile: 'local', provider: 'pi', model: 'model', reasoning: null } },
     initialInput: 'exact\ntext\n', allocation: { path: workspace }, sessionId: 'session', resultPath: join(root, 'retained', 'result.json') } as unknown as WorkerBinding;
@@ -53,20 +53,47 @@ process.stdout.write(JSON.stringify(value));`);
   return { root, launcher, binding, current, execution, discrepancies, save, calls, deny: async () => { current.admitted = false; await save(); } };
 }
 
-test('R06 R33 R34 A55: pending activation checks identity and held model without an attached environment', async t => {
+test('R06 R33 R34 A13 A55: pending activation checks identity and held model without an attached environment', async t => {
   for (const field of [null, 'provider', 'model', 'projectId', 'threadId'] as const) {
-    const f = await fixture(t), prepared = await f.launcher.prepare(f.binding, 'prepare');
+    let checks = 0;
+    const f = await fixture(t, () => ++checks > 1), prepared = await f.launcher.prepare(f.binding, 'prepare');
     assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
     if (field) f.current[field] = 'wrong';
     await f.save();
     const result = await f.launcher.activate(prepared.value, {}, 'activate', 'generation');
-    assert.equal(result.status, field === 'threadId' ? 'uncertain' : field ? 'rejected' : 'confirmed');
+    assert.equal(result.status, field ? 'rejected' : 'confirmed');
     assert.equal((await f.calls()).filter(c => c.args[1] === 'recheck').length, field ? 0 : 1);
     if (!field) {
       const attached = JSON.parse(await readFile(join(f.root, 'state.json'), 'utf8'));
       assert.equal(attached.status, 'active');
       assert.equal((await f.launcher.inspect(prepared.value)).status, 'known');
     }
+  }
+});
+
+test('R06 R33 A13 A55: recorded admission confirms before any bb read or recheck', async t => {
+  const f = await fixture(t), prepared = await f.launcher.prepare(f.binding, 'prepare');
+  assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
+  const before = await f.calls();
+  assert.deepEqual(await f.launcher.activate(prepared.value, {}, 'activate', 'generation'),
+    { status: 'confirmed', value: { admitted: true } });
+  assert.deepEqual(await f.calls(), before);
+  assert.equal((await f.launcher.activate(prepared.value, {}, 'activate', 'generation')).status, 'uncertain');
+});
+
+test('R06 R33 A13 A55: empty queue confirms raced admission, otherwise remains uncertain; two rows are uncertain', async t => {
+  for (const scenario of ['admitted', 'absent', 'multiple', 'malformed'] as const) {
+    let checks = 0;
+    const f = await fixture(t, () => ++checks > 1 && scenario === 'admitted');
+    const prepared = await f.launcher.prepare(f.binding, 'prepare');
+    assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
+    f.current.queue = scenario === 'multiple' ? [{ model: 'wrong' }, { model: 'model' }]
+      : scenario === 'malformed' ? [null] : [];
+    await f.save();
+    const result = await f.launcher.activate(prepared.value, {}, 'activate', 'generation');
+    assert.equal(result.status, scenario === 'admitted' ? 'confirmed' : 'uncertain');
+    assert.equal(checks, ['admitted', 'absent'].includes(scenario) ? 2 : 1);
+    assert.equal((await f.calls()).filter(c => c.args[1] === 'recheck').length, 0);
   }
 });
 

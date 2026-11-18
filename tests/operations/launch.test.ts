@@ -510,7 +510,7 @@ test('A14/R09: interrupted claimed prepare or activation is never retried, even 
   assert.equal(second.launcher.prompts.length, 0);
 });
 
-test('A14/R09: lost activation responses before and after prompting never send twice', async t => {
+test('R06 R33 A13 A55 A14/R09: lost or contradictory activation responses never send twice', async t => {
   for (const stage of ['before', 'after', 'uncertain', 'rejected'] as const) {
     const { db, prepared } = await fixture(t), value = await prepared('task', 'other');
     await db.decideWorkerLaunch(value.attemptId, value.claimId, 'permit', host);
@@ -521,12 +521,13 @@ test('A14/R09: lost activation responses before and after prompting never send t
       return uncertain('No acknowledgement');
     };
     if (stage === 'before' || stage === 'after') await assert.rejects(activateWorker(db, value.attemptId, value.reference, host, value.launcher));
+    else if (stage === 'rejected') await assert.rejects(activateWorker(db, value.attemptId, value.reference, host, value.launcher), conflict);
     else await activateWorker(db, value.attemptId, value.reference, host, value.launcher);
     assert.equal(await activateWorker(db, value.attemptId, value.reference, host, value.launcher), null);
     assert.equal(value.launcher.calls.filter(call => call.operation === 'activate').length, 1);
     assert.equal(value.launcher.prompts.length, stage === 'before' || stage === 'rejected' ? 0 : 1);
     const effect = db.requests().find(request => request.operation === 'worker.activate')!;
-    assert.equal(effect.state, stage === 'rejected' ? 'rejected' : 'uncertain');
+    assert.equal(effect.state, 'uncertain');
   }
 });
 
@@ -730,6 +731,21 @@ test('R06 R33 A15: bb hook holds before permission, matches every queued member 
   assert.equal(db.request(decision.effectId!).state, 'claimed');
   const reopened = await Database.open(f.path, f.options); defer(t, () => reopened.close());
   assert.deepEqual(await reopened.admitBbDispatch(threadId, [member]), { decision: 'refuse' });
+});
+
+test('R06 R33 A13 A55: an activation admitted through the hook cannot be recorded as rejected', async t => {
+  const f = await bbDispatchFixture(t), { db, threadId, member } = f;
+  const permission = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'admit' });
+  const executor = { claimId: f.claimId, generation: host.generation };
+  const before = db.events();
+  await assert.rejects(db.recordEffectOutcome(permission.effectId!, executor, 'rejected',
+    { status: 'rejected', reason: 'Queue was empty' }), conflict);
+  assert.equal(db.request(permission.effectId!).state, 'claimed');
+  assert.deepEqual(db.events(), before);
+  assert.equal(db.events({ attemptId: f.attemptId, kinds: ['attempt.prompt_admitted'] }).length, 1);
+  await db.recordEffectOutcome(permission.effectId!, executor, 'uncertain', { reason: 'Lost acknowledgement' });
+  assert.equal(db.request(permission.effectId!).state, 'uncertain');
 });
 
 test('R06/R10 R33 A15: withdrawn bb activation refuses even an otherwise authorised delivery', async t => {

@@ -30,6 +30,7 @@ const capabilities: LauncherCapabilities = {
   stopTurn: true, terminalFence: true, fenceEnforcement: 'best_effort', usageMetrics: ['tokens'],
   observationSources: ['bb_events'],
 };
+class BbIdentityMismatch extends Error {}
 class BbRefusal extends Error {
   readonly evidence: JsonObject;
   constructor(evidence: JsonObject) { super('bb validation refusal'); this.evidence = evidence; }
@@ -148,14 +149,20 @@ export class BbLauncher implements Launcher {
   async activate(reference: WorkerReference, _input: JsonObject, effectId: string, _generation: string): Promise<Result<JsonObject>> {
     if (!this.once(effectId)) return uncertain('bb activation already attempted', reference);
     try {
+      if (this.options.admission(effectId)) return confirmed({ admitted: true });
       const view = await this.view(reference);
       if (view.thread.providerId !== reference.provider
         || (view.thread.projectId !== undefined && view.thread.projectId !== reference.projectId)
         || (view.environment !== null && view.environment.path !== reference.path)) return rejected('bb execution identity changed');
       const queue = await this.call(String(reference.executionProfile), ['thread', 'queue', 'list', String(reference.threadId), '--json']);
-      if (!Array.isArray(queue) || queue.length !== 1 || !object(queue[0]) || queue[0].model !== reference.model) {
-        return rejected('bb held prompt model could not be verified');
+      if (Array.isArray(queue) && queue.length === 0) {
+        return this.options.admission(effectId) ? confirmed({ admitted: true })
+          : uncertain('bb held prompt absent without recorded admission', reference);
       }
+      if (!Array.isArray(queue) || queue.length !== 1 || !object(queue[0])) {
+        return uncertain('bb held prompt could not be verified', reference);
+      }
+      if (queue[0].model !== reference.model) return rejected('bb held prompt model differs');
       const reply = await this.call(String(reference.executionProfile), ['docket', 'recheck', String(reference.threadId)]);
       if (!object(reply) || reply.requested !== true || reply.threadId !== reference.threadId) throw new Error();
       const deadline = Date.now() + (this.options.admissionMs ?? 5000);
@@ -164,10 +171,15 @@ export class BbLauncher implements Launcher {
         await new Promise(resolve => setTimeout(resolve, 25));
       } while (Date.now() < deadline);
       return uncertain('bb admission not recorded', reference);
-    } catch { return uncertain('bb activation response lost or unreadable', reference); }
+    } catch (error) {
+      if (error instanceof BbIdentityMismatch) return rejected('bb execution identity changed');
+      return uncertain('bb activation response lost or unreadable', reference);
+    }
   }
   private async view(reference: WorkerReference): Promise<{ thread: JsonObject; environment: JsonObject | null }> {
     const value = await this.call(String(reference.executionProfile), ['thread', 'show', String(reference.threadId), '--json']);
+    if (object(value) && object(value.thread) && typeof value.thread.id === 'string'
+      && value.thread.id !== reference.threadId) throw new BbIdentityMismatch();
     if (!object(value) || !object(value.thread) || value.thread.id !== reference.threadId
       || !(value.environment === null ? value.thread.environmentId === null
         : object(value.environment) && typeof value.environment.path === 'string')
