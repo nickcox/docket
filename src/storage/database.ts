@@ -1430,10 +1430,9 @@ export class Database {
       throw new StorageError('conflict', 'Continuation requires a terminal settled source for this task');
     }
     if (this.db.prepare("SELECT 1 FROM requests WHERE attempt_id = ? AND (category = 'effect' OR operation = 'checks.run') AND state IN ('pending', 'claimed', 'uncertain')").get(sourceId)) throw new StorageError('conflict', 'Source has unresolved effects');
-    if (this.db.prepare(`SELECT 1 FROM attempts WHERE task_id = ? AND id <> ? AND id <> ?
-      AND (execution_open = 1 OR lease_state IN ('held', 'unknown')) LIMIT 1`).get(taskId, sourceId, newAttemptId ?? '')) {
-      throw new StorageError('conflict', 'Task is not ready: another attempt or lease blocks continuation');
-    }
+    const blocker = this.db.prepare(`SELECT * FROM attempts WHERE task_id = ? AND id <> ? AND id <> ?
+      AND (execution_open = 1 OR lease_state IN ('held', 'unknown')) ORDER BY id LIMIT 1`).get(taskId, sourceId, newAttemptId ?? '');
+    if (blocker) this.refuseBlockingAttempt(blocker);
     if (newAttemptId) {
       const current = this.decodeAttempt(this.attemptRow(newAttemptId)), task = this.decodeTask(this.taskRow(taskId));
       if ((task.state !== 'queued' && !(task.state === 'in_flight' && current.phase === 'running')) || task.holdReason !== null
@@ -1448,6 +1447,13 @@ export class Database {
       if (Number(this.db.prepare("SELECT count(*) AS count FROM attempts WHERE task_id = ? AND id NOT IN (SELECT attempt_id FROM events WHERE kind = 'profile.limited')").get(taskId)!.count) > config.maxAttemptsPerTask) throw new StorageError('conflict', 'Task is not ready: attempt limit reached');
     }
     return source;
+  }
+
+  private refuseBlockingAttempt(attempt: Record<string, unknown>): never {
+    const reason = `Attempt ${String(attempt.id)} ${attempt.execution_open === 1 ? 'is execution-open' : `holds a ${String(attempt.lease_state)} lease`}.`;
+    const failure = new CommandFailure('not_ready', { attemptId: String(attempt.id), reason });
+    failure.diagnostic = reason;
+    throw failure;
   }
 
   /** The key comparison precedes selection, policy resolution and all admission decisions. */
@@ -1509,10 +1515,12 @@ export class Database {
           skippedTasks.push({ taskId: task.id, reason: `Profile ${config.profileName} is provider_limited: ${limited.message}` });
           continue;
         }
+        const blockingAttempt = this.db.prepare("SELECT * FROM attempts WHERE task_id = ? AND (execution_open = 1 OR (lease_state IN ('held', 'unknown') AND id <> ?)) ORDER BY id LIMIT 1").get(task.id, value.sourceAttemptId ?? '');
+        if (blockingAttempt && value.taskId !== undefined) this.refuseBlockingAttempt(blockingAttempt);
         const unavailable = task.state !== 'queued' || task.holdReason !== null ||
           this.db.prepare(`SELECT 1 FROM dependencies JOIN tasks AS blocker ON blocker.id = blocker_id
             WHERE task_id = ? AND blocker.state <> 'done' LIMIT 1`).get(task.id) ||
-          this.db.prepare("SELECT 1 FROM attempts WHERE task_id = ? AND (execution_open = 1 OR (lease_state IN ('held', 'unknown') AND id <> ?)) LIMIT 1").get(task.id, value.sourceAttemptId ?? '') ||
+          blockingAttempt ||
           Number(this.db.prepare("SELECT count(*) AS count FROM attempts WHERE task_id = ? AND id NOT IN (SELECT attempt_id FROM events WHERE kind = 'profile.limited')").get(task.id)!.count) >= config.maxAttemptsPerTask;
         if (unavailable) {
           if (value.taskId !== undefined) throw new StorageError('conflict', 'Task is not eligible for reservation');
@@ -1999,7 +2007,7 @@ export class Database {
       }
       const activation = this.requests({ attemptId: String(attempt.id), operation: 'worker.activate' })[0];
       const claim = this.claims().find(c => c.id === attempt.owner_claim_id && !c.releasedAt);
-      if (!claim || !activation) return { decision: 'refuse' };
+      if (!claim || !activation || activation.state === 'withdrawn') return { decision: 'refuse' };
       const owner = claim.ownerRef as WorkerHost;
       const deliveries: StoredRequest[] = [];
       let initial = false;
@@ -2661,6 +2669,17 @@ export class Database {
         const recorded = this.decodeEvent(previous);
         if (value.discard && !recorded.payload.discard) throw new StorageError('conflict', 'Return and discard decisions differ');
         return recorded;
+      }
+      if (value.discard && terminal) {
+        // Only never-claimed worker effects can be cancelled by the discard decision.
+        // Claimed and uncertain effects still require exact scoped reconciliation.
+        for (const request of this.requests({ attemptId: value.attemptId }).filter(r =>
+          r.category === 'effect' && r.operation.startsWith('worker.') && r.state === 'pending')) {
+          const result = { reason: 'Person discarded terminal attempt; worker effect withdrawn before claim.' };
+          this.db.prepare("UPDATE requests SET state = 'withdrawn', result = ?, revision = revision + 1 WHERE id = ? AND state = 'pending'")
+            .run(json(result), request.id);
+          this.storageEvent('request.withdrawn', value.caller, { request: object(this.request(request.id)) }, request.id);
+        }
       }
       if (!value.discard && this.db.prepare(`SELECT 1 FROM requests WHERE attempt_id = ? AND state IN ('pending','claimed','uncertain')
         AND (category = 'effect' OR operation = 'checks.run') LIMIT 1`).get(value.attemptId)) throw new StorageError('conflict', 'Attempt has an unresolved effect');

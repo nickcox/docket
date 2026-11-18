@@ -1,6 +1,7 @@
 import { once } from 'node:events';
 import { dirname } from 'node:path';
 import { Database, StorageError } from '../../../src/storage/database.ts';
+import { CommandFailure } from '../../../src/response.ts';
 import type { ReservationInput } from '../../../src/storage/reservations.ts';
 
 const [path, encoded] = process.argv.slice(2);
@@ -14,7 +15,8 @@ try {
   const result = await db.reserveAttempt(input);
   process.send({ result: 'reserved', id: result.attempt.id, taskId: result.attempt.taskId, replayed: result.replayed });
 } catch (error) {
-  if (!(error instanceof StorageError) || error.code !== 'conflict') throw error;
+  if (!(error instanceof StorageError && error.code === 'conflict')
+    && !(error instanceof CommandFailure && error.code === 'not_ready')) throw error;
   process.send({ result: 'conflict' });
 }
 process.disconnect!();

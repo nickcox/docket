@@ -732,6 +732,22 @@ test('R06 R33 A15: bb hook holds before permission, matches every queued member 
   assert.deepEqual(await reopened.admitBbDispatch(threadId, [member]), { decision: 'refuse' });
 });
 
+test('R06/R10 R33 A15: withdrawn bb activation refuses even an otherwise authorised delivery', async t => {
+  const f = await bbDispatchFixture(t), { db, threadId, member, reference } = f;
+  const permission = await db.decideWorkerLaunch(f.attemptId, f.claimId, 'permit', host);
+  await db.closePendingEffect(permission.effectId!, 'withdrawn', { reason: 'Withdrawn before claim' }, person);
+  const executor = { claimId: f.claimId, generation: host.generation };
+  const input = { attemptId: f.attemptId, message: member.content, mode: 'after_turn' };
+  const command = await db.recordCommand({ requestKey: 'delivery-command', operation: 'attempt.steer', caller: person,
+    input, fingerprint: canonicalJson(input) });
+  const delivery = await db.recordEffect({ requestKey: 'delivery-effect', operation: 'worker.deliver', caller: person,
+    input: { reference, ...input }, fingerprint: 'delivery', parentId: command.id,
+    executor, attemptId: f.attemptId, target: { kind: 'worker', reference } });
+  await db.claimEffect(delivery.id, executor);
+  assert.deepEqual(await db.admitBbDispatch(threadId, [member]), { decision: 'refuse' });
+  assert.equal(db.events({ attemptId: f.attemptId, kinds: ['worker.delivery_admitted'] }).length, 0);
+});
+
 test('R06 R33 A15: bb activation leaves consumption to the hook and queue re-evaluation never repeats on lost acknowledgement', async t => {
   for (const lost of [false, true]) {
     const f = await bbDispatchFixture(t), { db, member, threadId, launcher } = f;

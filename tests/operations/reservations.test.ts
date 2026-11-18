@@ -126,11 +126,15 @@ test('A06/R04: capacity, readiness, retained lifetime attempts and leases constr
     VALUES (?, 'old', ?, 0, 'settled', '{}', ?, 'held', 'now')`).run(`older-${number}`, number, `older-ref-${number}`);
   seed.prepare(`INSERT INTO attempts (id, task_id, number, execution_open, phase, specification, output_ref, allocation, lease_id, lease_state, created_at)
     VALUES ('retained', 'lease', 1, 0, 'settled', '{}', 'retained-ref', '{"leaseId":"retained-lease"}', 'retained-lease', 'held', 'now')`).run();
-  for (const id of ['held', 'blocked', 'old', 'lease']) await assert.rejects(db.reserveAttempt(input(`named-${id}`, id)), conflict);
+  for (const id of ['held', 'blocked', 'old']) await assert.rejects(db.reserveAttempt(input(`named-${id}`, id)), conflict);
+  await assert.rejects(db.reserveAttempt(input('named-lease', 'lease')), { code: 'not_ready',
+    data: { attemptId: 'retained', reason: 'Attempt retained holds a held lease.' }, diagnostic: 'Attempt retained holds a held lease.' });
   const one = await db.reserveAttempt(input('auto-1'));
   const two = await db.reserveAttempt(input('auto-2'));
   assert.equal(one.attempt.taskId, 'first'); assert.equal(two.attempt.taskId, 'second');
-  await assert.rejects(db.reserveAttempt(input('same-task', 'first')), conflict);
+  await assert.rejects(db.reserveAttempt(input('same-task', 'first')), { code: 'not_ready',
+    data: { attemptId: one.attempt.id, reason: `Attempt ${one.attempt.id} is execution-open.` },
+    diagnostic: `Attempt ${one.attempt.id} is execution-open.` });
   await assert.rejects(db.reserveAttempt(input('capacity', 'third')), conflict);
   seed.prepare("UPDATE attempts SET execution_open = 0, outcome = 'held', phase = 'settled' WHERE id = ?").run(one.attempt.id);
   const next = await db.reserveAttempt(input('next', 'first'));

@@ -218,12 +218,11 @@ export async function executeCoreOperation(operation: OperationDefinition, args:
             && ['claimed', 'uncertain'].includes(r.state));
           const checksState = checks?.state === 'withdrawn' ? 'interrupted' : String(checks?.result?.status ?? checks?.state ?? 'missing');
           const accepted = a.candidate ? db.acceptance(a.id, String(a.candidate.id)) !== null : false;
-          const returnedOrDiscarded = a.leaseState === 'returned'
-            || db.events({ attemptId: a.id, kinds: ['return.authorised'] }).some(e => e.payload.discard);
-          const resolved = returnedOrDiscarded || db.task(a.taskId).state === 'done';
-          const currentReturnReason = a.allocation && !returnedOrDiscarded
+          const discarded = db.events({ attemptId: a.id, kinds: ['return.authorised'] }).some(e => e.payload.discard);
+          const resolved = a.leaseState === 'returned' || discarded || db.task(a.taskId).state === 'done';
+          const currentReturnReason = a.allocation && a.leaseState !== 'returned'
             ? await leaseReturnReason(db, a.id, caller, (await services()).completion) : null;
-          const returnReason = currentReturnReason === 'Lease is ready to return.' && (resolved || a.candidate && !accepted)
+          const returnReason = currentReturnReason === 'Lease is ready to return.' && !discarded && (resolved || a.candidate && !accepted)
             ? null : currentReturnReason;
           const invalidResult = db.invalidWorkerResult(a.id);
           const discrepancy = db.laterTurnDiscrepancy(a.id);

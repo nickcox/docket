@@ -84,6 +84,22 @@ async function fixture(t: Parameters<typeof checkFixture>[0], candidate = true, 
     dirtyOnPin: () => { dirtyAfterPin = true; } };
 }
 
+for (const executionOpen of [false, true]) test(`R06/R07/R10 A06/A26: dispatch and continuation name another attempt blocking the task (execution-open: ${executionOpen})`, async t => {
+  const f = await fixture(t);
+  using sql = new DatabaseSync(f.path);
+  sql.prepare(`INSERT INTO attempts (id, task_id, number, execution_open, phase, specification, output_ref, lease_state, created_at)
+    VALUES ('blocking-attempt', 'task', 2, ?, 'settled', '{}', 'blocking-ref', 'held', 'now')`).run(executionOpen ? 1 : 0);
+  sql.prepare("UPDATE attempts SET lease_state = 'returned' WHERE id = ?").run(f.source.id);
+  const reason = `Attempt blocking-attempt ${executionOpen ? 'is execution-open' : 'holds a held lease'}.`;
+  for (const continuation of [false, true]) {
+    const args = continuation ? f.args : { taskId: 'task', profile: null, dryRun: true };
+    await assert.rejects(dispatch(f.db, args, person, `blocked-${continuation}`, f.runtime, () => {}), {
+      code: 'not_ready', data: { attemptId: 'blocking-attempt', reason }, diagnostic: reason,
+    });
+  }
+  assert.equal(f.acquired(), 0);
+});
+
 for (const [candidate, chosen] of [[true, false], [false, false], [false, true]]) test(`R12/A26: continuation freezes commit with candidate=${candidate}, chosen=${chosen}; allocates and prompts only a new session; replay is inert`, async t => {
   const f = await fixture(t, candidate);
   if (chosen) f.args.sourceCommit = start;

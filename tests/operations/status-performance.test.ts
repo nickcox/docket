@@ -67,7 +67,7 @@ for (const withObjective of [false, true]) test(`R08/A16/A17: status.show and at
   assert.equal(large.statusRows, small.statusRows);
   assert.equal(large.attemptRows, small.attemptRows);
 
-  // R10: returned and discarded leases never need a return plan or external reads.
+  // R10/A17: a discarded attempt with a held lease still needs attention and a return plan.
   for (const [i, id] of ids.entries()) {
     const allocation = { leaseId: `lease-${i}`, path: join(home, `workspace-${i}`) };
     sql.prepare('UPDATE attempts SET allocation = ?, lease_id = ?, lease_state = ? WHERE id = ?')
@@ -76,6 +76,17 @@ for (const withObjective of [false, true]) test(`R08/A16/A17: status.show and at
       payloadVersion: 1, attemptId: id, correlationId: id, actor: person, occurredAt: new Date(0).toISOString(),
       payload: { discard: true }, notification: false }]);
   }
+  const discarded = await binding.execute('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
+  for (const [i, id] of ids.entries()) {
+    if (i % 2 === 0) continue;
+    const attempt = (discarded.attempts as { items: any[] }).items.find(a => a.id === id);
+    assert.equal(attempt.leaseState, 'held');
+    assert.match(attempt.reason, /stopped terminal worker/);
+    assert.equal(attempt.nextAction.operation, 'attempt.return');
+  }
+  const discardedLarge = await measure();
+  assert.ok(discardedLarge.statusRows < 150, 'Discard return planning must ignore heartbeat history');
+  sql.prepare("UPDATE attempts SET lease_state = 'returned'").run();
   const withoutRuntime = createBinding(person, { config: file }, { home, runtime: async () => {
     assert.fail('R10: resolved leases must not initialise return-planning services');
   } });

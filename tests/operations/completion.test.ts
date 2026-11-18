@@ -614,6 +614,64 @@ test('R11: discard records the person decision before keeping dirt, then explici
   assert.equal(f.db.attempt(f.a.id).leaseState, 'returned');
 });
 
+for (const state of ['pending', 'claimed', 'uncertain'] as const) {
+  test(`R06/R07/R10 A14/A16/A17: discard after person-confirmed bb stop withdraws only pending worker effects (${state})`, async t => {
+    const f = await fixture(t);
+    const a = await f.attempt(`activation-${state}`, ['Criterion'], undefined, head, start, policyContent, 'prepared');
+    const activation = f.db.requests({ attemptId: a.id, operation: 'worker.activate' })[0]!;
+    const preparation = f.db.requests({ attemptId: a.id, operation: 'worker.prepare' })[0]!;
+    const reference = preparation.result!.reference as import('../../src/storage/launch.ts').WorkerReference;
+    const executor = { claimId: activation.claimId!, generation: host.generation };
+    const command = await f.db.recordCommand({ requestKey: 'steer-before-discard', operation: 'attempt.steer', caller: person,
+      input: { attemptId: a.id, message: 'Later', mode: 'after_turn' }, fingerprint: 'steer' });
+    const delivery = await f.db.recordEffect({ requestKey: 'pending-delivery', operation: 'worker.deliver', caller: person,
+      input: { reference, attemptId: a.id, message: 'Later', mode: 'after_turn' }, fingerprint: 'delivery',
+      parentId: command.id, executor, attemptId: a.id, target: { kind: 'worker', reference } });
+    if (state !== 'pending') {
+      await f.db.claimEffect(activation.id, executor);
+      if (state === 'uncertain') await f.db.recordEffectOutcome(activation.id, executor, 'uncertain', { reason: 'Interrupted recheck' });
+    }
+    const recovery = { claimId: executor.claimId, confirmStopped: true,
+      evidence: 'Inspected this exact bb thread; its worker never started and is stopped.', dryRun: false };
+    await f.db.resolveClaimByPerson(executor.claimId, recovery.evidence, person,
+      { requestKey: 'recover-bb', operation: 'claim.resolve', caller: person, input: recovery, fingerprint: canonicalJson(recovery) });
+    const discard = { leaseId: a.allocation.leaseId, confirmed: true as const, reason: 'Abandoned activation' };
+    const beforePlan = f.db.requests({ attemptId: a.id });
+    if (state === 'pending') await planAttemptReturn(f.db, { requestKey: 'discard', attemptId: a.id, caller: person, discard }, f.services);
+    assert.deepEqual(f.db.requests({ attemptId: a.id }), beforePlan, 'Planning never withdraws effects');
+    if (state === 'pending') {
+      const input = { requestKey: 'discard', attemptId: a.id, caller: person, discard };
+      const command = await f.db.recordCommand({ requestKey: 'discard', operation: 'attempt.discard', caller: person,
+        input, fingerprint: canonicalJson(input) });
+      const target = f.db as unknown as { insertEvent: (event: import('../../src/storage/database.ts').EventInput) => unknown };
+      const insert = target.insertEvent;
+      const before = [f.db.attempt(a.id), f.db.requests(), f.db.events(), f.db.task(a.binding.identity.taskId as string)];
+      target.insertEvent = function (event) {
+        if (event.kind === 'return.authorised') throw new Error('Injected discard failure');
+        return insert.call(this, event);
+      };
+      try {
+        await assert.rejects(f.db.authoriseReturn(input, command.id), /Injected discard failure/);
+      } finally { target.insertEvent = insert; }
+      assert.deepEqual([f.db.attempt(a.id), f.db.requests(), f.db.events(), f.db.task(a.binding.identity.taskId as string)], before,
+        'Effect withdrawals, failed outcome and discard authorisation roll back together');
+    }
+    const result = await automaticReturn(f.db, a.id, person, f.services, discard, 'discard');
+    assert.equal(f.db.request(delivery.id).state, 'withdrawn');
+    assert.equal(f.db.request(activation.id).state, state === 'pending' ? 'withdrawn' : state);
+    assert.equal(result.state, state === 'pending' ? 'returned' : 'kept');
+    if (state !== 'pending') assert.match(result.reason!, /unresolved effect/);
+    assert.equal(f.db.attempt(a.id).outcome, 'failed');
+    assert.equal(reference.launcher, 'bb');
+    if (reference.launcher === 'bb') assert.deepEqual(await f.db.admitBbDispatch(String(reference.threadId),
+      [{ id: 'held-prompt', author: 'user', content: String(preparation.input.initialInput) }]), { decision: 'refuse' });
+    const withdrawn = f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] });
+    assert.ok(withdrawn.some(e => e.requestId === delivery.id));
+    await automaticReturn(f.db, a.id, person, f.services, discard, 'discard');
+    assert.equal(f.db.events({ attemptId: a.id, kinds: ['request.withdrawn'] }).length, withdrawn.length, 'Replay does not withdraw twice');
+  });
+}
+
 test('R11: discard keeps an unresolved effect without losing the person decision', async t => {
   const f = await fixture(t);
   f.services.run = async () => ({ status: 'uncertain', exitCode: null, timedOut: false, stdout: '', stderr: '', truncated: false });

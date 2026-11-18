@@ -273,7 +273,8 @@ export async function planAttemptReturn(db: Database, input: ReturnInput, servic
   const bound = db.requests({ attemptId: attempt.id, operation: 'worker.prepare' }).some(r => r.result?.reference);
   if (!bound && db.claims().some(c => c.attemptId === attempt.id && c.role === 'worker_owner' && !c.releasedAt)) refuse('Worker owner claim is unresolved');
   if ((!attempt.outcome || attempt.executionOpen) && !input.discard) refuse('Return requires a recorded outcome');
-  const unresolved = db.requests({ attemptId: attempt.id }).find(r => (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state));
+  const unresolved = db.requests({ attemptId: attempt.id }).find(r => (r.category === 'effect' || r.operation === 'checks.run') && ['pending', 'claimed', 'uncertain'].includes(r.state)
+    && !(input.discard && r.category === 'effect' && r.operation.startsWith('worker.') && r.state === 'pending'));
   const authorisation = db.events({ sourceKey: `return.authorised:${attempt.id}` })[0];
   const previous = db.requests({ requestKey: `return:${attempt.id}` })[0];
   if (unresolved && unresolved.id !== previous?.id) refuse('Attempt has an unresolved effect');
