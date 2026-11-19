@@ -17,7 +17,7 @@ import { configuration } from '../fixtures/configuration.ts';
 import { defer } from '../helpers/cleanup.ts';
 import { person, host, start, head, retention } from '../helpers/check-attempt.ts';
 
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, destroyed = false) {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'docket-bb-readonly-')));
   defer(t, () => rm(home, { recursive: true, force: true }));
   const file = join(home, 'docket.json'), config = configuration(home);
@@ -43,7 +43,13 @@ async function fixture(t: test.TestContext) {
     let value: unknown;
     if (args[0] === 'docket') value = { version: 1, ready: true };
     else if (args[1] === 'spawn') value = { id: 'thr_worker' };
-    else if (args[1] === 'show') value = { thread: { id: 'thr_worker', providerId: 'test-provider', status: 'idle' }, environment: { path } };
+    else if (args[1] === 'show') value = {
+      thread: { id: 'thr_worker', providerId: 'test-provider', status: 'idle', environmentId: 'env_worker',
+        archivedAt: destroyed ? '2026-11-19T00:00:00Z' : null },
+      environment: destroyed
+        ? { id: 'env_worker', path: null, status: 'destroyed', lifecycle: { phase: 'destroyed', teardown: { status: 'removed' } } }
+        : { id: 'env_worker', path },
+    };
     else if (args[1] === 'log') value = events;
     else throw new Error('Unexpected bb effect');
     return { complete: true, code: 0, stdout: unreadable && args[1] === 'log' ? '{' : JSON.stringify(value), stderr: '' };
@@ -80,7 +86,8 @@ async function fixture(t: test.TestContext) {
     payload: { turnEnded: true, threadStopped: true, fenceRecorded: true } }, host, retention);
   const activation = db.requests({ attemptId: id, operation: 'worker.activate' })[0]!;
   await db.closePendingEffect(activation.id, 'withdrawn', { reason: 'Synthetic worker is already terminal' }, person);
-  events.push({ threadId: 'thr_worker', seq: 4, type: 'turn/started', data: {} });
+  const startLaterTurn = () => events.push({ threadId: 'thr_worker', seq: 4, type: 'turn/started', data: {} });
+  if (!destroyed) startLaterTurn();
   const execute = (name: string, args: Record<string, unknown>) => executeCoreOperation(findOperation(name)!, args,
     () => {}, { config: file }, `test-${name}`, { home, caller: person, runtime });
   const accept = (dryRun: boolean) => execute('attempt.accept', { attemptId: id, candidateCommit: null, overrideReason: null, dryRun });
@@ -88,7 +95,8 @@ async function fixture(t: test.TestContext) {
     const result = await execute('status.show', { attentionOnly: true, page: { after: null, limit: 100 } });
     return (result.attempts as { items: any[] }).items.find(a => a.id === id);
   };
-  return { db, id, calls, accept, status, unreadable: () => { unreadable = true; } };
+  const inspectWorkerOutput = () => services.completion.repository.inspectWorkerOutput!(id);
+  return { db, id, calls, accept, status, inspectWorkerOutput, startLaterTurn, unreadable: () => { unreadable = true; } };
 }
 
 const refusal = (expected: string) => (error: unknown) => error instanceof CommandFailure && error.code === expected;
@@ -110,6 +118,15 @@ test('R11 R33 A55: read-only acceptance and status detect an unrecorded later bb
   assert.deepEqual(transient.nextAction, recorded.nextAction);
   await assert.rejects(f.accept(false), refusal('result_discrepancy'));
   assert.equal(f.db.events({ attemptId: f.id, kinds: ['worker.observed'] }).filter(e => e.payload.kind === 'later_turn').length, 1);
+  assert.ok(f.calls.every(args => ['show', 'log', 'spawn'].includes(args[1]!) || args[0] === 'docket'));
+});
+
+test('R33 R34 A55 A56: acceptance inspection reads a destroyed environment and still detects a later turn', async t => {
+  const f = await fixture(t, true);
+  assert.equal(await f.inspectWorkerOutput(), true);
+  f.startLaterTurn();
+  await assert.rejects(f.accept(true), refusal('result_discrepancy'));
+  assert.equal(f.db.events({ attemptId: f.id, kinds: ['worker.observed'] }).filter(e => e.payload.kind === 'later_turn').length, 0);
   assert.ok(f.calls.every(args => ['show', 'log', 'spawn'].includes(args[1]!) || args[0] === 'docket'));
 });
 

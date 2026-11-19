@@ -93,9 +93,15 @@ bypasses the hook could change a folder another attempt holds. Docket does not
 remove bb environment records. Docket's recorded starting commit and output ref
 remain authoritative, not bb's Git view of that record.
 
-After core retention checks and stopping/fencing the worker, manually archive
-the old worker thread (and any other threads holding the environment), then delete
-the environment record. Use the environment ID from the thread, not a path guess:
+Prefer to delete the environment record after Docket returns the lease. If you
+delete it while Docket still holds the lease, the folder is safe and Docket can
+still accept or discard the attempt. Docket can read the thread and its events
+when bb reports a destroyed environment with no path, but will not activate a
+worker in that state.
+
+After stopping and fencing the worker, manually archive the old worker thread
+(and any other threads holding the environment), then delete the environment
+record. Use the environment ID from the thread, not a path guess:
 
 ```text
 bb thread show <thread-id> --json

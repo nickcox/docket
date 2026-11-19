@@ -31,13 +31,18 @@ if (args[0] === 'docket') {
 }
 else if (args[0] === 'project') value = state.projects;
 else if (args[1] === 'spawn') value = {id:'thr_worker'};
-else if (args[1] === 'show') value = {thread:{id:state.threadId,providerId:state.provider,projectId:state.projectId,status:state.status,archivedAt:state.archivedAt ?? null,environmentId:state.status === 'pending' ? null : 'env_worker'},environment:state.status === 'pending' ? null : {path:state.path}};
+else if (args[1] === 'show') {
+  const environment = state.environment ?? (state.status === 'pending' ? null : {id:'env_worker',path:state.path});
+  value = {thread:{id:state.threadId,providerId:state.provider,projectId:state.projectId,status:state.status,archivedAt:state.archivedAt ?? null,environmentId:environment?.id ?? null},environment};
+}
 else if (args[1] === 'queue') value = state.queue ?? [{model:state.model}];
 else if (args[1] === 'log') value = state.events;
 else if (args[1] === 'stop') value = {ok:true,threadId:'thr_worker'};
 else value = {threadId:'thr_worker',delivery:'queued'};
 process.stdout.write(JSON.stringify(value));`);
   const current = { ready: true, admitted: true, lost: '', refusal: '', timeout: false, status: 'pending', threadId: 'thr_worker', provider: 'pi', model: 'model', projectId: 'proj_local', path: workspace, events: [] as unknown[], queue: null as unknown[] | null,
+    archivedAt: null as string | number | null,
+    environment: null as { id: string; path: string | null; status: string; lifecycle: { phase: string; teardown: { status: string } } } | null,
     projects: [{ id: 'proj_local', kind: 'standard', sources: [{ type: 'local_path', hostId: 'host_local', path: root }] }] };
   const save = () => writeFile(state, JSON.stringify(current));
   await save();
@@ -137,6 +142,35 @@ test('R06 R33 R34 A55: inspect accepts pending and matching attached paths; mism
   assert.equal((await f.launcher.deliver(ref, 'no', 'after_turn', 'send')).status, 'rejected');
   await f.launcher.inspect(ref);
   assert.equal((await f.calls()).filter(c => c.args[1] === 'stop').length, 1);
+});
+
+test('R33 R34 A55 A56: a destroyed environment allows stopped-worker inspection but not activation', async t => {
+  const f = await fixture(t, () => false), prepared = await f.launcher.prepare(f.binding, 'prepare');
+  assert.equal(prepared.status, 'confirmed'); if (prepared.status !== 'confirmed') return;
+  const ref = prepared.value;
+  f.current.status = 'idle';
+  f.current.events = [
+    { threadId: 'thr_worker', seq: 1, type: 'turn/started', data: {} },
+    { threadId: 'thr_worker', seq: 2, type: 'turn/completed', data: {} },
+  ];
+  const environment = { id: 'env_worker', path: null, status: 'destroyed', lifecycle: { phase: 'destroyed', teardown: { status: 'removed' } } };
+  f.current.archivedAt = '2026-11-19T00:00:00Z';
+  f.current.environment = environment;
+  await f.save();
+  const observed = await f.launcher.inspect(ref);
+  assert.ok(observed.status === 'known' && observed.worker === 'stopped' && observed.turn === 'ended' && !observed.terminal);
+  assert.equal(observed.sequence, 2);
+  assert.equal((await f.launcher.activate(ref, {}, 'activate', 'generation')).status, 'rejected');
+  assert.deepEqual((await f.calls()).slice(-3).map(c => c.args[1]), ['show', 'log', 'show']);
+
+  for (const invalid of [{ ...environment, status: 'active' }, { ...environment, lifecycle: { ...environment.lifecycle, phase: 'active' } }]) {
+    f.current.environment = invalid; await f.save();
+    assert.deepEqual(await f.launcher.inspect(ref), { status: 'unknown', reason: 'bb thread or events unavailable' });
+  }
+  f.current.environment = { ...environment, path: join(f.root, 'wrong') }; await f.save();
+  assert.deepEqual(await f.launcher.inspect(ref), { status: 'unknown', reason: 'bb environment differs from the leased path' });
+  assert.deepEqual(f.discrepancies, [ref]);
+  assert.equal((await f.calls()).at(-1).args[1], 'stop');
 });
 
 test('R31: runtime routes profile launchers and validates bb execution settings without changing Pi capabilities', async t => {

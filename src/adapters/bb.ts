@@ -151,6 +151,7 @@ export class BbLauncher implements Launcher {
     try {
       if (this.options.admission(effectId)) return confirmed({ admitted: true });
       const view = await this.view(reference);
+      if (view.environment?.path === null) return rejected('bb environment is detached');
       if (view.thread.providerId !== reference.provider
         || (view.thread.projectId !== undefined && view.thread.projectId !== reference.projectId)
         || (view.environment !== null && view.environment.path !== reference.path)) return rejected('bb execution identity changed');
@@ -182,7 +183,9 @@ export class BbLauncher implements Launcher {
       && value.thread.id !== reference.threadId) throw new BbIdentityMismatch();
     if (!object(value) || !object(value.thread) || value.thread.id !== reference.threadId
       || !(value.environment === null ? value.thread.environmentId === null
-        : object(value.environment) && typeof value.environment.path === 'string')
+        : object(value.environment) && (typeof value.environment.path === 'string'
+          || (value.environment.path === null && value.environment.status === 'destroyed'
+            && object(value.environment.lifecycle) && value.environment.lifecycle.phase === 'destroyed')))
       || !['active', 'error', 'idle', 'pending', 'starting', 'stopping'].includes(String(value.thread.status))) throw new Error('Unreadable bb thread');
     return { thread: value.thread, environment: value.environment as JsonObject | null };
   }
@@ -200,7 +203,7 @@ export class BbLauncher implements Launcher {
   async inspect(reference: WorkerReference): Promise<WorkerObservation> {
     try {
       const { thread, environment } = await this.view(reference);
-      if (environment !== null && environment.path !== reference.path) {
+      if (environment !== null && environment.path !== null && environment.path !== reference.path) {
         // Persist the discrepancy before stopping; repeated reads never retry the stop.
         try { await this.options.discrepancy?.(reference); }
         finally { await this.fence(reference, `environment-mismatch:${reference.threadId}`); }
