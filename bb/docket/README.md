@@ -20,11 +20,18 @@ versions, but they have not necessarily been tested live. The
 [qualification record](../../docs/qualification/bb-0.49.0.md) lists what was tested.
 
 Build in a copy of `bb/docket` outside the repository. Install its pinned
-development dependency in the copy and run
-`bb plugin types <copy> --check` and `bb plugin build <copy>`. Never leave
-`node_modules/` or `dist/` inside `bb/docket/`. Only after explicit person
-approval, install with `bb plugin install <copy>`. Do not install or enable it
-as part of offline tests.
+development dependency in the copy, then run the required build step:
+`bb plugin build <copy>`. Never leave `node_modules/` or `dist/` inside
+`bb/docket/`. Only after explicit person approval, install with
+`bb plugin install <copy>`. Do not install or enable it as part of offline tests.
+
+To check that the plugin's code still compiles against the installed bb's SDK,
+run `bb plugin types <copy> --check`. This check only passes when the
+`@get-bb/plugin-sdk` development dependency matches the installed bb's SDK
+version. After a bb upgrade, update the development dependency to the new SDK
+version, install it in the copy and run the check again. An installed plugin
+keeps loading meanwhile, as long as the `engines` ranges are satisfied, because
+bb checks only those ranges when loading it.
 
 The person configures these plugin settings:
 

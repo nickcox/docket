@@ -11,5 +11,5 @@
     "server": "./server.ts",
     "skills": ["skills"]
   },
-  "devDependencies": { "@get-bb/plugin-sdk": "0.6.132" }
+  "devDependencies": { "@get-bb/plugin-sdk": "0.6.157" }
 }
