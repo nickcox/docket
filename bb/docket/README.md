@@ -15,8 +15,12 @@ identical-copy limit.
 
 ## Installation and settings
 
-Use bb 0.49.0 and SDK 0.6.132. Build in a copy of `bb/docket` outside the
-repository. Install its pinned development dependency in the copy and run
+The plugin needs at least bb 0.49.0 and plugin SDK 0.6.132. It loads on later
+versions, but they have not necessarily been tested live. The
+[qualification record](../../docs/qualification/bb-0.49.0.md) lists what was tested.
+
+Build in a copy of `bb/docket` outside the repository. Install its pinned
+development dependency in the copy and run
 `bb plugin types <copy> --check` and `bb plugin build <copy>`. Never leave
 `node_modules/` or `dist/` inside `bb/docket/`. Only after explicit person
 approval, install with `bb plugin install <copy>`. Do not install or enable it
