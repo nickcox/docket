@@ -1,22 +1,23 @@
-# Docket bb plugin – unqualified
+# Docket bb plugin
 
-This is separate from `bb/plugin`, the experimental synthetic probe. It provides
-only dispatch admission and launcher control commands. It has no SQLite access, claims, event delivery, domain tools,
-forms, status UI or supervisor registration. The core is called only through
-`docket host invoke`. Everything must run on the same machine.
+This plugin provides only dispatch admission and launcher control commands. It has
+no SQLite access, claims, event delivery, domain tools, forms, status UI or
+supervisor registration. The core is called only through `docket host invoke`.
+Everything must run on the same machine.
 
-Offline-tested, not live-qualified. See [queue identity](#queue-identity) for
-single-use content correlation and its identical-copy limit. These tests are not
-Q1/Q2 qualification evidence.
+The plugin and the bb launcher were qualified live on 2026-11-18 with bb 0.49.0,
+plugin SDK 0.6.132 and the Pi provider. See [`docs/bb-launcher.md`](../../docs/bb-launcher.md)
+for the known limits and [queue identity](#queue-identity) for single-use content
+correlation and its identical-copy limit.
 
 ## Installation and settings
 
-Use bb 0.49.0 and SDK 0.6.132. Copy this folder to a retained scratch/build location
-outside the repository, install its pinned development dependency there and run
-`bb plugin types <copy> --check` and `bb plugin build <copy>`. Only after explicit
-person approval, install with `bb plugin install <copy>`. Do not install or enable
-it as part of offline tests. Keep all `node_modules` and `dist` output outside the
-source checkout, as described in `bb/README.md`.
+Use bb 0.49.0 and SDK 0.6.132. Build in a copy of `bb/docket` outside the
+repository. Install its pinned development dependency in the copy and run
+`bb plugin types <copy> --check` and `bb plugin build <copy>`. Never leave
+`node_modules/` or `dist/` inside `bb/docket/`. Only after explicit person
+approval, install with `bb plugin install <copy>`. Do not install or enable it
+as part of offline tests.
 
 The person configures these plugin settings:
 
