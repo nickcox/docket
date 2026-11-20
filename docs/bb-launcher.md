@@ -177,12 +177,15 @@ and user category; unrelated threads pass through.
 
 ## Limits and qualification
 
-These are offline adapter and storage tests, not Q1/Q2 or A55 qualification.
-No live provider, model or server was started for this work. bb workers load
-the person's ordinary provider settings, skills, extensions, context and tools;
-they are not sandboxed. Filtering the CLI's environment does not demonstrate
-that an already running bb server strips its provider environment. That needs
-live qualification for each supported combination.
+The launcher was tested live with bb 0.49.0, plugin SDK 0.6.132 and bb's `pi`
+provider using `openai-codex/gpt-6.1-sol` with medium reasoning. The
+[qualification record](qualification/bb-0.49.0.md) gives the results and
+explains why Q1c and Q2b are still only partly run.
+
+bb workers load the person's ordinary provider settings, skills, extensions,
+context and tools; they are not sandboxed. Filtering the CLI's environment does
+not demonstrate that an already running bb server strips its provider
+environment. That needs live qualification for each supported combination.
 
 The fence is best effort. Plugin disablement, unloading or replacement, Send
 now, queue send, and unqualified recovery paths can bypass it. A worker thread

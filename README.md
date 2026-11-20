@@ -45,6 +45,7 @@ Run `npm run check` and `npm test` for the type check and full test suite.
 - [Reference implementations](docs/reference-implementations.md): Switchboard files a task may consult on purpose.
 - [bb admission probe](investigations/bb-qualification/2026-11-08-bb-admission.md): records what happens when a waiting message loses its plugin hook after deliberate disablement; this case is outside the bb launcher guarantee.
 - [bb enabled-plugin probe](investigations/bb-qualification/2026-11-08-bb-enabled-admission.md): records ordinary admission and the explicit Send now bypass with the plugin enabled.
+- [bb 0.49.0 qualification record](docs/qualification/bb-0.49.0.md): live test results, known limits and outstanding gates.
 
 ## Licence
 

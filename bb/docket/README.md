@@ -5,10 +5,13 @@ no SQLite access, claims, event delivery, domain tools, forms, status UI or
 supervisor registration. The core is called only through `docket host invoke`.
 Everything must run on the same machine.
 
-The plugin and the bb launcher were qualified live on 2026-11-18 with bb 0.49.0,
-plugin SDK 0.6.132 and the Pi provider. See [`docs/bb-launcher.md`](../../docs/bb-launcher.md)
-for the known limits and [queue identity](#queue-identity) for single-use content
-correlation and its identical-copy limit.
+Live testing of the plugin and launcher began on 2026-11-18 with bb 0.49.0,
+plugin SDK 0.6.132 and bb's `pi` provider using `openai-codex/gpt-6.1-sol` with
+medium reasoning. See the [qualification record](../../docs/qualification/bb-0.49.0.md)
+for results, including the partly run Q1c and Q2b gates,
+[`docs/bb-launcher.md`](../../docs/bb-launcher.md) for the known limits, and
+[queue identity](#queue-identity) for single-use content correlation and its
+identical-copy limit.
 
 ## Installation and settings
 
