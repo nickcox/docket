@@ -2,6 +2,8 @@
 
 Status: draft, part of the [Docket specification](README.md).
 
+The scope below is for the foreground release. The [detached release](detached.md) starts with fresh contexts, supports bb first and includes both fast-forward and PR delivery. Standalone Pi is not a release requirement for it.
+
 ## Supported capabilities
 
 The first release supports the following capabilities before it is ready for everyday use.

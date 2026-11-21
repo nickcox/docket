@@ -6,6 +6,8 @@ Levels: P = pure decision/validation; O = in-process operations with real tempor
 
 All fault scenarios assert both the response and the persistent state/effect call count after reopening through a fresh operation. Waiting/races use barriers and an injected clock. A fake's “not called” assertion cannot replace the distinct real-process race/crash cases.
 
+These scenarios apply to the foreground workflow. Use [D01–D09](detached.md#acceptance-scenarios) for the agreed detached workflow; where they differ, the new scenarios apply to its implementation.
+
 ## Identity, tasks and reservation
 
 | ID | Given / action | Required result | Requirements; level |

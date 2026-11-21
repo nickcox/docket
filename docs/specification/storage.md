@@ -1,6 +1,6 @@
 # Storage and transaction contract
 
-Status: draft, part of the [Docket specification](README.md). Requirement IDs refer to its index.
+Status: draft, part of the [Docket specification](README.md). Requirement IDs refer to its index. The [detached workflow](detached.md#scope-and-transition) starts with fresh contexts and does not require migration from the foreground schema.
 
 ## Starting schema
 

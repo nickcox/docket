@@ -2,6 +2,8 @@
 
 Status: draft, part of the [Docket specification](README.md).
 
+For the next release, [detached task execution](detached.md) replaces the foreground reservation, worker and delivery rules below where they differ.
+
 ## Identity and scope
 
 **R01.** One database holds one context, and a context has one canonical backing repository on one machine. A context has a name chosen by a person (its context ID), a database UUID and a repository identity. People and hosts refer to a context by its name; the database UUID is internal. Docket validates canonical paths. If the repository, its remote or the workspace pool changes, that is an identity discrepancy, not an empty list of workspaces. Moving a context to another path or machine is deferred.

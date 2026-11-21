@@ -2,7 +2,11 @@
 
 Status: draft for review, 8 November 2026. This specification defines Docket's required behaviour, interfaces and acceptance criteria. Docket succeeds [Switchboard](https://github.com/nickcox/switchboard), and is built from this specification rather than from Switchboard's code.
 
-## Purpose
+## Next workflow: detached execution
+
+[Detached task execution](detached.md) defines dispatch, sync, status, delivery, dependency readiness and worktree return for the next release. Start there for changes to the scheduler. Its requirements take precedence over the foreground requirements below wherever they differ. It does not describe commands already available or certify bb for detached use.
+
+## Foreground workflow (before cutover)
 
 Docket is a CLI that owns project tasks, attempts, evidence and the decisions needed to preserve their work. A host runs the agents, delivers messages and questions, and presents the work. bb is the required first host for everyday use. A minimal standalone Pi path exercises the same operations without bb.
 
@@ -32,7 +36,7 @@ The supervisor chooses work and judges results. Docket enforces identity, curren
 | [Acceptance scenarios](acceptance.md) | Observable success, refusal, race and crash cases mapped to requirements |
 | [Scope and release requirements](delivery.md) | Supported capabilities, exclusions, verification and context activation |
 
-These documents form one specification. Requirement IDs R01–R40 are normative. Scenario IDs A01–A60 identify their acceptance evidence. Tables and examples that define fields or transitions are normative; SDK implementation candidates are identified separately.
+These chapters describe the foreground design. Requirement IDs R01–R40 are normative for that design; [the detached specification](detached.md#relationship-to-foreground-requirements) identifies replacements and exclusions for the next workflow. Scenario IDs A01–A60 identify their acceptance evidence. Tables and examples that define fields or transitions are normative; SDK implementation candidates are identified separately.
 
 ## Design constraints
 
@@ -98,7 +102,27 @@ These documents form one specification. Requirement IDs R01–R40 are normative.
 | R39 | Safe context initialisation and activation | [Delivery](delivery.md#context-initialisation-and-activation) |
 | R40 | Permanent identities and bounded diagnostic retention | [Storage](storage.md#retention) |
 
-## Required qualification
+### Detached execution
+
+These requirements apply to the [detached workflow](detached.md) and replace foreground requirements where they differ.
+
+| ID | Requirement | Defined in |
+| --- | --- | --- |
+| R41 | Detached scope: independent workers, no Docket background process, fresh contexts | [Detached](detached.md#scope-and-transition) |
+| R42 | Dispatch an objective and return without waiting | [Detached](detached.md#supervisor-operations) |
+| R43 | Continue from a commit on an earlier attempt's branch | [Detached](detached.md#supervisor-operations) |
+| R44 | Sync an objective, triggered by the supervisor or the host | [Detached](detached.md#supervisor-operations) |
+| R45 | Approve the exact checked commit | [Detached](detached.md#supervisor-operations) |
+| R46 | Read-only objective status | [Detached](detached.md#supervisor-operations) |
+| R47 | No duplicate starts; project-wide capacity and uncertain submissions | [Detached](detached.md#supervisor-operations) |
+| R48 | Checks after a successful, stopped worker, bound to the checked commit | [Detached](detached.md#checks-delivery-and-dependencies) |
+| R49 | Fast-forward, approval and PR delivery, and when each satisfies a dependency | [Detached](detached.md#checks-delivery-and-dependencies) |
+| R50 | Automatic worktree return conditions | [Detached](detached.md#worktree-return-and-interrupted-operations) |
+| R51 | No duplicate delivery or cleanup after overlap or interruption | [Detached](detached.md#worktree-return-and-interrupted-operations) |
+| R52 | bb workers are not isolated | [Detached](detached.md#bb-workers) |
+| R53 | Detached bb qualification | [Detached](detached.md#bb-qualification-still-required) |
+
+## Foreground qualification
 
 Host support requires evidence for two technical gates:
 

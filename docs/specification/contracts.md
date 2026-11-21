@@ -2,6 +2,8 @@
 
 Status: draft, part of the [Docket specification](README.md).
 
+The catalogue below describes the foreground CLI. See [supervisor operations](detached.md#supervisor-operations) for the required behaviour of the replacement. The response envelope remains applicable.
+
 ## Invocation
 
 The CLI contract, configuration format, tool catalogue and worker protocol each start at version 1, and the SQL schema also starts at 1. Each is versioned independently, as are event payloads.

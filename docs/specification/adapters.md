@@ -1,6 +1,6 @@
 # Adapters and host qualification
 
-Status: draft, part of the [Docket specification](README.md).
+Status: draft, part of the [Docket specification](README.md). For the replacement workflow, use the [detached bb qualification](detached.md#bb-qualification-still-required). The foreground gates below do not establish detached support.
 
 ## Ownership boundaries
 
